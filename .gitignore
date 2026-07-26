@@ -1,0 +1,10 @@
+node_modules/
+.next/
+data/
+data.db-shm
+data.db-wal
+.env.local
+*.tsbuildinfo
+dev.err
+dev.log
+.DS_Store
