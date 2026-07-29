@@ -1,5 +1,6 @@
 ﻿import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import {
@@ -120,7 +121,16 @@ type ActorContext = {
   accountName: string;
   displayName: string;
   status: string;
+  mustChangePassword?: boolean;
 };
+
+type PasswordVerificationResult = {
+  ok: boolean;
+  needsRehash: boolean;
+};
+
+const PASSWORD_SCHEME = "scrypt-v1";
+const SESSION_TTL_DAYS = 7;
 
 const dataDir = join(process.cwd(), "data");
 const dbPath = join(dataDir, "meeting-asr-app.db");
@@ -257,6 +267,9 @@ function getDb() {
       email TEXT,
       department TEXT,
       external_user_id TEXT,
+      password_hash TEXT,
+      must_change_password INTEGER NOT NULL DEFAULT 0,
+      last_login_at TEXT,
       status TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -293,10 +306,32 @@ function getDb() {
       after_snapshot TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
   `);
 
+  migrateAuthSchema(db);
   seedDefaults(db);
   return db;
+}
+
+function migrateAuthSchema(database: DatabaseSync) {
+  ensureColumn(database, "users", "password_hash", "TEXT");
+  ensureColumn(database, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(database, "users", "last_login_at", "TEXT");
+}
+
+function ensureColumn(database: DatabaseSync, tableName: string, columnName: string, definition: string) {
+  const columns = database.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === columnName)) return;
+  database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
 }
 
 function seedDefaults(database: DatabaseSync) {
@@ -1042,10 +1077,63 @@ function getBootstrapAdminAccount() {
   if (configuredAccount) return configuredAccount;
 
   if (process.env.NODE_ENV !== "production") {
-    return String(process.env.DEV_ACTOR_ACCOUNT || "").trim();
+    return String(process.env.DEV_ACTOR_ACCOUNT || "admin").trim();
   }
 
-  return "";
+  return "admin";
+}
+
+function getBootstrapAdminPassword() {
+  const configuredPassword = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || "");
+  if (configuredPassword) {
+    return { password: configuredPassword, mustChangePassword: false, source: "env" as const };
+  }
+
+  const fallbackPassword = "admin123";
+  if (process.env.NODE_ENV === "production") {
+    console.warn(
+      "[auth] BOOTSTRAP_ADMIN_PASSWORD is not set. Created bootstrap admin with default password admin123; change it immediately."
+    );
+  }
+  return { password: fallbackPassword, mustChangePassword: true, source: "default" as const };
+}
+
+function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  const key = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
+  return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key}`;
+}
+
+function verifyPassword(password: string, storedHash: string | null | undefined): PasswordVerificationResult {
+  if (!storedHash) return { ok: false, needsRehash: false };
+
+  const parts = storedHash.split("$");
+  if (parts.length !== 6 || parts[0] !== PASSWORD_SCHEME) {
+    return { ok: false, needsRehash: false };
+  }
+
+  const [, nRaw, rRaw, pRaw, salt, expectedHex] = parts;
+  const expected = Buffer.from(expectedHex, "hex");
+  const actual = scryptSync(password, salt, expected.length, {
+    N: Number(nRaw),
+    r: Number(rRaw),
+    p: Number(pRaw),
+  });
+
+  return {
+    ok: actual.length === expected.length && timingSafeEqual(actual, expected),
+    needsRehash: nRaw !== "16384" || rRaw !== "8" || pRaw !== "1",
+  };
+}
+
+function hashSessionToken(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function sessionExpiryIso() {
+  const expiresAt = new Date();
+  expiresAt.setDate(expiresAt.getDate() + SESSION_TTL_DAYS);
+  return expiresAt.toISOString();
 }
 
 function seedIdentityDefaults(database: DatabaseSync) {
@@ -1056,6 +1144,7 @@ function seedIdentityDefaults(database: DatabaseSync) {
     database.prepare("SELECT COUNT(*) as count FROM users").get()?.count ?? 0
   );
   const bootstrapAdminAccount = getBootstrapAdminAccount();
+  const bootstrapAdminPassword = getBootstrapAdminPassword();
 
   if (roleCount === 0) {
     const roles: RoleRow[] = [
@@ -1075,13 +1164,30 @@ function seedIdentityDefaults(database: DatabaseSync) {
     }
   }
 
-  if (userCount === 0 && bootstrapAdminAccount) {
+  const existingBootstrapAdmin = database
+    .prepare("SELECT id FROM users WHERE account_name = ?")
+    .get(bootstrapAdminAccount) as { id: string } | undefined;
+  const systemAdminCount = Number(
+    database
+      .prepare(`
+        SELECT COUNT(*) as count
+        FROM users u
+        INNER JOIN user_roles ur ON ur.user_id = u.id
+        INNER JOIN roles r ON r.id = ur.role_id
+        WHERE r.role_key = 'system_admin' AND u.status = 'active'
+      `)
+      .get()?.count ?? 0
+  );
+  const shouldCreateBootstrapAdmin =
+    bootstrapAdminAccount && !existingBootstrapAdmin && (userCount === 0 || systemAdminCount === 0);
+
+  if (shouldCreateBootstrapAdmin) {
     database
       .prepare(`
         INSERT INTO users (
           id, account_name, display_name, email, department, external_user_id,
-          status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          password_hash, must_change_password, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(
         "user-admin",
@@ -1090,6 +1196,8 @@ function seedIdentityDefaults(database: DatabaseSync) {
         "",
         "系统",
         null,
+        hashPassword(bootstrapAdminPassword.password),
+        bootstrapAdminPassword.mustChangePassword ? 1 : 0,
         "active",
         nowIso(),
         nowIso()
@@ -1097,13 +1205,24 @@ function seedIdentityDefaults(database: DatabaseSync) {
   }
 
   const adminUser = database
-    .prepare("SELECT id FROM users WHERE account_name = ?")
-    .get(bootstrapAdminAccount) as { id: string } | undefined;
+    .prepare("SELECT id, password_hash as passwordHash FROM users WHERE account_name = ?")
+    .get(bootstrapAdminAccount) as { id: string; passwordHash?: string | null } | undefined;
   const adminRole = database
     .prepare("SELECT id FROM roles WHERE role_key = ?")
     .get("system_admin") as { id: string } | undefined;
 
   if (adminUser && adminRole) {
+    if (!adminUser.passwordHash) {
+      database
+        .prepare("UPDATE users SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?")
+        .run(
+          hashPassword(bootstrapAdminPassword.password),
+          bootstrapAdminPassword.mustChangePassword ? 1 : 0,
+          nowIso(),
+          adminUser.id
+        );
+    }
+
     database
       .prepare(`
         INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
@@ -1134,11 +1253,126 @@ export function getActorByAccountName(accountName: string) {
         id,
         account_name as accountName,
         display_name as displayName,
-        status
+        status,
+        must_change_password as mustChangePassword
       FROM users
       WHERE account_name = ?
     `)
-    .get(normalizedAccount) as { id: string; accountName: string; displayName: string; status: string } | null;
+    .get(normalizedAccount) as ActorContext | null;
+}
+
+export function authenticateUser(accountName: string, password: string) {
+  const normalizedAccount = String(accountName ?? "").trim();
+  if (!normalizedAccount || !password) return null;
+
+  const user = getDb()
+    .prepare(`
+      SELECT
+        id,
+        account_name as accountName,
+        display_name as displayName,
+        status,
+        password_hash as passwordHash,
+        must_change_password as mustChangePassword
+      FROM users
+      WHERE account_name = ?
+    `)
+    .get(normalizedAccount) as (ActorContext & { passwordHash?: string | null }) | null;
+
+  if (!user || user.status !== "active") return null;
+  const verification = verifyPassword(password, user.passwordHash);
+  if (!verification.ok) return null;
+
+  if (verification.needsRehash) {
+    getDb()
+      .prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+      .run(hashPassword(password), nowIso(), user.id);
+  }
+
+  getDb()
+    .prepare("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
+    .run(nowIso(), nowIso(), user.id);
+
+  return {
+    id: user.id,
+    accountName: user.accountName,
+    displayName: user.displayName,
+    status: user.status,
+    mustChangePassword: Boolean(user.mustChangePassword),
+  };
+}
+
+export function createAuthSession(userId: string) {
+  const token = randomBytes(32).toString("base64url");
+  const expiresAt = sessionExpiryIso();
+  getDb()
+    .prepare(`
+      INSERT INTO auth_sessions (id, user_id, token_hash, expires_at, created_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    .run(newId("session"), userId, hashSessionToken(token), expiresAt, nowIso(), nowIso());
+
+  return { token, expiresAt };
+}
+
+export function getActorBySessionToken(token: string) {
+  const sessionToken = String(token ?? "").trim();
+  if (!sessionToken) return null;
+
+  const row = getDb()
+    .prepare(`
+      SELECT
+        u.id,
+        u.account_name as accountName,
+        u.display_name as displayName,
+        u.status,
+        u.must_change_password as mustChangePassword
+      FROM auth_sessions s
+      INNER JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.expires_at > ?
+    `)
+    .get(hashSessionToken(sessionToken), nowIso()) as ActorContext | null;
+
+  if (!row || row.status !== "active") return null;
+
+  getDb()
+    .prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?")
+    .run(nowIso(), hashSessionToken(sessionToken));
+
+  return { ...row, mustChangePassword: Boolean(row.mustChangePassword) };
+}
+
+export function deleteAuthSession(token: string) {
+  const sessionToken = String(token ?? "").trim();
+  if (!sessionToken) return;
+  getDb().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(hashSessionToken(sessionToken));
+}
+
+export function changeUserPassword(accountName: string, currentPassword: string, nextPassword: string) {
+  const normalizedAccount = requireNonEmpty(accountName, "Account name");
+  const next = String(nextPassword ?? "");
+  if (next.length < 8) {
+    throw new Error("Password must be at least 8 characters");
+  }
+
+  const user = getDb()
+    .prepare(`
+      SELECT id, password_hash as passwordHash
+      FROM users
+      WHERE account_name = ? AND status = 'active'
+    `)
+    .get(normalizedAccount) as { id: string; passwordHash?: string | null } | undefined;
+
+  if (!user || !verifyPassword(currentPassword, user.passwordHash).ok) {
+    throw new Error("Current password is incorrect");
+  }
+
+  getDb()
+    .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
+    .run(hashPassword(next), nowIso(), user.id);
+  getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
+
+  return true;
 }
 
 export function getCurrentActorRoleKeys() {

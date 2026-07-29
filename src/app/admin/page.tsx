@@ -597,14 +597,16 @@ export default function AdminPage() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <div className="text-lg font-semibold text-slate-800">⚙ 系统管理</div>
-        <Link
-          href="/"
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
-        >
-          ← 返回主界面
-        </Link>
+      <header className="border-b border-slate-200 bg-white px-6 py-3">
+        <div className="flex flex-wrap items-center gap-3 pr-32 sm:pr-40">
+          <div className="text-lg font-semibold text-slate-800">⚙ 系统管理</div>
+          <Link
+            href="/"
+            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
+          >
+            ← 返回主界面
+          </Link>
+        </div>
       </header>
 
       <div className="mx-auto max-w-6xl space-y-5 p-6">
