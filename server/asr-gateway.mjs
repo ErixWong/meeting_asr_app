@@ -205,7 +205,7 @@ function createProviderAdapter(runtimeConfig, session) {
   if (runtimeConfig.isLocalFunasr) {
     return {
       name: "local_funasr",
-      headers: undefined,
+      headers: runtimeConfig.apiKey ? { Authorization: `Bearer ${runtimeConfig.apiKey}` } : undefined,
       startsAfterOpen: true,
       startMessage: () => buildLocalFunasrStartMessage(session, runtimeConfig.hotwords),
       finishMessage: () => buildLocalFunasrFinishMessage(session.sessionId),

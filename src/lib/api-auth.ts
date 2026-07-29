@@ -1,8 +1,37 @@
 import { NextResponse } from "next/server";
-import { getActorByAccountName, getActorRoleKeys, runWithActor } from "@/lib/admin-store";
+import {
+  getActorByAccountName,
+  getActorBySessionToken,
+  getActorRoleKeys,
+  runWithActor,
+} from "@/lib/admin-store";
+import { SESSION_COOKIE_NAME } from "@/lib/auth-constants";
 
 export const ADMIN_ROLES = ["system_admin"];
 export const CONTENT_MANAGER_ROLES = ["minutes_admin", "system_admin"];
+
+function readCookie(req: Request, name: string) {
+  const cookieHeader = req.headers.get("cookie") || "";
+  const cookies = cookieHeader.split(";").map((item) => item.trim());
+  const match = cookies.find((item) => item.startsWith(`${name}=`));
+  if (!match) return "";
+  return decodeURIComponent(match.slice(name.length + 1));
+}
+
+export function getAuthenticatedActor(req: Request) {
+  const sessionToken = readCookie(req, SESSION_COOKIE_NAME);
+  const sessionActor = getActorBySessionToken(sessionToken);
+  if (sessionActor) {
+    return { ...sessionActor, mustChangePassword: Boolean(sessionActor.mustChangePassword) };
+  }
+
+  const accountName = getRequestAccountName(req);
+  if (!accountName) return null;
+
+  const actor = getActorByAccountName(accountName);
+  if (!actor || actor.status !== "active") return null;
+  return { ...actor, mustChangePassword: Boolean(actor.mustChangePassword) };
+}
 
 function getRequestAccountName(req: Request) {
   if (process.env.NODE_ENV !== "production") {
@@ -28,14 +57,18 @@ export function withRequiredRoles<T>(
 }
 
 function authorizeAnyRole(req: Request, roleKeys: string[]) {
-  const accountName = getRequestAccountName(req);
-  if (!accountName) {
+  const actor = getAuthenticatedActor(req);
+  if (!actor) {
     return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
   }
 
-  const actor = getActorByAccountName(accountName);
-  if (!actor || actor.status !== "active") {
-    return { response: NextResponse.json({ error: "Unauthorized", actor: accountName }, { status: 401 }) };
+  if (actor.mustChangePassword) {
+    return {
+      response: NextResponse.json(
+        { error: "Password change required", mustChangePassword: true },
+        { status: 403 }
+      ),
+    };
   }
 
   const currentRoleKeys = new Set(getActorRoleKeys(actor.id, actor.status));
