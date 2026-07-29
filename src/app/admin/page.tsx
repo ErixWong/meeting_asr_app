@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
-type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords";
+type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit";
 
 type SettingItem = {
   itemSection: string;
@@ -31,6 +31,61 @@ type HotwordItem = {
   status: string;
   note: string;
 };
+
+type RoleItem = {
+  id: string;
+  roleKey: string;
+  roleName: string;
+};
+
+type UserItem = {
+  id: string;
+  accountName: string;
+  displayName: string;
+  email: string;
+  department: string;
+  status: string;
+  roles: RoleItem[];
+};
+
+type AuditLogItem = {
+  id: string;
+  actorAccountName: string;
+  actorDisplayName: string;
+  actionType: string;
+  resourceType: string;
+  resourceId: string;
+  resourceName?: string | null;
+  result: string;
+  errorMessage?: string | null;
+  createdAt: string;
+};
+
+type DiagnosticStep = {
+  step: string;
+  ok: boolean;
+  detail: string;
+  elapsedMs?: number;
+};
+
+type AsrDiagnostics = {
+  providerType: string;
+  inputEndpoint: string;
+  targetUrl: string;
+  hasApiKey: boolean;
+  workspaceId?: string;
+  steps: DiagnosticStep[];
+};
+
+class ApiRequestError extends Error {
+  data: any;
+
+  constructor(message: string, data: any) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.data = data;
+  }
+}
 
 function Card({
   title,
@@ -74,6 +129,8 @@ function SectionTabs({
     { key: "mail", label: "邮件配置" },
     { key: "templates", label: "模板管理" },
     { key: "hotwords", label: "热词管理" },
+    { key: "users", label: "用户与权限" },
+    { key: "audit", label: "审计日志" },
   ];
 
   return (
@@ -105,6 +162,7 @@ export default function AdminPage() {
   const [funasrApiKey, setFunasrApiKey] = useState("");
   const [funasrWorkspaceId, setFunasrWorkspaceId] = useState("");
   const [funasrStatus, setFunasrStatus] = useState<"ok" | "fail" | "idle">("idle");
+  const [funasrDiagnostics, setFunasrDiagnostics] = useState<AsrDiagnostics | null>(null);
 
   const [llmUrl, setLlmUrl] = useState("http://qwen.local:8080/v1");
   const [llmKey, setLlmKey] = useState("");
@@ -122,6 +180,10 @@ export default function AdminPage() {
   const [defaultTemplateId, setDefaultTemplateId] = useState("");
   const [templates, setTemplates] = useState<PromptTemplateItem[]>([]);
   const [hotwords, setHotwords] = useState<HotwordItem[]>([]);
+  const [users, setUsers] = useState<UserItem[]>([]);
+  const [roles, setRoles] = useState<RoleItem[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
+  const [notice, setNotice] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const inputCls =
     "w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand";
@@ -247,18 +309,29 @@ export default function AdminPage() {
     ]
   );
 
+  const requestJson = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const res = await fetch(input, init);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      throw new ApiRequestError(data.error || `Request failed: ${res.status}`, data);
+    }
+    return data;
+  };
+
+  const showSuccess = (text: string) => setNotice({ type: "success", text });
+  const showError = (text: string) => setNotice({ type: "error", text });
+
   useEffect(() => {
     const loadAdminData = async () => {
       try {
-        const [settingsRes, templatesRes, hotwordsRes] = await Promise.all([
-          fetch("/api/admin/settings"),
-          fetch("/api/admin/prompt-templates"),
-          fetch("/api/admin/hotwords"),
+        const [settingsData, templatesData, hotwordsData, usersData, rolesData, auditLogsData] = await Promise.all([
+          requestJson("/api/admin/settings"),
+          requestJson("/api/admin/prompt-templates"),
+          requestJson("/api/admin/hotwords"),
+          requestJson("/api/admin/users"),
+          requestJson("/api/admin/roles"),
+          requestJson("/api/admin/audit-logs"),
         ]);
-
-        const settingsData = await settingsRes.json();
-        const templatesData = await templatesRes.json();
-        const hotwordsData = await hotwordsRes.json();
 
         const settings = (settingsData.settings ?? []) as SettingItem[];
         const get = (section: string, mark: string, fallback = "") =>
@@ -285,9 +358,13 @@ export default function AdminPage() {
 
         setTemplates(nextTemplates);
         setHotwords(nextHotwords);
+        setUsers((usersData.users ?? []) as UserItem[]);
+        setRoles((rolesData.roles ?? []) as RoleItem[]);
+        setAuditLogs((auditLogsData.auditLogs ?? []) as AuditLogItem[]);
         setDefaultTemplateId(get("system", "default_prompt_template_id", nextTemplates[0]?.id ?? ""));
       } catch (error) {
         console.error("Failed to load admin data:", error);
+        showError(`后台配置加载失败: ${(error as Error).message}`);
       } finally {
         setLoading(false);
       }
@@ -299,88 +376,223 @@ export default function AdminPage() {
   const saveSettings = async () => {
     setSavingSettings(true);
     try {
-      await fetch("/api/admin/settings", {
+      await requestJson("/api/admin/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ settings: settingsPayload }),
       });
+      await loadAuditLogs();
+      showSuccess("设置已保存");
+    } catch (error) {
+      showError(`设置保存失败: ${(error as Error).message}`);
     } finally {
       setSavingSettings(false);
     }
   };
 
+  const loadAuditLogs = async () => {
+    const data = await requestJson("/api/admin/audit-logs");
+    setAuditLogs((data.auditLogs ?? []) as AuditLogItem[]);
+  };
+
   const saveTemplate = async (template: PromptTemplateItem) => {
-    const res = await fetch(`/api/admin/prompt-templates/${template.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(template),
-    });
-    const data = await res.json();
-    if (data.template) {
+    try {
+      const data = await requestJson(`/api/admin/prompt-templates/${template.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(template),
+      });
       setTemplates((prev) => prev.map((item) => (item.id === template.id ? data.template : item)));
+      showSuccess("模板已保存");
+    } catch (error) {
+      showError(`模板保存失败: ${(error as Error).message}`);
     }
   };
 
   const createTemplate = async () => {
-    const res = await fetch("/api/admin/prompt-templates", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        templateKey: `custom_${Date.now()}`,
-        templateName: "新模板",
-        templateType: "custom",
-        content: "请根据以下会议转写内容输出结果。\n\n{transcript}",
-        description: "请补充说明",
-      }),
-    });
-    const data = await res.json();
-    if (data.template) {
+    try {
+      const data = await requestJson("/api/admin/prompt-templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          templateKey: `custom_${Date.now()}`,
+          templateName: "新模板",
+          templateType: "custom",
+          content: "请根据以下会议转写内容输出结果。\n\n{transcript}",
+          description: "请补充说明",
+        }),
+      });
       setTemplates((prev) => [...prev, data.template]);
+      showSuccess("模板已新增");
+    } catch (error) {
+      showError(`新增模板失败: ${(error as Error).message}`);
     }
   };
 
   const saveHotword = async (hotword: HotwordItem) => {
-    const res = await fetch(`/api/admin/hotwords/${hotword.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(hotword),
-    });
-    const data = await res.json();
-    if (data.hotword) {
+    try {
+      const data = await requestJson(`/api/admin/hotwords/${hotword.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(hotword),
+      });
       setHotwords((prev) => prev.map((item) => (item.id === hotword.id ? data.hotword : item)));
+      showSuccess("热词已保存");
+    } catch (error) {
+      showError(`热词保存失败: ${(error as Error).message}`);
     }
   };
 
   const createHotword = async () => {
-    const res = await fetch("/api/admin/hotwords", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ term: "", weight: 10, status: "active", note: "" }),
-    });
-    const data = await res.json();
-    if (data.hotword) {
+    try {
+      const data = await requestJson("/api/admin/hotwords", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ term: `新热词${Date.now()}`, weight: 10, status: "active", note: "" }),
+      });
       setHotwords((prev) => [...prev, data.hotword]);
+      showSuccess("热词已新增");
+    } catch (error) {
+      showError(`新增热词失败: ${(error as Error).message}`);
     }
   };
 
   const removeHotword = async (id: string) => {
-    await fetch(`/api/admin/hotwords/${id}`, { method: "DELETE" });
-    setHotwords((prev) => prev.filter((item) => item.id !== id));
+    try {
+      await requestJson(`/api/admin/hotwords/${id}`, { method: "DELETE" });
+      setHotwords((prev) => prev.filter((item) => item.id !== id));
+      showSuccess("热词已删除");
+    } catch (error) {
+      showError(`删除热词失败: ${(error as Error).message}`);
+    }
   };
 
-  const testFunasr = () => {
+  const roleKeysOf = (user: UserItem) => user.roles.map((role) => role.roleKey);
+
+  const saveUser = async (user: UserItem) => {
+    try {
+      const data = await requestJson(`/api/admin/users/${user.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountName: user.accountName,
+          displayName: user.displayName,
+          email: user.email,
+          department: user.department,
+          status: user.status,
+          roleKeys: roleKeysOf(user),
+        }),
+      });
+      setUsers((prev) => prev.map((item) => (item.id === user.id ? data.user : item)));
+      await loadAuditLogs();
+      showSuccess("用户已保存");
+    } catch (error) {
+      showError(`保存用户失败: ${(error as Error).message}`);
+    }
+  };
+
+  const createUser = async () => {
+    try {
+      const data = await requestJson("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountName: `user_${Date.now()}`,
+          displayName: "新用户",
+          email: "",
+          department: "",
+          status: "active",
+          roleKeys: ["user"],
+        }),
+      });
+      setUsers((prev) => [...prev, data.user]);
+      await loadAuditLogs();
+      showSuccess("用户已新增");
+    } catch (error) {
+      showError(`新增用户失败: ${(error as Error).message}`);
+    }
+  };
+
+  const toggleUserRole = (userId: string, role: RoleItem) => {
+    setUsers((prev) =>
+      prev.map((user) => {
+        if (user.id !== userId) return user;
+        const hasRole = user.roles.some((item) => item.roleKey === role.roleKey);
+        return {
+          ...user,
+          roles: hasRole
+            ? user.roles.filter((item) => item.roleKey !== role.roleKey)
+            : [...user.roles, role],
+        };
+      })
+    );
+  };
+
+  const testFunasr = async () => {
     setFunasrStatus("idle");
-    setTimeout(() => setFunasrStatus("ok"), 1000);
+    setFunasrDiagnostics(null);
+    try {
+      const data = await requestJson("/api/admin/test-asr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          providerType: funasrProvider,
+          endpoint: funasrUrl,
+          apiKey: funasrApiKey,
+          workspaceId: funasrWorkspaceId,
+        }),
+      });
+      setFunasrDiagnostics((data.diagnostics ?? null) as AsrDiagnostics | null);
+      setFunasrStatus("ok");
+      showSuccess("ASR 连接测试通过");
+    } catch (error) {
+      setFunasrStatus("fail");
+      if (error instanceof ApiRequestError) {
+        setFunasrDiagnostics((error.data?.diagnostics ?? null) as AsrDiagnostics | null);
+      }
+      showError(`ASR 测试失败: ${(error as Error).message}`);
+    }
   };
 
-  const testLlm = () => {
+  const testLlm = async () => {
     setLlmStatus("idle");
-    setTimeout(() => setLlmStatus("ok"), 1000);
+    try {
+      await requestJson("/api/admin/test-llm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          baseUrl: llmUrl,
+          apiKey: llmKey,
+          model: llmModel,
+        }),
+      });
+      setLlmStatus("ok");
+      showSuccess("LLM 调用测试通过");
+    } catch (error) {
+      setLlmStatus("fail");
+      showError(`LLM 测试失败: ${(error as Error).message}`);
+    }
   };
 
-  const testMail = () => {
+  const testMail = async () => {
     setMailStatus("idle");
-    setTimeout(() => setMailStatus("ok"), 1000);
+    try {
+      await requestJson("/api/admin/test-mail", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          smtpHost: mailHost,
+          smtpPort: mailPort,
+          smtpUsername: mailUser,
+          smtpPassword: mailPassword,
+        }),
+      });
+      setMailStatus("ok");
+      showSuccess("邮件连接测试通过");
+    } catch (error) {
+      setMailStatus("fail");
+      showError(`邮件测试失败: ${(error as Error).message}`);
+    }
   };
 
   return (
@@ -397,6 +609,18 @@ export default function AdminPage() {
 
       <div className="mx-auto max-w-6xl space-y-5 p-6">
         <SectionTabs value={activeTab} onChange={setActiveTab} />
+
+        {notice && (
+          <div
+            className={`rounded-lg border px-3 py-2 text-sm ${
+              notice.type === "success"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-red-200 bg-red-50 text-red-700"
+            }`}
+          >
+            {notice.text}
+          </div>
+        )}
 
         {loading && (
           <div className="rounded-xl border border-slate-200 bg-white px-4 py-6 text-sm text-slate-500 shadow-sm">
@@ -436,6 +660,48 @@ export default function AdminPage() {
                 测试连接
               </button>
             </div>
+            {funasrDiagnostics && (
+              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                <div className="grid gap-1 md:grid-cols-2">
+                  <div>
+                    <span className="font-medium">provider:</span> {funasrDiagnostics.providerType}
+                  </div>
+                  <div>
+                    <span className="font-medium">target:</span> {funasrDiagnostics.targetUrl || "(empty)"}
+                  </div>
+                  <div>
+                    <span className="font-medium">input:</span> {funasrDiagnostics.inputEndpoint || "(empty)"}
+                  </div>
+                  <div>
+                    <span className="font-medium">apiKey:</span> {funasrDiagnostics.hasApiKey ? "present" : "missing"}
+                  </div>
+                </div>
+                <div className="mt-2 overflow-x-auto rounded border border-slate-200 bg-white">
+                  <table className="w-full min-w-[560px] border-collapse text-left">
+                    <thead className="bg-slate-100 text-slate-500">
+                      <tr>
+                        <th className="px-2 py-1 font-medium">step</th>
+                        <th className="px-2 py-1 font-medium">status</th>
+                        <th className="px-2 py-1 font-medium">ms</th>
+                        <th className="px-2 py-1 font-medium">detail</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {funasrDiagnostics.steps.map((step) => (
+                        <tr key={step.step} className="border-t border-slate-100">
+                          <td className="px-2 py-1 font-mono">{step.step}</td>
+                          <td className={step.ok ? "px-2 py-1 text-emerald-600" : "px-2 py-1 text-red-600"}>
+                            {step.ok ? "ok" : "fail"}
+                          </td>
+                          <td className="px-2 py-1 font-mono">{step.elapsedMs ?? "-"}</td>
+                          <td className="px-2 py-1 font-mono">{step.detail}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
             <div className="mt-3">
               <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>
                 {savingSettings ? "保存中..." : "保存 ASR 配置"}
@@ -698,7 +964,192 @@ export default function AdminPage() {
             </div>
           </Card>
         )}
+
+        {!loading && activeTab === "users" && (
+          <Card title="用户与权限" icon="👥">
+            <div className="mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+              当前为极简 RBAC：只维护用户与固定角色，不在本轮启用复杂权限策略。
+            </div>
+            <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <table className="min-w-full text-sm">
+                <thead className="bg-slate-50 text-left text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">账号</th>
+                    <th className="px-3 py-2 font-medium">姓名</th>
+                    <th className="px-3 py-2 font-medium">邮箱</th>
+                    <th className="px-3 py-2 font-medium">部门</th>
+                    <th className="px-3 py-2 font-medium">状态</th>
+                    <th className="px-3 py-2 font-medium">角色</th>
+                    <th className="px-3 py-2 font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {users.map((user) => (
+                    <tr key={user.id} className="border-t border-slate-100 align-top">
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.accountName}
+                          disabled={user.id === "user-admin"}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, accountName: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-32 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
+                        />
+                        {user.id === "user-admin" && (
+                          <div className="mt-1 text-[11px] text-slate-400">bootstrap admin</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.displayName}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, displayName: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.email}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, email: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-44 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.department}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, department: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <select
+                          value={user.status}
+                          disabled={user.id === "user-admin"}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, status: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
+                        >
+                          <option value="active">active</option>
+                          <option value="disabled">disabled</option>
+                        </select>
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex flex-wrap gap-2">
+                          {roles.map((role) => {
+                            const checked = user.roles.some((item) => item.roleKey === role.roleKey);
+                            return (
+                              <label key={role.id} className="flex items-center gap-1 rounded bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  disabled={user.id === "user-admin" && role.roleKey === "system_admin"}
+                                  onChange={() => toggleUserRole(user.id, role)}
+                                />
+                                {role.roleName}
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2">
+                        <button onClick={() => saveUser(user)} className="text-slate-500 hover:text-slate-700">
+                          保存
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3">
+              <button onClick={createUser} className={btnCls}>新增用户</button>
+            </div>
+          </Card>
+        )}
+
+        {!loading && activeTab === "audit" && (
+          <Card title="审计日志" icon="🧾">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="text-sm text-slate-500">显示最近 100 条关键操作记录。</div>
+              <button onClick={loadAuditLogs} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">
+                刷新
+              </button>
+            </div>
+            <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <table className="min-w-full text-sm">
+                <thead className="bg-slate-50 text-left text-slate-500">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">时间</th>
+                    <th className="px-3 py-2 font-medium">操作者</th>
+                    <th className="px-3 py-2 font-medium">动作</th>
+                    <th className="px-3 py-2 font-medium">资源</th>
+                    <th className="px-3 py-2 font-medium">结果</th>
+                    <th className="px-3 py-2 font-medium">错误</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {auditLogs.length === 0 ? (
+                    <tr>
+                      <td className="px-3 py-6 text-center text-slate-400" colSpan={6}>
+                        暂无审计记录
+                      </td>
+                    </tr>
+                  ) : (
+                    auditLogs.map((log) => (
+                      <tr key={log.id} className="border-t border-slate-100">
+                        <td className="whitespace-nowrap px-3 py-2 text-slate-500">
+                          {new Date(log.createdAt).toLocaleString("zh-CN")}
+                        </td>
+                        <td className="px-3 py-2 text-slate-700">
+                          {log.actorDisplayName || log.actorAccountName}
+                        </td>
+                        <td className="px-3 py-2 font-mono text-xs text-slate-600">{log.actionType}</td>
+                        <td className="px-3 py-2 text-slate-600">
+                          {log.resourceName || log.resourceId}
+                          <span className="ml-2 text-xs text-slate-400">{log.resourceType}</span>
+                        </td>
+                        <td className={`px-3 py-2 ${log.result === "success" ? "text-emerald-600" : "text-red-600"}`}>
+                          {log.result}
+                        </td>
+                        <td className="max-w-xs truncate px-3 py-2 text-red-500">
+                          {log.errorMessage || "-"}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
       </div>
     </div>
   );
+
 }

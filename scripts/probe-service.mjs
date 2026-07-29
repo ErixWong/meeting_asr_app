@@ -40,12 +40,14 @@ function withTimeout(promise, label, timeoutMs = 5000) {
 }
 
 async function probeDns(host) {
-  try {
-    const records = await dns.lookup(host, { all: true });
-    return { ok: true, kind: "dns", detail: records.map((r) => `${r.address} (IPv${r.family})`).join(", ") };
-  } catch (error) {
-    return { ok: false, kind: "dns", detail: error.message };
-  }
+  return withTimeout((async () => {
+    try {
+      const records = await dns.lookup(host, { all: true });
+      return { ok: true, kind: "dns", detail: records.map((r) => `${r.address} (IPv${r.family})`).join(", ") };
+    } catch (error) {
+      return { ok: false, kind: "dns", detail: error.message };
+    }
+  })(), "dns");
 }
 
 async function probeTcp(host, port) {
@@ -121,22 +123,33 @@ async function probeHttp(host, port, path, secure = false) {
 }
 
 async function probeWebSocket(url) {
-  return withTimeout(new Promise((resolve) => {
+  return new Promise((resolve) => {
     const ws = new WebSocket(url);
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      ws.terminate();
+      finish({ ok: false, kind: `ws ${url}`, detail: "timeout after 5000ms" });
+    }, 5000);
 
     ws.on("open", () => {
       ws.close();
-      resolve({ ok: true, kind: `ws ${url}`, detail: "handshake succeeded" });
+      finish({ ok: true, kind: `ws ${url}`, detail: "handshake succeeded" });
     });
 
     ws.on("unexpected-response", (_, response) => {
-      resolve({ ok: false, kind: `ws ${url}`, detail: `unexpected HTTP ${response.statusCode}` });
+      finish({ ok: false, kind: `ws ${url}`, detail: `unexpected HTTP ${response.statusCode}` });
     });
 
     ws.on("error", (error) => {
-      resolve({ ok: false, kind: `ws ${url}`, detail: error.message });
+      finish({ ok: false, kind: `ws ${url}`, detail: error.message });
     });
-  }), `ws ${url}`);
+  });
 }
 
 function printResult(result) {

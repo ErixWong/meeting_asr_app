@@ -2,8 +2,18 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import Link from "next/link";
-import { RecordStatus, MeetingLlmResult, MeetingRecord, MeetingSendRecord, TranscriptSegment, AudioDevice } from "@/types";
+import {
+  RecordStatus,
+  MeetingAsrResult,
+  MeetingAsrResultDetail,
+  MeetingLlmResult,
+  MeetingRecord,
+  MeetingSendRecord,
+  TranscriptSegment,
+  AudioDevice,
+} from "@/types";
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
+import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import DeviceSelector from "@/components/main/DeviceSelector";
 import RecordingControls from "@/components/main/RecordingControls";
@@ -13,6 +23,11 @@ import { formatTime } from "@/components/main/RecordingControls";
 
 let segCounter = 0;
 
+type ActionNotice = {
+  type: "success" | "error" | "info";
+  message: string;
+};
+
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
@@ -21,7 +36,7 @@ export default function MeetingPage() {
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
-  const [viewTab, setViewTab] = useState<"transcript" | "summary">("transcript");
+  const [viewTab, setViewTab] = useState<"transcript" | "summary" | "asrRaw">("transcript");
   const [summaryGenerating, setSummaryGenerating] = useState(false);
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState("");
@@ -30,18 +45,41 @@ export default function MeetingPage() {
   const [mailTo, setMailTo] = useState("");
   const [mailCc, setMailCc] = useState("");
   const [sendRecords, setSendRecords] = useState<MeetingSendRecord[]>([]);
+  const [asrResults, setAsrResults] = useState<MeetingAsrResult[]>([]);
+  const [selectedAsrResult, setSelectedAsrResult] = useState<MeetingAsrResultDetail | null>(null);
   const [sendingMail, setSendingMail] = useState(false);
-  const [workspaceId, setWorkspaceId] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [hasCustomFunasr, setHasCustomFunasr] = useState(false);
+  const [asrReady, setAsrReady] = useState(false);
   const [savingMeeting, setSavingMeeting] = useState(false);
+  const [notice, setNotice] = useState<ActionNotice | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const asrClientRef = useRef<FunASRClient | null>(null);
   const segmentsRef = useRef<TranscriptSegment[]>([]);
   const elapsedRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectedMeetingIdRef = useRef<string | null>(null);
+  const summaryGeneratingRef = useRef(false);
+  const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<VoiceprintFeature[]>([]);
   const speakerIdsRef = useRef<number[]>([]);
+
+  const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
+    setNotice({ type, message });
+  }, []);
+
+  const updateSummaryGenerating = useCallback((value: boolean, meetingId?: string | null) => {
+    summaryGeneratingRef.current = value;
+    summaryGeneratingMeetingIdRef.current = value ? meetingId ?? summaryGeneratingMeetingIdRef.current : null;
+    setSummaryGenerating(value);
+  }, []);
+
+  const requestJson = useCallback(async <T = any,>(input: RequestInfo | URL, init?: RequestInit) => {
+    const res = await fetch(input, init);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      throw new Error(data.error || `Request failed: ${res.status}`);
+    }
+    return data as T;
+  }, []);
 
   useEffect(() => {
     segmentsRef.current = liveSegments;
@@ -51,23 +89,60 @@ export default function MeetingPage() {
     elapsedRef.current = elapsed;
   }, [elapsed]);
 
-  const loadRuntimeConfig = useCallback(async () => {
-    const res = await fetch("/api/config");
-    const data = await res.json();
-    const nextWorkspaceId = data.workspaceId || "";
-    const nextApiKey = data.apiKey || "";
-    const nextHasCustomFunasr = Boolean(data.hasCustomFunasr);
+  useEffect(() => {
+    selectedMeetingIdRef.current = selected?.id ?? null;
+  }, [selected?.id]);
 
-    setWorkspaceId(nextWorkspaceId);
-    setApiKey(nextApiKey);
-    setHasCustomFunasr(nextHasCustomFunasr);
+  const isActiveMeeting = useCallback((meetingId: string) => {
+    return selectedMeetingIdRef.current === meetingId;
+  }, []);
+
+  const primeMeetingAsyncState = useCallback(async (meetingId: string) => {
+    try {
+      const [meetingData, llmData] = await Promise.all([
+        requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`),
+        requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`).catch(() => ({ llmResults: [] })),
+      ]);
+
+      if (!isActiveMeeting(meetingId)) return;
+
+      const latestMeeting = meetingData.meeting;
+      if (latestMeeting) {
+        setMeetings((prev) => prev.map((item) => (item.id === meetingId ? latestMeeting : item)));
+        setSelected((prev) => (prev && prev.id === meetingId ? latestMeeting : prev));
+      }
+
+      const nextResults = llmData.llmResults ?? [];
+      setLlmResults(nextResults);
+      setSelectedLlmResultId(nextResults[0]?.id ?? null);
+      if (nextResults[0]?.resultMarkdown) {
+        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: nextResults[0].resultMarkdown } : prev));
+      }
+    } catch (error) {
+      console.error("Failed to prime meeting async state:", error);
+    }
+  }, [isActiveMeeting, requestJson]);
+
+  useEffect(() => {
+    if (!notice) return;
+
+    const timer = window.setTimeout(() => {
+      setNotice(null);
+    }, notice.type === "error" ? 7000 : 3500);
+
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const loadRuntimeConfig = useCallback(async () => {
+    const data = await requestJson<{ asr?: { isConfigured?: boolean } }>("/api/config");
+    const nextAsrReady = Boolean(data.asr?.isConfigured);
+
+    setAsrReady(nextAsrReady);
 
     return {
-      workspaceId: nextWorkspaceId,
-      apiKey: nextApiKey,
-      hasCustomFunasr: nextHasCustomFunasr,
+      asrReady: nextAsrReady,
     };
-  }, []);
+  }, [requestJson]);
 
   useEffect(() => {
     getAudioDevices().then((deviceList) => {
@@ -84,41 +159,40 @@ export default function MeetingPage() {
 
     loadRuntimeConfig().catch(console.error);
 
-    fetch("/api/meetings")
-      .then((res) => res.json())
+    requestJson<{ meetings?: MeetingRecord[] }>("/api/meetings")
       .then((data) => {
         setMeetings(data.meetings ?? []);
       })
-      .catch((error) => console.error("Failed to load meetings:", error));
+      .catch((error) => {
+        console.error("Failed to load meetings:", error);
+        showNotice("error", `会议列表加载失败: ${(error as Error).message}`);
+      });
 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [loadRuntimeConfig]);
+  }, [loadRuntimeConfig, requestJson, showNotice]);
 
   const startRecording = useCallback(async () => {
-    let nextHasCustomFunasr = hasCustomFunasr;
-    let nextWorkspaceId = workspaceId;
-    let nextApiKey = apiKey;
+    let nextAsrReady = asrReady;
 
-    if (!nextHasCustomFunasr && (!nextWorkspaceId || !nextApiKey)) {
+    if (!nextAsrReady) {
       try {
         const latest = await loadRuntimeConfig();
-        nextHasCustomFunasr = latest.hasCustomFunasr;
-        nextWorkspaceId = latest.workspaceId;
-        nextApiKey = latest.apiKey;
+        nextAsrReady = latest.asrReady;
       } catch (error) {
         console.error("Failed to refresh runtime config:", error);
       }
     }
 
-    if (!nextHasCustomFunasr && (!nextWorkspaceId || !nextApiKey)) {
-      alert("请先在 .env.local 中配置 FUNASR_SERVER_WS_URL，或配置 DASHSCOPE_API_KEY 和 FUNASR_WORKSPACE_ID");
+    if (!nextAsrReady) {
+      showNotice("error", "请先在后台配置可用的 ASR 服务");
       return;
     }
 
     setStatus("connecting");
     setLiveSegments([]);
+    selectedMeetingIdRef.current = null;
     setSelected(null);
     voiceprintFeaturesRef.current = [];
     speakerIdsRef.current = [];
@@ -129,8 +203,6 @@ export default function MeetingPage() {
 
       await client.startRecording(
         {
-          apiKey: nextApiKey,
-          workspaceId: nextWorkspaceId,
           onResult: (text, isFinal, speakerId, audioData) => {
             let clusterSpeakerId = speakerId;
 
@@ -197,7 +269,7 @@ export default function MeetingPage() {
           onError: (error) => {
             console.error("FunASR error:", error);
             setStatus("idle");
-            alert(`ASR 连接失败: ${error.message}`);
+            showNotice("error", `ASR 连接失败: ${error.message}`);
           },
           onStatusChange: (s) => {
             if (s === "recording") {
@@ -215,8 +287,9 @@ export default function MeetingPage() {
     } catch (error) {
       console.error("Failed to start recording:", error);
       setStatus("idle");
+      showNotice("error", `启动录音失败: ${(error as Error).message}`);
     }
-  }, [hasCustomFunasr, workspaceId, apiKey, device, loadRuntimeConfig]);
+  }, [asrReady, device, loadRuntimeConfig, showNotice]);
 
   const pauseRecording = useCallback(() => {
     if (asrClientRef.current) {
@@ -241,8 +314,11 @@ export default function MeetingPage() {
     if (timerRef.current) clearInterval(timerRef.current);
     setStatus("generating");
 
+    let recordingCaptureSessionId = "";
     if (asrClientRef.current) {
-      await asrClientRef.current.stopRecording();
+      const currentClient = asrClientRef.current;
+      await currentClient.stopRecording();
+      recordingCaptureSessionId = currentClient.getCaptureSessionId();
       asrClientRef.current = null;
     }
 
@@ -264,7 +340,7 @@ export default function MeetingPage() {
     const title = name.trim() || defaultName;
     setSavingMeeting(true);
     try {
-      const res = await fetch("/api/meetings", {
+      const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -272,44 +348,53 @@ export default function MeetingPage() {
           sourceType: "live_recording",
           sourceFileName: null,
           durationSeconds: elapsedRef.current,
-          captureSessionId: `capture-${Date.now()}`,
+          captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
           transcriptSegments: finalSegments,
         }),
       });
-      const data = await res.json();
-      if (data.meeting) {
-        setMeetings((prev) => [data.meeting, ...prev]);
-        setSelected(data.meeting);
+      const meeting = data.meeting;
+      if (meeting) {
+        setMeetings((prev) => [meeting, ...prev]);
+        selectedMeetingIdRef.current = meeting.id;
+        setSelected(meeting);
         setLlmResults([]);
         setSelectedLlmResultId(null);
         setSendRecords([]);
+        setAsrResults([]);
+        setSelectedAsrResult(null);
+        primeMeetingAsyncState(meeting.id).catch(console.error);
       }
       setLiveSegments([]);
       setStatus("idle");
       setElapsed(0);
     } catch (error) {
       console.error("Failed to save meeting:", error);
-      alert("会议保存失败");
+      showNotice("error", "会议保存失败");
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
     }
-  }, []);
+  }, [primeMeetingAsyncState, requestJson, showNotice]);
 
   const handleCreateNew = useCallback(() => {
+    selectedMeetingIdRef.current = null;
     setSelected(null);
+    updateSummaryGenerating(false, null);
+    setSendingMail(false);
     setLiveSegments([]);
     setStatus("idle");
     setElapsed(0);
     setLlmResults([]);
     setSelectedLlmResultId(null);
     setSendRecords([]);
-  }, []);
+    setAsrResults([]);
+    setSelectedAsrResult(null);
+  }, [updateSummaryGenerating]);
 
   const loadLlmResults = useCallback(async (meetingId: string) => {
     try {
-      const res = await fetch(`/api/meetings/${meetingId}/llm-results`);
-      const data = await res.json();
+      const data = await requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`);
+      if (!isActiveMeeting(meetingId)) return;
       const nextResults = data.llmResults ?? [];
       setLlmResults(nextResults);
       setSelectedLlmResultId(nextResults[0]?.id ?? null);
@@ -318,29 +403,120 @@ export default function MeetingPage() {
       }
     } catch (error) {
       console.error("Failed to load llm results:", error);
+      if (!isActiveMeeting(meetingId)) return;
       setLlmResults([]);
       setSelectedLlmResultId(null);
     }
-  }, []);
+  }, [isActiveMeeting, requestJson]);
 
   const loadSendRecords = useCallback(async (meetingId: string) => {
     try {
-      const res = await fetch(`/api/meetings/${meetingId}/send-records`);
-      const data = await res.json();
+      const data = await requestJson<{ sendRecords?: MeetingSendRecord[] }>(`/api/meetings/${meetingId}/send-records`);
+      if (!isActiveMeeting(meetingId)) return;
       setSendRecords(data.sendRecords ?? []);
     } catch (error) {
       console.error("Failed to load send records:", error);
+      if (!isActiveMeeting(meetingId)) return;
       setSendRecords([]);
     }
-  }, []);
+  }, [isActiveMeeting, requestJson]);
+
+  const loadAsrResults = useCallback(async (meetingId: string) => {
+    try {
+      const data = await requestJson<{ asrResults?: MeetingAsrResult[] }>(`/api/meetings/${meetingId}/asr-results`);
+      if (!isActiveMeeting(meetingId)) return;
+      const nextResults = data.asrResults ?? [];
+      setAsrResults(nextResults);
+
+      if (nextResults[0]?.id) {
+        const detailData = await requestJson<{ asrResult?: MeetingAsrResultDetail }>(`/api/meetings/${meetingId}/asr-results/${nextResults[0].id}`);
+        if (!isActiveMeeting(meetingId)) return;
+        setSelectedAsrResult(detailData.asrResult ?? null);
+      } else {
+        setSelectedAsrResult(null);
+      }
+    } catch (error) {
+      console.error("Failed to load asr results:", error);
+      if (!isActiveMeeting(meetingId)) return;
+      setAsrResults([]);
+      setSelectedAsrResult(null);
+    }
+  }, [isActiveMeeting, requestJson]);
+
+  const loadAsrResultDetail = useCallback(async (meetingId: string, resultId: string) => {
+    try {
+      const data = await requestJson<{ asrResult?: MeetingAsrResultDetail }>(`/api/meetings/${meetingId}/asr-results/${resultId}`);
+      if (!isActiveMeeting(meetingId)) return;
+      setSelectedAsrResult(data.asrResult ?? null);
+    } catch (error) {
+      console.error("Failed to load asr result detail:", error);
+      if (!isActiveMeeting(meetingId)) return;
+      setSelectedAsrResult(null);
+    }
+  }, [isActiveMeeting, requestJson]);
+
+  const refreshMeeting = useCallback(async (meetingId: string) => {
+    const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`);
+    const meeting = data.meeting;
+    if (!meeting) return null;
+
+    setMeetings((prev) => prev.map((item) => (item.id === meetingId ? meeting : item)));
+    setSelected((prev) => (prev && prev.id === meetingId ? meeting : prev));
+    return meeting;
+  }, [requestJson]);
+
+  useEffect(() => {
+    if (!selected?.id || selected.status !== "llm_processing" || selected.summary) {
+      return;
+    }
+
+    let disposed = false;
+
+    const poll = async () => {
+      try {
+        await refreshMeeting(selected.id);
+        await loadLlmResults(selected.id);
+      } catch (error) {
+        if (!disposed) {
+          console.error("Failed to refresh llm processing meeting:", error);
+        }
+      }
+    };
+
+    poll().catch(console.error);
+    const timer = window.setInterval(() => {
+      poll().catch(console.error);
+    }, 2000);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [loadLlmResults, refreshMeeting, selected?.id, selected?.status, selected?.summary]);
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     e.target.value = "";
 
+    let nextAsrReady = asrReady;
+    if (!nextAsrReady) {
+      try {
+        const latest = await loadRuntimeConfig();
+        nextAsrReady = latest.asrReady;
+      } catch (error) {
+        console.error("Failed to refresh runtime config:", error);
+      }
+    }
+
+    if (!nextAsrReady) {
+      showNotice("error", "请先在后台配置可用的 ASR 服务");
+      return;
+    }
+
     setStatus("connecting");
     setLiveSegments([]);
+    selectedMeetingIdRef.current = null;
     setSelected(null);
 
     const client = new FunASRClient();
@@ -413,7 +589,7 @@ export default function MeetingPage() {
         if (name !== null) {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
-          const res = await fetch("/api/meetings", {
+          const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -421,17 +597,21 @@ export default function MeetingPage() {
               sourceType: "file_upload",
               sourceFileName: file.name,
               durationSeconds: null,
-              captureSessionId: `capture-${Date.now()}`,
+              captureSessionId: client.getCaptureSessionId() || `capture-${Date.now()}`,
               transcriptSegments: allSegments,
             }),
           });
-          const data = await res.json();
-          if (data.meeting) {
-            setMeetings((prev) => [data.meeting, ...prev]);
-            setSelected(data.meeting);
+          const meeting = data.meeting;
+          if (meeting) {
+            setMeetings((prev) => [meeting, ...prev]);
+            selectedMeetingIdRef.current = meeting.id;
+            setSelected(meeting);
             setLlmResults([]);
             setSelectedLlmResultId(null);
             setSendRecords([]);
+            setAsrResults([]);
+            setSelectedAsrResult(null);
+            primeMeetingAsyncState(meeting.id).catch(console.error);
           }
         }
       }
@@ -440,41 +620,50 @@ export default function MeetingPage() {
       setStatus("idle");
     } catch (err) {
       console.error("Upload transcribe failed:", err);
-      alert("音频识别失败：" + (err as Error).message);
+      showNotice("error", `音频识别失败: ${(err as Error).message}`);
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
     }
-  }, []);
+  }, [asrReady, loadRuntimeConfig, primeMeetingAsyncState, requestJson, showNotice]);
 
   const generateSummary = useCallback(async () => {
-    if (!selected) return;
-    setSummaryGenerating(true);
+    if (!selected || summaryGeneratingRef.current) return;
+    const meetingId = selected.id;
+    updateSummaryGenerating(true, meetingId);
     try {
-      const res = await fetch(`/api/meetings/${selected.id}/llm-results`, {
+      const data = await requestJson<{ llmResult?: MeetingLlmResult }>(`/api/meetings/${meetingId}/llm-results`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      const data = await res.json();
-      if (data.llmResult?.resultMarkdown) {
-        const updated = { ...selected, summary: data.llmResult.resultMarkdown };
+      if (!isActiveMeeting(meetingId)) return;
+      const llmResult = data.llmResult;
+      if (llmResult?.resultMarkdown) {
+        const updated = { ...selected, summary: llmResult.resultMarkdown };
         setSelected(updated);
-        setMeetings((prev) => prev.map((m) => m.id === selected.id ? updated : m));
-        await loadLlmResults(selected.id);
-      } else if (data.error) {
-        throw new Error(data.error);
+        setMeetings((prev) => prev.map((m) => m.id === meetingId ? updated : m));
+        await loadLlmResults(meetingId);
+        await refreshMeeting(meetingId);
+        showNotice("success", "会议纪要已生成");
+      } else {
+        throw new Error("LLM 未返回会议纪要结果");
       }
     } catch (err) {
       console.error("Generate summary failed:", err);
-      alert("生成会议纪要失败");
+      if (!isActiveMeeting(meetingId)) return;
+      await refreshMeeting(meetingId).catch(console.error);
+      showNotice("error", `生成会议纪要失败: ${(err as Error).message}`);
     } finally {
-      setSummaryGenerating(false);
+      if (summaryGeneratingMeetingIdRef.current === meetingId) {
+        updateSummaryGenerating(false, null);
+      }
     }
-  }, [loadLlmResults, selected]);
+  }, [isActiveMeeting, loadLlmResults, refreshMeeting, requestJson, selected, showNotice, updateSummaryGenerating]);
 
   const sendSummary = useCallback(async () => {
     if (!selected || !selected.summary) return;
+    const meetingId = selected.id;
 
     const toRecipients = mailTo
       .split(",")
@@ -486,7 +675,7 @@ export default function MeetingPage() {
       .filter(Boolean);
 
     if (toRecipients.length === 0) {
-      alert("请至少填写一个主送邮箱");
+      showNotice("error", "请至少填写一个主送邮箱");
       return;
     }
 
@@ -497,7 +686,7 @@ export default function MeetingPage() {
         throw new Error("当前会议还没有可发送的纪要结果");
       }
 
-      const sendRes = await fetch(`/api/meetings/${selected.id}/send-mail`, {
+      await requestJson(`/api/meetings/${meetingId}/send-mail`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -508,23 +697,39 @@ export default function MeetingPage() {
           mailTemplateType: "formal_minutes_mail",
         }),
       });
-      const sendData = await sendRes.json();
-      if (sendData.error) {
-        throw new Error(sendData.error);
-      }
 
-      await loadSendRecords(selected.id);
-      alert("会议纪要已发送");
+      if (!isActiveMeeting(meetingId)) return;
+      await loadSendRecords(meetingId);
+      await refreshMeeting(meetingId);
+      showNotice("success", "会议纪要已发送");
     } catch (error) {
       console.error("Failed to send summary:", error);
-      alert(`发送失败: ${(error as Error).message}`);
+      if (!isActiveMeeting(meetingId)) return;
+      await refreshMeeting(meetingId).catch(console.error);
+      await loadSendRecords(meetingId).catch(console.error);
+      showNotice("error", `发送失败: ${(error as Error).message}`);
     } finally {
-      setSendingMail(false);
+      if (isActiveMeeting(meetingId)) {
+        setSendingMail(false);
+      }
     }
-  }, [llmResults, loadSendRecords, mailCc, mailTo, selected, selectedLlmResultId]);
+  }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedLlmResultId, showNotice]);
 
   const selectedDeviceLabel =
     devices.find((d) => d.deviceId === device)?.label ?? "";
+  const rawAsrPayloadText = selectedAsrResult
+    ? JSON.stringify(selectedAsrResult.rawPayload, null, 2)
+    : "";
+  const asrConfigText = selectedAsrResult
+    ? JSON.stringify(selectedAsrResult.asrConfigSnapshot, null, 2)
+    : "";
+  const selectedStatusMeta = selected ? getMeetingStatusMeta(selected.status) : null;
+  const noticeClassName =
+    notice?.type === "success"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : notice?.type === "error"
+        ? "border-red-200 bg-red-50 text-red-700"
+        : "border-sky-200 bg-sky-50 text-sky-700";
 
   return (
     <div className="flex h-screen flex-col">
@@ -543,6 +748,19 @@ export default function MeetingPage() {
         </div>
       </header>
 
+      {notice && (
+        <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
+          <span>{notice.message}</span>
+          <button
+            type="button"
+            onClick={() => setNotice(null)}
+            className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+          >
+            关闭
+          </button>
+        </div>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex-1 overflow-y-auto">
@@ -550,25 +768,53 @@ export default function MeetingPage() {
               meetings={meetings}
               selectedId={selected?.id ?? null}
               onSelect={(m) => {
+                selectedMeetingIdRef.current = m.id;
                 setSelected(m);
+                updateSummaryGenerating(false, null);
+                setSendingMail(false);
                 setLiveSegments([]);
                 setViewTab("transcript");
                 loadLlmResults(m.id).catch(console.error);
                 loadSendRecords(m.id).catch(console.error);
+                loadAsrResults(m.id).catch(console.error);
               }}
               onCreateNew={handleCreateNew}
-              onRename={(id, newTitle) => {
-                setMeetings((prev) => prev.map((m) => m.id === id ? { ...m, title: newTitle } : m));
-                if (selected?.id === id) setSelected((prev) => prev ? { ...prev, title: newTitle } : prev);
-              }}
-              onDelete={(id) => {
-                setMeetings((prev) => prev.filter((m) => m.id !== id));
-                if (selected?.id === id) setSelected(null);
-                if (selected?.id === id) {
-                  setLlmResults([]);
-                  setSelectedLlmResultId(null);
+              onRename={async (id, newTitle) => {
+                try {
+                  const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${id}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ title: newTitle }),
+                  });
+                  const meeting = data.meeting;
+                  if (meeting) {
+                    setMeetings((prev) => prev.map((m) => m.id === id ? meeting : m));
+                    if (selected?.id === id) setSelected(meeting);
+                    showNotice("success", "会议已重命名");
+                  }
+                } catch (error) {
+                  console.error("Failed to rename meeting:", error);
+                  showNotice("error", "重命名失败");
                 }
-                if (selected?.id === id) setSendRecords([]);
+              }}
+              onDelete={async (id) => {
+                try {
+                  await requestJson(`/api/meetings/${id}`, { method: "DELETE" });
+                  setMeetings((prev) => prev.filter((m) => m.id !== id));
+                  if (selected?.id === id) {
+                    selectedMeetingIdRef.current = null;
+                    setSelected(null);
+                    setLlmResults([]);
+                    setSelectedLlmResultId(null);
+                    setSendRecords([]);
+                    setAsrResults([]);
+                    setSelectedAsrResult(null);
+                  }
+                  showNotice("success", "会议已删除");
+                } catch (error) {
+                  console.error("Failed to delete meeting:", error);
+                  showNotice("error", "删除失败");
+                }
               }}
             />
           </div>
@@ -586,7 +832,14 @@ export default function MeetingPage() {
                     <h2 className="text-xl font-semibold text-slate-800">
                       {selected.title}
                     </h2>
-                    <p className="text-sm text-slate-400">{selected.date} · {selected.durationLabel}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <p className="text-sm text-slate-400">{selected.date} · {selected.durationLabel}</p>
+                      {selectedStatusMeta && (
+                        <span className={`rounded px-2 py-0.5 text-xs ${selectedStatusMeta.className}`}>
+                          {selectedStatusMeta.label}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center gap-1">
                     {viewTab === "summary" && llmResults.length > 0 && (
@@ -610,6 +863,19 @@ export default function MeetingPage() {
                         ))}
                       </select>
                     )}
+                    {viewTab === "asrRaw" && asrResults.length > 0 && (
+                      <select
+                        value={selectedAsrResult?.id ?? ""}
+                        onChange={(e) => selected && loadAsrResultDetail(selected.id, e.target.value)}
+                        className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-600"
+                      >
+                        {asrResults.map((result) => (
+                          <option key={result.id} value={result.id}>
+                            {result.asrProvider} · {result.resultFormat}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <div className="flex gap-1 rounded-lg bg-slate-100 p-1">
                       <button
                         onClick={() => setViewTab("transcript")}
@@ -623,7 +889,7 @@ export default function MeetingPage() {
                       </button>
                       <button
                         onClick={() => {
-                          if (!selected.summary) {
+                          if (!selected.summary && !summaryGeneratingRef.current) {
                             generateSummary();
                           }
                           setViewTab("summary");
@@ -637,12 +903,75 @@ export default function MeetingPage() {
                       >
                         生成会议纪要
                       </button>
+                      <button
+                        onClick={() => {
+                          setViewTab("asrRaw");
+                          if (selected && asrResults.length === 0) {
+                            loadAsrResults(selected.id).catch(console.error);
+                          }
+                        }}
+                        className={`rounded-md px-3 py-1 text-sm ${
+                          viewTab === "asrRaw"
+                            ? "bg-white text-brand shadow-sm"
+                            : "text-slate-500"
+                        }`}
+                      >
+                        原始 ASR
+                      </button>
                     </div>
                   </div>
                 </div>
                 <div className="flex-1 overflow-auto rounded-xl border border-slate-200 bg-white p-4">
+                  {selected.lastErrorMessage && (
+                    <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                      {selected.lastErrorMessage}
+                    </div>
+                  )}
                   {viewTab === "transcript" ? (
                     <TranscriptView segments={selected.transcript} isHistory />
+                  ) : viewTab === "asrRaw" ? (
+                    selectedAsrResult ? (
+                      <div className="space-y-4 text-sm">
+                        <div className="grid gap-3 md:grid-cols-3">
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <div className="text-xs text-slate-400">Provider</div>
+                            <div className="mt-1 font-medium text-slate-700">{selectedAsrResult.asrProvider}</div>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <div className="text-xs text-slate-400">Capture Session</div>
+                            <div className="mt-1 truncate font-mono text-xs text-slate-700">{selectedAsrResult.captureSessionId}</div>
+                          </div>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <div className="text-xs text-slate-400">Format</div>
+                            <div className="mt-1 font-medium text-slate-700">{selectedAsrResult.resultFormat}</div>
+                          </div>
+                        </div>
+                        <div className="grid gap-4 lg:grid-cols-2">
+                          <div>
+                            <div className="mb-2 text-xs font-medium text-slate-500">ASR 配置快照</div>
+                            <pre className="max-h-56 overflow-auto rounded-lg bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">
+                              {asrConfigText}
+                            </pre>
+                          </div>
+                          <div>
+                            <div className="mb-2 text-xs font-medium text-slate-500">规范化文本</div>
+                            <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+                              {selectedAsrResult.normalizedText || "-"}
+                            </pre>
+                          </div>
+                        </div>
+                        <div>
+                          <div className="mb-2 text-xs font-medium text-slate-500">原始 Payload</div>
+                          <pre className="max-h-[28rem] overflow-auto rounded-lg bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">
+                            {rawAsrPayloadText}
+                          </pre>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                        <p>暂无原始 ASR 结果</p>
+                      </div>
+                    )
                   ) : summaryGenerating ? (
                     <div className="flex h-full flex-col items-center justify-center text-slate-400">
                       <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-brand border-t-transparent" />
@@ -663,14 +992,29 @@ export default function MeetingPage() {
                   ) : (
                     <div className="flex h-full flex-col items-center justify-center text-slate-400">
                       <p>点击上方"生成会议纪要"按钮开始生成</p>
+                      {selected.status === "llm_failed" && (
+                        <button
+                          onClick={generateSummary}
+                          disabled={summaryGenerating}
+                          className="mt-3 rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:opacity-60"
+                        >
+                          重新生成纪要
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
                 <div className="mt-3 flex gap-2">
                   <button
-                    onClick={() => {
+                    onClick={async () => {
                       const text = selected.transcript.map((s) => s.text).join("");
-                      navigator.clipboard.writeText(text);
+                      try {
+                        await navigator.clipboard.writeText(text);
+                        showNotice("success", "转写全文已复制");
+                      } catch (error) {
+                        console.error("Failed to copy transcript:", error);
+                        showNotice("error", "复制失败，请检查浏览器剪贴板权限");
+                      }
                     }}
                     className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
                   >
@@ -682,21 +1026,27 @@ export default function MeetingPage() {
                         <>
                           <button
                             onClick={async () => {
-                              const updated = { ...selected, summary: summaryText };
-                              setSelected(updated);
-                              setMeetings((prev) => prev.map((m) => m.id === selected.id ? updated : m));
-                              if (selectedLlmResultId) {
-                                await fetch(`/api/meetings/${selected.id}/llm-results`, {
-                                  method: "PATCH",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({
-                                    id: selectedLlmResultId,
-                                    resultMarkdown: summaryText,
-                                  }),
-                                });
-                                await loadLlmResults(selected.id);
+                              try {
+                                if (selectedLlmResultId) {
+                                  await requestJson(`/api/meetings/${selected.id}/llm-results`, {
+                                    method: "PATCH",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({
+                                      id: selectedLlmResultId,
+                                      resultMarkdown: summaryText,
+                                    }),
+                                  });
+                                  await loadLlmResults(selected.id);
+                                }
+                                const updated = { ...selected, summary: summaryText };
+                                setSelected(updated);
+                                setMeetings((prev) => prev.map((m) => m.id === selected.id ? updated : m));
+                                setEditingSummary(false);
+                                showNotice("success", "会议纪要已保存");
+                              } catch (error) {
+                                console.error("Failed to save summary:", error);
+                                showNotice("error", `保存失败: ${(error as Error).message}`);
                               }
-                              setEditingSummary(false);
                             }}
                             className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark"
                           >
@@ -720,6 +1070,13 @@ export default function MeetingPage() {
                           编辑纪要
                         </button>
                       )}
+                      <button
+                        onClick={generateSummary}
+                        disabled={summaryGenerating}
+                        className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                      >
+                        {summaryGenerating ? "生成中..." : "重新生成"}
+                      </button>
                       <button
                         onClick={() => sendSummary()}
                         disabled={sendingMail}
@@ -770,6 +1127,11 @@ export default function MeetingPage() {
                               {record.ccRecipients.length > 0 && (
                                 <div className="mt-1 text-xs text-slate-400">
                                   Cc: {record.ccRecipients.join(", ")}
+                                </div>
+                              )}
+                              {record.errorMessage && (
+                                <div className="mt-1 text-xs text-red-500">
+                                  {record.errorMessage}
                                 </div>
                               )}
                             </div>

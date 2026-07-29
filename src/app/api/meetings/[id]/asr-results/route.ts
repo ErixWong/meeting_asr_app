@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { CONTENT_MANAGER_ROLES, withRequiredRoles } from "@/lib/api-auth";
-import { listMeetingSendRecords } from "@/lib/admin-store";
+import { listMeetingAsrResults } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request, { params }: { params: { id: string } }) {
   return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
-    return NextResponse.json({ sendRecords: listMeetingSendRecords(params.id) });
+    return NextResponse.json({ asrResults: listMeetingAsrResults(params.id) });
   });
 }

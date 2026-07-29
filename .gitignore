@@ -8,3 +8,4 @@ data.db-wal
 dev.err
 dev.log
 .DS_Store
+docs/tasks/

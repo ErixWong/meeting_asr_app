@@ -21,6 +21,8 @@ export interface MeetingRecord {
   title: string;
   date: string;
   durationLabel: string;
+  status: string;
+  lastErrorMessage?: string | null;
   transcript: TranscriptSegment[];
   summary: string;
 }
@@ -50,6 +52,24 @@ export interface MeetingSendRecord {
   ccRecipients: string[];
   createdAt?: string;
   sentAt?: string;
+}
+
+export interface MeetingAsrResult {
+  id: string;
+  meetingId: string;
+  asrProvider: string;
+  asrSettingMark: string;
+  captureSessionId: string;
+  resultFormat: string;
+  rawPayloadBytes?: number;
+  normalizedTextLength?: number;
+  createdAt?: string;
+}
+
+export interface MeetingAsrResultDetail extends MeetingAsrResult {
+  asrConfigSnapshot: unknown;
+  rawPayload: unknown;
+  normalizedText: string;
 }
 
 export interface Voiceprint {
