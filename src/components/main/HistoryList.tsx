@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { MeetingRecord } from "@/types";
+import { getMeetingStatusMeta } from "@/lib/meeting-status";
 
 interface Props {
   meetings: MeetingRecord[];
@@ -47,16 +48,19 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
         <div className="px-1 pb-1 pt-2 text-xs font-medium text-slate-400">
           今天
         </div>
-        {meetings.map((m) => (
-          <div
-            key={m.id}
-            onClick={() => onSelect(m)}
-            className={`group mb-1 rounded-lg border-l-2 px-3 py-2 transition ${
-              selectedId === m.id
-                ? "border-brand bg-brand/5"
-                : "border-transparent hover:bg-slate-100"
-            }`}
-          >
+        {meetings.map((m) => {
+          const statusMeta = getMeetingStatusMeta(m.status);
+
+          return (
+            <div
+              key={m.id}
+              onClick={() => onSelect(m)}
+              className={`group mb-1 rounded-lg border-l-2 px-3 py-2 transition ${
+                selectedId === m.id
+                  ? "border-brand bg-brand/5"
+                  : "border-transparent hover:bg-slate-100"
+              }`}
+            >
             {editingId === m.id ? (
               <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
                 <input
@@ -73,10 +77,13 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
               </div>
             ) : (
               <>
-                <div className="flex items-center justify-between">
-                  <div className="truncate text-sm font-medium text-slate-700">
-                    📄 {m.title}
-                  </div>
+                 <div className="flex items-center justify-between gap-2">
+                   <div className="min-w-0 flex-1 truncate text-sm font-medium text-slate-700">
+                     📄 {m.title}
+                   </div>
+                  <span className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${statusMeta.className}`}>
+                    {statusMeta.label}
+                  </span>
                   <div
                     className="ml-1 hidden shrink-0 gap-1 group-hover:flex"
                     onClick={(e) => e.stopPropagation()}
@@ -106,8 +113,9 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
                 </div>
               </>
             )}
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

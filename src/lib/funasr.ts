@@ -1,11 +1,10 @@
 /**
- * FunASR WebSocket 客户端
- * 连接阿里云 DashScope 实时语音识别服务 (新版协议)
+ * FunASR browser client.
+ * The browser only connects to the local ASR Gateway; provider credentials and
+ * upstream protocol details stay on the server side.
  */
 
 export interface FunASROptions {
-  apiKey: string;
-  workspaceId: string;
   hotWords?: string[];
   onResult: (text: string, isFinal: boolean, speakerId?: number | null, audioData?: Float32Array) => void;
   onError: (error: Error) => void;
@@ -29,9 +28,14 @@ export class FunASRClient {
   private options: FunASROptions | null = null;
   private isRecording = false;
   private isPaused = false;
-  private taskId: string = "";
+  private sessionId: string = "";
+  private captureSessionId: string = "";
   private audioBuffer: Float32Array[] = [];
   private audioBufferStartTime: number = 0;
+
+  getCaptureSessionId(): string {
+    return this.captureSessionId;
+  }
 
   async transcribeFile(
     file: File,
@@ -48,28 +52,26 @@ export class FunASRClient {
     const resampled = this.resample(rawData, audioBuffer.sampleRate, 16000);
     const pcmData = this.convertFloat32ToInt16(resampled);
 
-    const wsUrl = `ws://localhost:8080`;
+    const wsUrl = this.getWebSocketUrl();
     console.log("[FunASR] Transcribing file, connecting to:", wsUrl);
-    const taskId = generateUUID();
+    const sessionId = generateUUID();
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
+    this.captureSessionId = "";
 
     const totalChunks = Math.ceil(pcmData.length / 3200);
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("连接超时")), 15000);
-      let taskStarted = false;
-      let allSent = false;
 
       ws.onopen = () => {
-        console.log("[FunASR] WebSocket opened, sending run-task");
+        console.log("[FunASR] WebSocket opened, starting ASR session");
         ws.send(JSON.stringify({
-          header: { action: "run-task", task_id: taskId, streaming: "duplex" },
-          payload: {
-            task_group: "audio", task: "asr", function: "recognition",
-            model: "fun-asr-realtime",
-            parameters: { format: "pcm", sample_rate: 16000 },
-            input: {},
+          type: "session.start",
+          sessionId,
+          audio: {
+            format: "pcm",
+            sampleRate: 16000,
           },
         }));
       };
@@ -77,12 +79,11 @@ export class FunASRClient {
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
         const msg = JSON.parse(event.data);
-        const evt = msg.header?.event;
 
-        if (evt === "task-started") {
-          console.log("[FunASR] Task started, sending audio...");
+        if (msg.type === "session.started") {
+          this.captureSessionId = msg.captureSessionId || "";
+          console.log("[FunASR] Session started, sending audio...");
           clearTimeout(timeout);
-          taskStarted = true;
 
           (async () => {
             for (let i = 0; i < totalChunks; i++) {
@@ -93,33 +94,30 @@ export class FunASRClient {
               onProgress?.(Math.floor((i / totalChunks) * 100));
               await new Promise((r) => setTimeout(r, 20));
             }
-            console.log("[FunASR] All audio sent, sending finish-task");
-            allSent = true;
+            console.log("[FunASR] All audio sent, finishing ASR session");
             ws.send(JSON.stringify({
-              header: { action: "finish-task", task_id: taskId, streaming: "duplex" },
-              payload: { input: {} },
+              type: "session.finish",
+              sessionId,
             }));
           })();
 
-        } else if (evt === "result-generated") {
-          const sentence = msg.payload?.output?.sentence;
-          if (sentence?.text) {
-            const speakerId = sentence.speaker_id ?? null;
-            onResult(sentence.text, sentence.sentence_end === true, speakerId);
+        } else if (msg.type === "transcript.partial" || msg.type === "transcript.final") {
+          if (msg.text) {
+            onResult(msg.text, msg.type === "transcript.final", msg.speakerId ?? null);
           }
-        } else if (evt === "task-finished") {
-          console.log("[FunASR] Task finished");
+        } else if (msg.type === "session.finished") {
+          console.log("[FunASR] Session finished");
           resolve();
-        } else if (evt === "task-failed") {
-          const errMsg = msg.header?.error_message || "task failed";
-          console.error("[FunASR] Task failed:", errMsg);
+        } else if (msg.type === "session.failed") {
+          const errMsg = msg.error || "ASR session failed";
+          console.error("[FunASR] Session failed:", errMsg);
           reject(new Error(errMsg));
         }
       };
 
       ws.onerror = () => {
         clearTimeout(timeout);
-        reject(new Error("无法连接到语音识别服务，请确认 proxy 已启动 (npm run proxy)"));
+        reject(new Error("无法连接到语音识别服务，请确认 ASR Gateway 已启动 (npm run asr-gateway)"));
       };
     });
 
@@ -144,12 +142,14 @@ export class FunASRClient {
   }
 
   private getWebSocketUrl(): string {
-    return `ws://localhost:8080`;
+    return `ws://127.0.0.1:8123`;
   }
 
   async startRecording(options: FunASROptions, deviceId?: string): Promise<void> {
     this.options = options;
-    this.taskId = generateUUID();
+    this.sessionId = generateUUID();
+    this.captureSessionId = "";
+    this.sessionStarted = false;
 
     try {
       const constraints: MediaStreamConstraints = {
@@ -177,44 +177,23 @@ export class FunASRClient {
       this.ws.binaryType = "arraybuffer";
 
       const timeout = setTimeout(() => {
-        this.options?.onError(new Error("连接超时：未收到 task-started"));
+        this.options?.onError(new Error("连接超时：未收到 session.started"));
         reject(new Error("timeout"));
       }, 15000);
 
       this.ws.onopen = () => {
-        console.log("[FunASR] WebSocket connected, sending run-task...");
-        const parameters: Record<string, unknown> = {
-          format: "pcm",
-          sample_rate: 16000,
-        };
-        const input: Record<string, unknown> = {};
-        if (this.options?.hotWords && this.options.hotWords.length > 0) {
-          const hotWordsText = this.options.hotWords.join(" ");
-          input.context = [
-            {
-              role: "user",
-              content: [{ type: "input_text", text: hotWordsText }],
-            },
-          ];
-        }
-        const runTask = {
-          header: {
-            action: "run-task",
-            task_id: this.taskId,
-            streaming: "duplex",
+        console.log("[FunASR] WebSocket connected, starting ASR session...");
+        this.ws!.send(JSON.stringify({
+          type: "session.start",
+          sessionId: this.sessionId,
+          audio: {
+            format: "pcm",
+            sampleRate: 16000,
           },
-          payload: {
-            task_group: "audio",
-            task: "asr",
-            function: "recognition",
-            model: "fun-asr-realtime",
-            parameters,
-            input,
-          },
-        };
-        this.ws!.send(JSON.stringify(runTask));
-        this.taskStartedResolve = () => { clearTimeout(timeout); resolve(); };
-        this.taskStartedReject = (err) => { clearTimeout(timeout); reject(err); };
+          hotWords: this.options?.hotWords ?? [],
+        }));
+        this.sessionStartedResolve = () => { clearTimeout(timeout); resolve(); };
+        this.sessionStartedReject = (err) => { clearTimeout(timeout); reject(err); };
       };
 
       this.ws.onmessage = (event) => {
@@ -238,47 +217,44 @@ export class FunASRClient {
     });
   }
 
-  private taskStartedResolve: (() => void) | null = null;
-  private taskStartedReject: ((err: Error) => void) | null = null;
-  private taskStarted = false;
+  private sessionStartedResolve: (() => void) | null = null;
+  private sessionStartedReject: ((err: Error) => void) | null = null;
+  private sessionStarted = false;
 
   private handleMessage(data: string): void {
     try {
       const message = JSON.parse(data);
       console.log("[FunASR] Received:", message);
 
-      if (message.header) {
-        const event = message.header.event || message.header.action;
-
-        if (event === "task-started") {
-          console.log("[FunASR] Task started!");
-          this.taskStarted = true;
+      if (message.type) {
+        if (message.type === "session.started") {
+          console.log("[FunASR] Session started!");
+          this.sessionStarted = true;
+          this.captureSessionId = message.captureSessionId || "";
           this.options?.onStatusChange?.("recording");
-          if (this.taskStartedResolve) {
-            this.taskStartedResolve();
-            this.taskStartedResolve = null;
+          if (this.sessionStartedResolve) {
+            this.sessionStartedResolve();
+            this.sessionStartedResolve = null;
           }
-        } else if (event === "result-generated") {
-          const sentence = message.payload?.output?.sentence;
-          if (!sentence) return;
-          const text = sentence.text || "";
-          const isFinal = sentence.sentence_end === true;
-          const speakerId = sentence.speaker_id ?? null;
+        } else if (message.type === "transcript.partial" || message.type === "transcript.final") {
+          const text = message.text || "";
+          const isFinal = message.type === "transcript.final";
+          const speakerId = message.speakerId ?? null;
           if (text) {
             let audioData: Float32Array | undefined;
-            if (isFinal && sentence.begin_time != null && sentence.end_time != null) {
-              audioData = this.extractAudioSegment(sentence.begin_time, sentence.end_time);
+            if (isFinal && message.beginTime != null && message.endTime != null) {
+              audioData = this.extractAudioSegment(message.beginTime, message.endTime);
             }
             this.options?.onResult(text, isFinal, speakerId, audioData);
           }
-        } else if (event === "task-finished") {
-          console.log("[FunASR] Task finished");
-        } else if (event === "task-failed") {
-          const errorMessage = message.header?.error_message || "Task failed";
-          console.error("[FunASR] Task failed:", errorMessage);
-          if (this.taskStartedReject) {
-            this.taskStartedReject(new Error(errorMessage));
-            this.taskStartedReject = null;
+        } else if (message.type === "session.finished") {
+          console.log("[FunASR] Session finished");
+        } else if (message.type === "session.failed") {
+          const errorMessage = message.error || "ASR session failed";
+          console.error("[FunASR] Session failed:", errorMessage);
+          if (this.sessionStartedReject) {
+            this.sessionStartedReject(new Error(errorMessage));
+            this.sessionStartedReject = null;
           }
           this.options?.onError(new Error(errorMessage));
         }
@@ -302,7 +278,7 @@ export class FunASRClient {
 
     let sentCount = 0;
     this.scriptProcessor.onaudioprocess = (event) => {
-      if (!this.isRecording || this.isPaused || !this.taskStarted || this.ws?.readyState !== WebSocket.OPEN) return;
+      if (!this.isRecording || this.isPaused || !this.sessionStarted || this.ws?.readyState !== WebSocket.OPEN) return;
 
       const inputData = event.inputBuffer.getChannelData(0);
       const pcmData = this.convertFloat32ToInt16(inputData);
@@ -367,17 +343,7 @@ export class FunASRClient {
     this.isRecording = false;
 
     if (this.ws?.readyState === WebSocket.OPEN) {
-      const finishTask = {
-        header: {
-          action: "finish-task",
-          task_id: this.taskId,
-          streaming: "duplex",
-        },
-        payload: {
-          input: {},
-        },
-      };
-      this.ws.send(JSON.stringify(finishTask));
+      this.ws.send(JSON.stringify({ type: "session.finish", sessionId: this.sessionId }));
 
       await new Promise((r) => setTimeout(r, 2000));
     }
@@ -393,6 +359,7 @@ export class FunASRClient {
     this.audioContext = null;
     this.mediaStream = null;
     this.ws = null;
+    this.sessionStarted = false;
   }
 }
 

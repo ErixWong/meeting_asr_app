@@ -4,11 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"node server/proxy.mjs\" \"next dev\"",
-    "proxy": "node server/proxy.mjs",
+    "dev": "node scripts/check-dev-ports.mjs && concurrently --kill-others-on-fail \"node server/asr-gateway.mjs\" \"next dev --port 3123\"",
+    "asr-gateway": "node server/asr-gateway.mjs",
     "probe:service": "node scripts/probe-service.mjs",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --port 3123",
     "lint": "next lint"
   },
   "dependencies": {

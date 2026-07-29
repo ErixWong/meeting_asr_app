@@ -20,6 +20,8 @@ export const MOCK_MEETINGS: MeetingRecord[] = [
     title: "产品评审会",
     date: "今天 14:30",
     durationLabel: "25 分钟",
+    status: "pending_review",
+    lastErrorMessage: null,
     summary:
       "## 会议摘要\n\n- 讨论了新版本的产品需求\n- 确认了发布时间节点\n- 分配了开发任务\n\n## 待办事项\n\n- [ ] 张三：整理 PRD 文档\n- [ ] 李四：评估技术可行性",
     transcript: [
@@ -33,6 +35,8 @@ export const MOCK_MEETINGS: MeetingRecord[] = [
     title: "每日站会",
     date: "今天 10:00",
     durationLabel: "12 分钟",
+    status: "sent",
+    lastErrorMessage: null,
     summary: "## 站会纪要\n\n- 各成员同步了昨日进展\n- 确认无阻塞问题",
     transcript: [
       { id: "s1", speaker: "李四", text: "昨天完成了登录模块的开发。", time: "00:02", timeSeconds: 2, isFinal: true },
@@ -44,6 +48,8 @@ export const MOCK_MEETINGS: MeetingRecord[] = [
     title: "需求讨论",
     date: "昨天 15:00",
     durationLabel: "45 分钟",
+    status: "llm_failed",
+    lastErrorMessage: "LLM config incomplete",
     summary: "## 需求讨论\n\n- 梳理了用户核心诉求\n- 确定了 MVP 范围",
     transcript: [
       { id: "s1", speaker: "张三", text: "我们先从用户最痛的点入手。", time: "00:03", timeSeconds: 3, isFinal: true },

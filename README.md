@@ -1,101 +1,73 @@
-# 智能会议纪要 + 任务管理系统
+# 智能会议纪要系统
 
-基于 Next.js 的智能会议纪要系统，支持任务自动识别和管理。
+基于 Next.js 的智能会议纪要系统，支持会议录音转写、会议纪要生成、邮件发送和后台配置管理�?
+## 功能特�?
+- 会议录音转写（FunASR�?- 会议纪要自动生成（LLM�?- 历史会议记录管理
+- ASR Gateway 统一承接前端 WebSocket 连接和敏感配�?- 后台配置管理（ASR、LLM、邮件、提示词模板、热词、用户与权限�?- 邮件发送记录和审计日志
 
-## 功能特性
-
-- 🎙 会议录音转写（FunASR）
-- 📝 会议纪要自动生成（通义千问）
-- 📋 任务自动识别（支持粘贴文本/上传Word）
-- ✅ 任务全生命周期管理
-- 📊 仪表盘统计
-- 📥 Excel导出
-- 🔔 邮件提醒（截止前3天/1天/当天）
-
-## 快速开始
-
+> 任务/行动项跟踪不属于当前产品范围。如后续需要，应作为独立产品开发，并消费本系统输出的转写文本或会议纪要�?
+## 快速开�?
 ### 1. 安装依赖
 
 ```bash
 npm install
 ```
 
-### 2. 配置环境变量
-
-编辑 `.env.local` 文件，配置以下信息：
-
-```env
-# 阿里云 DashScope API Key
-DASHSCOPE_API_KEY=your_api_key
-
-# FunASR Workspace ID
-FUNASR_WORKSPACE_ID=your_workspace_id
-
-# 可选：自建 FunASR 服务地址，支持 http://host:10095 或 ws://host:10095/ws
-FUNASR_SERVER_WS_URL=http://hp.inteva.vip:10095
-
-# 邮件配置（SMTP）
-EMAIL_HOST=smtp.qq.com
-EMAIL_PORT=587
-EMAIL_USER=your_email@qq.com
-EMAIL_PASS=your_smtp_password
-EMAIL_FROM=任务管理系统 <your_email@qq.com>
-```
-
-### 3. 启动开发服务器
-
+### 2. 启动开发服�?
 ```bash
 npm run dev
 ```
 
-访问 http://localhost:3000
+`npm run dev` 会同时启动：
 
-如果使用自建 FunASR 服务，代理会优先读取 `FUNASR_SERVER_WS_URL`，并自动将 `http://...:10095` 规范化为 `ws://...:10095/ws`。未配置该变量时，仍按原来的阿里云 DashScope 方式连接。
+- `server/asr-gateway.mjs`
+- `next dev`
+
+访问 http://localhost:3123
+
+### 3. 配置
+
+敏感配置通过后台管理页保存到本地 SQLite，不应直接放到前端代码中�?
+- ASR 服务地址、Workspace ID、API Key
+- LLM Base URL、API Key、模�?- SMTP 邮件配置
+- 默认提示词模板和热词
 
 ## 项目结构
 
-```
+```text
 src/
 ├── app/
-│   ├── page.tsx                 # 主页（会议录音）
-│   ├── tasks/
-│   │   ├── page.tsx            # 任务列表
-│   │   └── import/page.tsx     # 导入任务
-│   ├── dashboard/
-│   │   └── page.tsx            # 仪表盘统计
-│   └── api/
-│       └── tasks/
-│           ├── route.ts        # 任务CRUD
-│           ├── extract/route.ts # AI任务提取
-│           └── export/route.ts  # Excel导出
-├── lib/
-│   ├── db.ts                   # SQLite数据库
-│   ├── email.ts                # 邮件发送
-│   └── scheduler.ts            # 定时任务
-└── components/
-    └── tasks/
-        ├── TaskList.tsx        # 任务列表组件
-        ├── TaskFilter.tsx      # 筛选组件
-        ├── TaskImport.tsx      # 导入组件
-        └── StatsCard.tsx       # 统计卡片
+�?  ├── page.tsx                 # 主页面：录音、历史会议、转写和纪要
+�?  ├── admin/
+�?  �?  └── page.tsx             # 管理后台
+�?  └── api/
+�?      ├── config/              # 运行配置读取
+�?      ├── meetings/            # 会议、ASR、LLM、邮件发送记�?�?      ├── summarize/           # 兼容纪要生成接口
+�?      └── admin/               # 后台配置、用户、角色、审�?├── components/
+�?  └── main/                    # 录音控件、历史列表、转写视�?├── lib/
+�?  ├── admin-store.ts           # SQLite 存储、配置、会议、审计、极简 RBAC
+�?  ├── api-auth.ts              # 后台 API 角色守卫
+�?  ├── funasr.ts                # 浏览器端 ASR 客户�?�?  ├── store-utils.ts           # 通用存储工具
+�?  └── voiceprint.ts            # 声纹特征提取与聚�?└── types/
+    └── index.ts                 # 类型定义
+
+server/
+├── asr-gateway.mjs              # ASR Gateway
+└── runtime-store.mjs            # Gateway 读取运行配置
 ```
 
 ## 数据存储
 
-使用 SQLite 数据库，数据文件保存在项目根目录的 `data.db` 文件中。
+本地 SQLite 数据库文件位于：
 
-## 邮件配置说明
+```text
+data/meeting-asr-app.db
+```
 
-### QQ邮箱配置
+## 说明
 
-1. 登录QQ邮箱 -> 设置 -> 账户
-2. 开启 SMTP 服务
-3. 生成授权码
-4. 配置到 `.env.local`
+当前项目重点是会议纪要主链路�?
+```text
+录音/上传 -> ASR Gateway -> FunASR -> 转写结果 -> LLM 纪要 -> 邮件发�?```
 
-### 163邮箱配置
-
-1. 登录163邮箱 -> 设置 -> POP3/SMTP/IMAP
-2. 开启 SMTP 服务
-3. 设置授权码
-4. 配置到 `.env.local`
+任务管理、行动项跟踪、提醒调度不在当前产品范围内�?
