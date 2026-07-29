@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import Link from "next/link";
 import {
   RecordStatus,
   MeetingAsrResult,
@@ -732,22 +731,7 @@ export default function MeetingPage() {
         : "border-sky-200 bg-sky-50 text-sky-700";
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <div className="flex items-center gap-2 text-lg font-semibold text-slate-800">
-          <span>🎙</span> 智能会议纪要系统
-        </div>
-        <div className="flex items-center gap-2">
-          <Link
-            href="/admin"
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
-          >
-            ⚙ 管理
-          </Link>
-
-        </div>
-      </header>
-
+    <div className="flex min-h-0 flex-1 flex-col">
       {notice && (
         <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
           <span>{notice.message}</span>
