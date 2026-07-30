@@ -1,10 +1,12 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { useAuthSession } from "@/lib/use-auth-session";
 
 export default function LoginPage() {
   const router = useRouter();
+  const { user, loading } = useAuthSession(true);
   const [accountName, setAccountName] = useState("admin");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -14,6 +16,18 @@ export default function LoginPage() {
     const value = new URLSearchParams(window.location.search).get("next") || "/";
     return value.startsWith("/") && !value.startsWith("//") ? value : "/";
   };
+
+  useEffect(() => {
+    if (loading || !user) return;
+
+    if (user.mustChangePassword) {
+      router.replace("/change-password");
+      return;
+    }
+
+    router.replace(getNextUrl());
+    router.refresh();
+  }, [loading, router, user]);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();

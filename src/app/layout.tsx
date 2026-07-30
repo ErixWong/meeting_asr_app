@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import SessionNav from "@/components/auth/SessionNav";
+import AppHeader from "@/components/layout/AppHeader";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,9 +14,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body>
-        <SessionNav />
-        {children}
+      <body className="min-h-screen bg-slate-50">
+        <div className="flex min-h-screen flex-col">
+          <AppHeader />
+          {children}
+        </div>
       </body>
     </html>
   );
