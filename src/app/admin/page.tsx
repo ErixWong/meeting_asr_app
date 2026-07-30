@@ -394,17 +394,73 @@ export default function AdminPage() {
     setAuditLogs((data.auditLogs ?? []) as AuditLogItem[]);
   };
 
+  const persistTemplate = async (template: PromptTemplateItem) => {
+    const data = await requestJson(`/api/admin/prompt-templates/${template.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        templateKey: template.templateKey,
+        templateName: template.templateName,
+        templateType: template.templateType,
+        content: template.content,
+        description: template.description,
+        status: template.status,
+        isSystem: template.isSystem,
+      }),
+    });
+    return data.template as PromptTemplateItem;
+  };
+
   const saveTemplate = async (template: PromptTemplateItem) => {
     try {
-      const data = await requestJson(`/api/admin/prompt-templates/${template.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(template),
-      });
-      setTemplates((prev) => prev.map((item) => (item.id === template.id ? data.template : item)));
+      const savedTemplate = await persistTemplate(template);
+      setTemplates((prev) => prev.map((item) => (item.id === template.id ? savedTemplate : item)));
       showSuccess("模板已保存");
     } catch (error) {
       showError(`模板保存失败: ${(error as Error).message}`);
+    }
+  };
+
+  const saveDefaultTemplate = async (templateId: string) => {
+    setSavingSettings(true);
+    try {
+      await requestJson("/api/admin/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          settings: [
+            {
+              itemSection: "system",
+              itemMark: "default_prompt_template_id",
+              itemTitle: "默认纪要模板",
+              itemDescription: "自动生成首版结果时使用",
+              itemValue: templateId,
+            },
+          ],
+        }),
+      });
+      setDefaultTemplateId(templateId);
+      await loadAuditLogs();
+      showSuccess("默认模板已保存");
+    } catch (error) {
+      showError(`默认模板保存失败: ${(error as Error).message}`);
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const toggleTemplateStatus = async (template: PromptTemplateItem) => {
+    const nextTemplate = {
+      ...template,
+      status: template.status === "active" ? "disabled" : "active",
+    };
+
+    try {
+      const savedTemplate = await persistTemplate(nextTemplate);
+      setTemplates((prev) => prev.map((item) => (item.id === template.id ? savedTemplate : item)));
+      showSuccess(savedTemplate.status === "active" ? "模板已启用" : "模板已停用");
+    } catch (error) {
+      showError(`模板状态保存失败: ${(error as Error).message}`);
     }
   };
 
@@ -786,23 +842,30 @@ export default function AdminPage() {
                       )}
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={() => saveTemplate(template)} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">
+                      <button
+                        onClick={() => saveTemplate(template)}
+                        className="rounded-md border border-brand bg-brand px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-brand-dark"
+                      >
                         保存
                       </button>
-                      <button onClick={() => setDefaultTemplateId(template.id)} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">
-                        设为默认
+                      <button
+                        onClick={() => saveDefaultTemplate(template.id)}
+                        className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
+                          defaultTemplateId === template.id
+                            ? "cursor-default border-slate-200 bg-slate-100 text-slate-400"
+                            : "border-sky-500 bg-sky-50 text-sky-700 hover:bg-sky-100"
+                        }`}
+                        disabled={savingSettings || defaultTemplateId === template.id}
+                      >
+                        {defaultTemplateId === template.id ? "已默认" : "设为默认"}
                       </button>
                       <button
-                        onClick={() =>
-                          setTemplates((prev) =>
-                            prev.map((item) =>
-                              item.id === template.id
-                                ? { ...item, status: item.status === "active" ? "disabled" : "active" }
-                                : item
-                            )
-                          )
-                        }
-                        className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
+                        onClick={() => toggleTemplateStatus(template)}
+                        className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
+                          template.status === "active"
+                            ? "border-rose-500 bg-rose-50 text-rose-700 hover:bg-rose-100"
+                            : "border-emerald-500 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                        }`}
                       >
                         {template.status === "active" ? "停用" : "启用"}
                       </button>
@@ -849,9 +912,6 @@ export default function AdminPage() {
             </div>
             <div className="mt-3 flex gap-2">
               <button onClick={createTemplate} className={btnCls}>新增模板</button>
-              <button onClick={saveSettings} className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50" disabled={savingSettings}>
-                {savingSettings ? "保存中..." : "保存默认模板"}
-              </button>
             </div>
           </Card>
         )}
