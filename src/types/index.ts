@@ -40,6 +40,19 @@ export interface MeetingLlmResult {
   createdAt?: string;
 }
 
+export interface PromptTemplate {
+  id: string;
+  templateKey: string;
+  templateName: string;
+  templateType: string;
+  content: string;
+  description?: string;
+  status: string;
+  isSystem?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface MeetingSendRecord {
   id: string;
   meetingLlmResultId: string;
