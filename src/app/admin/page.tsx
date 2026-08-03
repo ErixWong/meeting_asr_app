@@ -166,6 +166,9 @@ export default function AdminPage() {
   const [llmUrl, setLlmUrl] = useState("http://qwen.local:8080/v1");
   const [llmKey, setLlmKey] = useState("");
   const [llmModel, setLlmModel] = useState("qwen3.6-35b");
+  const [llmContextSize, setLlmContextSize] = useState("");
+  const [llmMaxTokens, setLlmMaxTokens] = useState("");
+  const [llmTimeoutMs, setLlmTimeoutMs] = useState("");
   const [llmStatus, setLlmStatus] = useState<"ok" | "fail" | "idle">("idle");
 
   const [mailHost, setMailHost] = useState("smtp.example.com");
@@ -241,6 +244,27 @@ export default function AdminPage() {
         itemValue: llmModel,
       },
       {
+        itemSection: "llm",
+        itemMark: "context_size",
+        itemTitle: "上下文大小（字符）",
+        itemDescription: "发送给 LLM 的文本截断长度，留空不截断",
+        itemValue: llmContextSize,
+      },
+      {
+        itemSection: "llm",
+        itemMark: "max_tokens",
+        itemTitle: "最大回复 Tokens",
+        itemDescription: "留空则由 LLM 自行决定回复长度",
+        itemValue: llmMaxTokens,
+      },
+      {
+        itemSection: "llm",
+        itemMark: "timeout_ms",
+        itemTitle: "调用超时（毫秒）",
+        itemDescription: "留空使用默认 180000",
+        itemValue: llmTimeoutMs,
+      },
+      {
         itemSection: "mail",
         itemMark: "smtp_host",
         itemTitle: "SMTP Host",
@@ -299,6 +323,9 @@ export default function AdminPage() {
       llmKey,
       llmModel,
       llmUrl,
+      llmContextSize,
+      llmMaxTokens,
+      llmTimeoutMs,
       mailFromEmail,
       mailFromName,
       mailHost,
@@ -344,6 +371,9 @@ export default function AdminPage() {
         setLlmUrl(get("llm", "base_url", "http://qwen.local:8080/v1"));
         setLlmKey(get("llm", "api_key", ""));
         setLlmModel(get("llm", "model", "qwen3.6-35b"));
+        setLlmContextSize(get("llm", "context_size", ""));
+        setLlmMaxTokens(get("llm", "max_tokens", ""));
+        setLlmTimeoutMs(get("llm", "timeout_ms", ""));
 
         setMailHost(get("mail", "smtp_host", "smtp.example.com"));
         setMailPort(get("mail", "smtp_port", "465"));
@@ -763,6 +793,12 @@ export default function AdminPage() {
             <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} className={inputCls} />
             <label className="mb-1 mt-3 block text-xs text-slate-500">模型名称</label>
             <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)} className={inputCls} />
+            <label className="mb-1 mt-3 block text-xs text-slate-500">上下文大小（字符，留空不截断）</label>
+            <input type="number" min="1" step="1" value={llmContextSize} onChange={(e) => setLlmContextSize(e.target.value)} className={inputCls} placeholder="留空 = 不截断" />
+            <label className="mb-1 mt-3 block text-xs text-slate-500">最大回复 Tokens（留空由 LLM 决定）</label>
+            <input type="number" min="1" step="1" value={llmMaxTokens} onChange={(e) => setLlmMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 由 LLM 决定" />
+            <label className="mb-1 mt-3 block text-xs text-slate-500">调用超时（毫秒，留空默认 180000）</label>
+            <input type="number" min="1" step="1" value={llmTimeoutMs} onChange={(e) => setLlmTimeoutMs(e.target.value)} className={inputCls} placeholder="留空 = 180000" />
             <div className="mt-3 flex items-center justify-between">
               <StatusBadge status={llmStatus} />
               <button onClick={testLlm} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">

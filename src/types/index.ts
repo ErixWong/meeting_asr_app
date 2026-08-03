@@ -37,6 +37,7 @@ export interface MeetingLlmResult {
   resultType: string;
   resultTitle: string;
   resultMarkdown: string;
+  errorMessage?: string | null;
   createdAt?: string;
 }
 

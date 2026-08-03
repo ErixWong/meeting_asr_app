@@ -1,5 +1,8 @@
 ﻿import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { StringDecoder } from "node:string_decoder";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
@@ -393,6 +396,27 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "LLM Model",
         itemDescription: "当前使用模型",
         itemValue: "qwen3.6-35b",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "context_size",
+        itemTitle: "上下文大小（字符）",
+        itemDescription: "发送给 LLM 的文本截断长度，留空不截断",
+        itemValue: "",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "max_tokens",
+        itemTitle: "最大回复 Tokens",
+        itemDescription: "留空则由 LLM 自行决定回复长度",
+        itemValue: "",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "timeout_ms",
+        itemTitle: "调用超时（毫秒）",
+        itemDescription: "留空使用默认 180000",
+        itemValue: "",
       },
       {
         itemSection: "mail",
@@ -1792,6 +1816,110 @@ export function listMeetingLlmResults(meetingId: string) {
   return listMeetingLlmResultsByAsrResultId(asrResult.id);
 }
 
+function truncateUtf16(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  const cut = text.slice(0, maxLength);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) return cut.slice(0, -1);
+  return cut;
+}
+
+function parseSseText(text: string): {
+  content: string;
+  finishReason: string | null;
+  chunkCount: number;
+  reasoningChars: number;
+} {
+  let content = "";
+  let reasoningChars = 0;
+  let finishReason: string | null = null;
+  let chunkCount = 0;
+
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    for (const line of block.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload);
+        chunkCount++;
+        const choice = parsed.choices?.[0];
+        const delta = choice?.delta;
+        if (delta?.content) content += String(delta.content);
+        if (delta?.reasoning_content) reasoningChars += String(delta.reasoning_content).length;
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+      } catch (e) {
+        // skip malformed sse block
+      }
+    }
+  }
+  return { content, finishReason, chunkCount, reasoningChars };
+}
+
+function llmRequest(
+  url: string,
+  options: {
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+    signal: AbortSignal;
+    onData?: (text: string) => void;
+  }
+): Promise<{ status: number; text: string; headersAt: number; bodyAt: number }> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const isHttps = u.protocol === "https:";
+    const transport = isHttps ? httpsRequest : httpRequest;
+    const startedAt = Date.now();
+
+    const req = transport(
+      {
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : isHttps ? 443 : 80,
+        path: `${u.pathname}${u.search}`,
+        method: options.method,
+        headers: options.headers,
+      },
+      (res) => {
+        const headersAt = Date.now();
+        const chunks: Buffer[] = [];
+        const decoder = new StringDecoder("utf8");
+        res.on("data", (chunk) => {
+          const buf = Buffer.from(chunk);
+          chunks.push(buf);
+          if (options.onData) options.onData(decoder.write(buf));
+        });
+        res.on("end", () => {
+          if (options.onData) {
+            const rest = decoder.end();
+            if (rest) options.onData(rest);
+          }
+          resolve({
+            status: res.statusCode ?? 0,
+            text: Buffer.concat(chunks).toString("utf8"),
+            headersAt,
+            bodyAt: Date.now(),
+          });
+        });
+        res.on("error", (err) => reject(new Error(`LLM response read failed: ${err.message}`, { cause: err })));
+      }
+    );
+
+    req.on("error", (err) => reject(new Error(`LLM network error: ${err.message}`, { cause: err })));
+
+    const onAbort = () => {
+      req.destroy();
+      const abortError = new Error(`This operation was aborted after ${Date.now() - startedAt}ms`);
+      abortError.name = "AbortError";
+      reject(abortError);
+    };
+    options.signal.addEventListener("abort", onAbort, { once: true });
+
+    req.write(options.body);
+    req.end();
+  });
+}
+
 export async function createMeetingLlmResult(meetingId: string, templateId?: string) {
   updateMeetingStatus(meetingId, "llm_processing");
   const asrResult = getMeetingAsrResultByMeetingId(meetingId);
@@ -1823,55 +1951,132 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
 
   const existing = listMeetingLlmResultsByAsrResultId(asrResult.id) as any[];
   const versionNo = existing.length > 0 ? Number(existing[0].versionNo) + 1 : 1;
-  const prompt = String(template.content || "").replaceAll("{transcript}", asrResult.normalizedText || "");
+  const rawPrompt = String(template.content || "").replaceAll("{transcript}", asrResult.normalizedText || "");
+  const contextSize = Number(String(get("llm", "context_size") || "").trim()) || 0;
+  const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
+  const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 180000;
+  const prompt = contextSize > 0 && rawPrompt.length > contextSize ? truncateUtf16(rawPrompt, contextSize) : rawPrompt;
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
 
-  let data: any = null;
+  let llmFinishReason: string | null = null;
   let resultMarkdown = "";
+  let rawText = "";
+  const startedAt = Date.now();
 
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: "你是一个专业的会议纪要整理助手。" },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.3,
-        max_tokens: 2000,
-      }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    console.log(
+      `[LLM] generate: meeting=${meetingId} asr=${asrResult.id} model=${model} url=${baseUrl} promptChars=${prompt.length} maxTokens=${maxTokens > 0 ? maxTokens : "auto"} contextSize=${contextSize > 0 ? contextSize : "full"} timeoutMs=${timeoutMs}`
+    );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`LLM API error: ${response.status} ${errorText}`);
+    try {
+      let sseLineBuffer = "";
+      let streamTokenCount = 0;
+      let streamFirstLogged = false;
+      const { status, text, headersAt, bodyAt } = await llmRequest(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "text/event-stream",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: "你是一个专业的会议纪要整理助手。" },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.3,
+          stream: true,
+          ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
+        }),
+        signal: controller.signal,
+        onData: (chunkText) => {
+          sseLineBuffer += chunkText;
+          let nl: number;
+          while ((nl = sseLineBuffer.indexOf("\n")) >= 0) {
+            const line = sseLineBuffer.slice(0, nl).trim();
+            sseLineBuffer = sseLineBuffer.slice(nl + 1);
+            if (!line.startsWith("data:")) continue;
+            if (!streamFirstLogged) {
+              streamFirstLogged = true;
+              console.log(`[LLM] stream: first SSE event received at ${Date.now() - startedAt}ms`);
+            }
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(payload);
+              const delta = parsed.choices?.[0]?.delta;
+              if (delta?.content || delta?.reasoning_content) streamTokenCount++;
+            } catch (e) {}
+          }
+          if (streamTokenCount > 0 && streamTokenCount % 50 === 0) {
+            console.log(`[LLM] stream: tokens=${streamTokenCount} elapsed=${Date.now() - startedAt}ms`);
+          }
+        },
+      });
+
+      console.log(`[LLM] headers: status=${status} elapsed=${headersAt - startedAt}ms`);
+
+      if (status < 200 || status >= 300) {
+        throw new Error(`LLM API error: ${status} ${text.slice(0, 2000)}`);
+      }
+
+      rawText = text;
+      console.log(
+        `[LLM] body: elapsed=${bodyAt - headersAt}ms rawLength=${rawText.length} total=${bodyAt - startedAt}ms`
+      );
+    } finally {
+      clearTimeout(timer);
     }
 
-    data = await response.json();
-    resultMarkdown = data.choices?.[0]?.message?.content || "";
+    if (!rawText.trim()) {
+      throw new Error(`LLM returned empty body (raw=${rawText.slice(0, 500)})`);
+    }
+
+    const sse = parseSseText(rawText);
+    llmFinishReason = sse.finishReason;
+    resultMarkdown = sse.content || "";
+    console.log(
+      `[LLM] parsed: streamChunks=${sse.chunkCount} finishReason=${llmFinishReason ?? "N/A"} contentChars=${String(resultMarkdown).length} reasoningChars=${sse.reasoningChars}`
+    );
+
     if (!String(resultMarkdown).trim()) {
-      throw new Error("LLM returned empty result");
+      throw new Error(
+        `LLM returned empty result (finishReason=${llmFinishReason ?? "N/A"} raw=${rawText.slice(0, 2000)})`
+      );
     }
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : "LLM generation failed";
+    const elapsedMs = Date.now() - startedAt;
+    const isTimeout = error instanceof Error && error.name === "AbortError";
+    const errorCause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+    const causeInfo =
+      errorCause instanceof Error
+        ? ` (${(errorCause as { code?: string }).code ?? errorCause.name}: ${errorCause.message})`
+        : "";
+    const baseMessage = isTimeout
+      ? `LLM timeout after ${timeoutMs}ms`
+      : error instanceof Error
+        ? `${error.message}${causeInfo}`
+        : "LLM generation failed";
+    const errorMessage = `${baseMessage} (elapsed=${elapsedMs}ms)`;
+    console.error(
+      `[LLM] failed: meeting=${meetingId} asr=${asrResult.id} error=${errorMessage}`
+    );
     insertMeetingLlmResult({
       id: newId("llm"),
       meetingAsrResultId: asrResult.id,
       llmSettingMark: "current",
       promptTemplateId: template.id,
-      generationConfigSnapshot: JSON.stringify({ baseUrl, model }),
+      generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
       generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
       status: "failed",
       versionNo,
       resultType: template.templateType || "custom",
       resultTitle: template.templateName,
       rawPrompt: prompt,
-      rawResponse: "",
+      rawResponse: rawText ? rawText.slice(0, 4000) : "",
       resultMarkdown: "",
       errorMessage,
     });
@@ -1896,16 +2101,19 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
     meetingAsrResultId: asrResult.id,
     llmSettingMark: "current",
     promptTemplateId: template.id,
-    generationConfigSnapshot: JSON.stringify({ baseUrl, model }),
+    generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
     generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
     status: "succeeded",
     versionNo,
     resultType: template.templateType || "custom",
     resultTitle: template.templateName,
     rawPrompt: prompt,
-    rawResponse: JSON.stringify(data),
+    rawResponse: rawText.slice(0, 8000),
     resultMarkdown,
-    errorMessage: null,
+    errorMessage:
+      llmFinishReason === "length"
+        ? "结果可能不完整（finish_reason=length，输出被截断）"
+        : null,
   };
 
   insertMeetingLlmResult(row);
@@ -1993,6 +2201,33 @@ export function updateMeetingLlmResult(meetingId: string, id: string, patch: { r
   });
 
   return updated;
+}
+
+export function deleteMeetingLlmResult(meetingId: string, id: string) {
+  const existing = getMeetingLlmResultById(id);
+  if (!existing) return false;
+  if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
+    throw new Error("Meeting LLM result does not belong to this meeting");
+  }
+
+  const database = getDb();
+  database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
+  const result = database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
+  const deleted = Number(result.changes ?? 0) > 0;
+  if (deleted) {
+    writeAuditLog({
+      actionType: "llm_result.delete",
+      resourceType: "meeting_llm_result",
+      resourceId: id,
+      resourceName: existing.resultTitle,
+      beforeSnapshot: {
+        meetingId,
+        resultTitle: existing.resultTitle,
+        resultMarkdown: existing.resultMarkdown,
+      },
+    });
+  }
+  return deleted;
 }
 
 function getMeetingLlmResultById(id: string) {

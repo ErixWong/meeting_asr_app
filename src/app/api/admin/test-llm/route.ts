@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({
           model,
           messages: [{ role: "user", content: "你好，请回复 OK。" }],
-          max_tokens: 8,
+          max_tokens: 256,
           temperature: 0,
         }),
       });
@@ -37,8 +37,11 @@ export async function POST(req: NextRequest) {
 
       return NextResponse.json({ ok: true });
     } catch (error) {
+      const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+      const causeInfo =
+        cause instanceof Error ? ` (${(cause as { code?: string }).code ?? cause.name}: ${cause.message})` : "";
       return NextResponse.json(
-        { ok: false, error: error instanceof Error ? error.message : "LLM test failed" },
+        { ok: false, error: `${error instanceof Error ? error.message : "LLM test failed"}${causeInfo}` },
         { status: 500 }
       );
     }

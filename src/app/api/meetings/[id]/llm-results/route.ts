@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { CONTENT_MANAGER_ROLES, withRequiredRoles } from "@/lib/api-auth";
-import { createMeetingLlmResult, listMeetingLlmResults, updateMeetingLlmResult } from "@/lib/admin-store";
+import {
+  createMeetingLlmResult,
+  deleteMeetingLlmResult,
+  listMeetingLlmResults,
+  updateMeetingLlmResult,
+} from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
@@ -19,6 +24,27 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     } catch (error) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Failed to generate llm result" },
+        { status: 500 }
+      );
+    }
+  });
+}
+
+export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
+  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+    try {
+      const resultId = new URL(req.url).searchParams.get("resultId");
+      if (!resultId) {
+        return NextResponse.json({ error: "resultId query param required" }, { status: 400 });
+      }
+      const deleted = deleteMeetingLlmResult(params.id, resultId);
+      if (!deleted) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+      return NextResponse.json({ ok: true });
+    } catch (error) {
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : "Failed to delete llm result" },
         { status: 500 }
       );
     }
