@@ -743,6 +743,28 @@ export default function MeetingPage() {
     }
   }, [llmResults]);
 
+  const deleteLlmResult = useCallback(
+    async (resultId: string) => {
+      if (!selected) return;
+      const meetingId = selected.id;
+      if (!window.confirm("确定删除该纪要版本？关联的发送记录也会一并删除。")) return;
+      try {
+        await requestJson(`/api/meetings/${meetingId}/llm-results?resultId=${encodeURIComponent(resultId)}`, {
+          method: "DELETE",
+        });
+        if (!isActiveMeeting(meetingId)) return;
+        await loadLlmResults(meetingId);
+        await refreshMeeting(meetingId);
+        showNotice("success", "纪要版本已删除");
+      } catch (error) {
+        console.error("Delete llm result failed:", error);
+        if (!isActiveMeeting(meetingId)) return;
+        showNotice("error", `删除失败: ${(error as Error).message}`);
+      }
+    },
+    [isActiveMeeting, loadLlmResults, refreshMeeting, requestJson, selected, showNotice]
+  );
+
   const saveSummaryEdit = useCallback(async () => {
     if (!selected) return;
     try {
@@ -920,11 +942,6 @@ export default function MeetingPage() {
                   </div>
                 </div>
                 <div className="min-h-0 min-w-0 flex-1 overflow-auto rounded-xl border border-slate-200 bg-white p-4">
-                  {selected.lastErrorMessage && (
-                    <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                      {selected.lastErrorMessage}
-                    </div>
-                  )}
                   {viewTab === "transcript" ? (
                     <TranscriptView segments={selected.transcript} isHistory />
                   ) : viewTab === "asrRaw" ? (
@@ -1045,9 +1062,28 @@ export default function MeetingPage() {
                         </div>
                       )}
 
-                      <div className="min-h-[18rem] flex-1 overflow-hidden rounded-lg border border-slate-200 bg-white">
+                      <div className="flex min-h-[18rem] flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
+                        <div className="grid grid-cols-12 items-center gap-3 border-b border-slate-100 px-4 py-2">
+                          <div className="col-span-9">
+                            {currentLlmResult?.errorMessage ? (
+                              <div className="text-xs text-amber-600">⚠️ {currentLlmResult.errorMessage}</div>
+                            ) : (
+                              <span className="text-xs text-slate-400">纪要内容</span>
+                            )}
+                          </div>
+                          <div className="col-span-3 flex justify-end">
+                            {currentLlmResult && (
+                              <button
+                                onClick={() => deleteLlmResult(currentLlmResult.id)}
+                                className="rounded-md border border-slate-200 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
+                              >
+                                删除该版本
+                              </button>
+                            )}
+                          </div>
+                        </div>
                         {summaryGenerating ? (
-                          <div className="flex h-full min-h-[18rem] flex-col items-center justify-center text-slate-400">
+                          <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center text-slate-400">
                             <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-brand border-t-transparent" />
                             <p>正在生成会议纪要...</p>
                           </div>
@@ -1056,15 +1092,15 @@ export default function MeetingPage() {
                             <textarea
                               value={summaryText}
                               onChange={(e) => setSummaryText(e.target.value)}
-                              className="scroll-thin h-full min-h-[18rem] w-full resize-none whitespace-pre-wrap p-4 text-[15px] leading-relaxed text-slate-700 focus:outline-none"
+                              className="scroll-thin flex-1 min-h-[18rem] w-full resize-none whitespace-pre-wrap p-4 text-[15px] leading-relaxed text-slate-700 focus:outline-none"
                             />
                           ) : (
-                            <div className="scroll-thin h-full min-h-[18rem] overflow-y-auto p-4">
+                            <div className="scroll-thin flex-1 min-h-[18rem] overflow-y-auto p-4">
                               <MarkdownPreview markdown={selected.summary} />
                             </div>
                           )
                         ) : (
-                          <div className="flex h-full min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
+                          <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
                             <p>这个会议还没有纪要版本。</p>
                             <p className="mt-1 text-sm">选择模板后生成，生成结果会作为一个独立版本保留。</p>
                           </div>
