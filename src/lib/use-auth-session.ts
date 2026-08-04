@@ -6,6 +6,7 @@ export type CurrentUser = {
   accountName: string;
   displayName: string;
   mustChangePassword: boolean;
+  roles: string[];
 };
 
 export async function performLogout() {

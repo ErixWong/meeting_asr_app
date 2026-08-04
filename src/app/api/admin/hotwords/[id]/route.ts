@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CONTENT_MANAGER_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { deleteHotword, updateHotword } from "@/lib/admin-store";
 
 export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+  return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json();
       const hotword = updateHotword(params.id, {
@@ -26,7 +26,7 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
 }
 
 export async function DELETE(req: Request, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+  return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const deleted = deleteHotword(params.id);
       if (!deleted) {

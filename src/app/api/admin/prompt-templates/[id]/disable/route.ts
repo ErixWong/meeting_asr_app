@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { CONTENT_MANAGER_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { updatePromptTemplate } from "@/lib/admin-store";
 
 export async function POST(req: Request, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+  return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const template = updatePromptTemplate(params.id, { status: "disabled" });
       if (!template) {

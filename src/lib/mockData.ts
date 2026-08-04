@@ -20,7 +20,7 @@ export const MOCK_MEETINGS: MeetingRecord[] = [
     title: "产品评审会",
     date: "今天 14:30",
     durationLabel: "25 分钟",
-    status: "pending_review",
+    status: "generated",
     lastErrorMessage: null,
     summary:
       "## 会议摘要\n\n- 讨论了新版本的产品需求\n- 确认了发布时间节点\n- 分配了开发任务\n\n## 待办事项\n\n- [ ] 张三：整理 PRD 文档\n- [ ] 李四：评估技术可行性",

@@ -21,6 +21,7 @@ import RecordingControls from "@/components/main/RecordingControls";
 import TranscriptView from "@/components/main/TranscriptView";
 import HistoryList from "@/components/main/HistoryList";
 import { formatTime } from "@/components/main/RecordingControls";
+import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
 
@@ -37,7 +38,9 @@ export default function MeetingPage() {
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
-  const [viewTab, setViewTab] = useState<"transcript" | "summary" | "asrRaw">("transcript");
+  const [viewTab, setViewTab] = useState<"transcript" | "summary" | "asrRaw">("summary");
+  const { user: currentUser } = useAuthSession(true);
+  const isAdmin = Boolean(currentUser?.roles?.includes("system_admin"));
   const [summaryGenerating, setSummaryGenerating] = useState(false);
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState("");
@@ -833,7 +836,7 @@ export default function MeetingPage() {
                 updateSummaryGenerating(false, null);
                 setSendingMail(false);
                 setLiveSegments([]);
-                setViewTab("transcript");
+                setViewTab("summary");
                 loadLlmResults(m.id).catch(console.error);
                 loadSendRecords(m.id).catch(console.error);
                 loadAsrResults(m.id).catch(console.error);
@@ -901,16 +904,6 @@ export default function MeetingPage() {
                   <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
                     <div className="flex gap-1 rounded-lg bg-slate-100 p-1">
                       <button
-                        onClick={() => setViewTab("transcript")}
-                        className={`rounded-md px-3 py-1 text-sm ${
-                          viewTab === "transcript"
-                            ? "bg-white text-brand shadow-sm"
-                            : "text-slate-500"
-                        }`}
-                      >
-                        转写记录
-                      </button>
-                      <button
                         onClick={() => {
                           setViewTab("summary");
                           setEditingSummary(false);
@@ -923,6 +916,17 @@ export default function MeetingPage() {
                       >
                         会议纪要
                       </button>
+                      <button
+                        onClick={() => setViewTab("transcript")}
+                        className={`rounded-md px-3 py-1 text-sm ${
+                          viewTab === "transcript"
+                            ? "bg-white text-brand shadow-sm"
+                            : "text-slate-500"
+                        }`}
+                      >
+                        转写记录
+                      </button>
+                      {isAdmin && (
                       <button
                         onClick={() => {
                           setViewTab("asrRaw");
@@ -938,6 +942,7 @@ export default function MeetingPage() {
                       >
                         原始 ASR
                       </button>
+                      )}
                     </div>
                   </div>
                 </div>

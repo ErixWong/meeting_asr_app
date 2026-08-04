@@ -1,6 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { useAuthSession } from "@/lib/use-auth-session";
 
 type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit";
 
@@ -45,6 +47,19 @@ type UserItem = {
   department: string;
   status: string;
   roles: RoleItem[];
+};
+
+type UserModalState = { mode: "create" } | { mode: "edit"; user: UserItem };
+
+type UserDraft = {
+  id?: string;
+  accountName: string;
+  displayName: string;
+  email: string;
+  department: string;
+  status: string;
+  roleKeys: string[];
+  password: string;
 };
 
 type AuditLogItem = {
@@ -155,6 +170,7 @@ export default function AdminPage() {
   const [activeTab, setActiveTab] = useState<AdminTab>("asr");
   const [loading, setLoading] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
+  const { user: currentUser, loading: authLoading } = useAuthSession(true);
 
   const [funasrProvider, setFunasrProvider] = useState("local_funasr");
   const [funasrUrl, setFunasrUrl] = useState("ws://funasr.local:10095/ws");
@@ -186,6 +202,9 @@ export default function AdminPage() {
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
   const [notice, setNotice] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [userModal, setUserModal] = useState<UserModalState | null>(null);
+  const [userDraft, setUserDraft] = useState<UserDraft | null>(null);
+  const [savingUser, setSavingUser] = useState(false);
 
   const inputCls =
     "w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand";
@@ -348,6 +367,7 @@ export default function AdminPage() {
   const showError = (text: string) => setNotice({ type: "error", text });
 
   useEffect(() => {
+    if (authLoading || !currentUser || !currentUser.roles.includes("system_admin")) return;
     const loadAdminData = async () => {
       try {
         const [settingsData, templatesData, hotwordsData, usersData, rolesData, auditLogsData] = await Promise.all([
@@ -400,7 +420,7 @@ export default function AdminPage() {
     };
 
     loadAdminData().catch(console.error);
-  }, []);
+  }, [authLoading, currentUser]);
 
   const saveSettings = async () => {
     setSavingSettings(true);
@@ -554,63 +574,106 @@ export default function AdminPage() {
 
   const roleKeysOf = (user: UserItem) => user.roles.map((role) => role.roleKey);
 
-  const saveUser = async (user: UserItem) => {
-    try {
-      const data = await requestJson(`/api/admin/users/${user.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          accountName: user.accountName,
-          displayName: user.displayName,
-          email: user.email,
-          department: user.department,
-          status: user.status,
-          roleKeys: roleKeysOf(user),
-        }),
-      });
-      setUsers((prev) => prev.map((item) => (item.id === user.id ? data.user : item)));
-      await loadAuditLogs();
-      showSuccess("用户已保存");
-    } catch (error) {
-      showError(`保存用户失败: ${(error as Error).message}`);
-    }
+  const openCreateUser = () => {
+    setUserDraft({ accountName: "", displayName: "", email: "", department: "", status: "active", roleKeys: ["user"], password: "" });
+    setUserModal({ mode: "create" });
   };
 
-  const createUser = async () => {
-    try {
-      const data = await requestJson("/api/admin/users", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          accountName: `user_${Date.now()}`,
-          displayName: "新用户",
-          email: "",
-          department: "",
-          status: "active",
-          roleKeys: ["user"],
-        }),
-      });
-      setUsers((prev) => [...prev, data.user]);
-      await loadAuditLogs();
-      showSuccess("用户已新增");
-    } catch (error) {
-      showError(`新增用户失败: ${(error as Error).message}`);
-    }
+  const openEditUser = (user: UserItem) => {
+    setUserDraft({
+      id: user.id,
+      accountName: user.accountName,
+      displayName: user.displayName,
+      email: user.email,
+      department: user.department,
+      status: user.status,
+      roleKeys: roleKeysOf(user),
+      password: "",
+    });
+    setUserModal({ mode: "edit", user });
   };
 
-  const toggleUserRole = (userId: string, role: RoleItem) => {
-    setUsers((prev) =>
-      prev.map((user) => {
-        if (user.id !== userId) return user;
-        const hasRole = user.roles.some((item) => item.roleKey === role.roleKey);
-        return {
-          ...user,
-          roles: hasRole
-            ? user.roles.filter((item) => item.roleKey !== role.roleKey)
-            : [...user.roles, role],
-        };
-      })
-    );
+  const closeUserModal = () => {
+    setUserModal(null);
+    setUserDraft(null);
+  };
+
+  const toggleDraftRole = (roleKey: string) => {
+    setUserDraft((prev) => {
+      if (!prev) return prev;
+      const hasRole = prev.roleKeys.includes(roleKey);
+      return {
+        ...prev,
+        roleKeys: hasRole ? prev.roleKeys.filter((key) => key !== roleKey) : [...prev.roleKeys, roleKey],
+      };
+    });
+  };
+
+  const submitUserModal = async () => {
+    if (!userDraft || savingUser) return;
+    const password = userDraft.password.trim();
+    if (userModal?.mode === "create") {
+      if (!password) {
+        showError("请设置初始密码");
+        return;
+      }
+      if (password.length < 8) {
+        showError("密码至少 8 位");
+        return;
+      }
+    }
+    if (userModal?.mode === "edit" && password && password.length < 8) {
+      showError("密码至少 8 位");
+      return;
+    }
+    setSavingUser(true);
+    try {
+      if (userModal?.mode === "edit" && userDraft.id) {
+        const data = await requestJson(`/api/admin/users/${userDraft.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accountName: userDraft.accountName,
+            displayName: userDraft.displayName,
+            email: userDraft.email,
+            department: userDraft.department,
+            status: userDraft.status,
+            roleKeys: userDraft.roleKeys,
+            password: password ? userDraft.password : undefined,
+          }),
+        });
+        setUsers((prev) => prev.map((item) => (item.id === userDraft.id ? data.user : item)));
+        showSuccess(password ? "用户已保存（密码已重置）" : "用户已保存");
+      } else {
+        if (!userDraft.accountName.trim()) {
+          showError("账号不能为空");
+          return;
+        }
+        const data = await requestJson("/api/admin/users", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accountName: userDraft.accountName,
+            displayName: userDraft.displayName,
+            email: userDraft.email,
+            department: userDraft.department,
+            status: userDraft.status,
+            roleKeys: userDraft.roleKeys,
+            password: userDraft.password,
+          }),
+        });
+        setUsers((prev) => [...prev, data.user]);
+        showSuccess("用户已新增");
+      }
+      await loadAuditLogs();
+      closeUserModal();
+    } catch (error) {
+      showError(
+        userModal?.mode === "edit" ? `保存用户失败: ${(error as Error).message}` : `新增用户失败: ${(error as Error).message}`
+      );
+    } finally {
+      setSavingUser(false);
+    }
   };
 
   const testFunasr = async () => {
@@ -679,6 +742,33 @@ export default function AdminPage() {
       showError(`邮件测试失败: ${(error as Error).message}`);
     }
   };
+
+  if (authLoading) {
+    return (
+      <div className="flex flex-1 items-center justify-center bg-slate-50">
+        <div className="rounded-xl border border-slate-200 bg-white px-8 py-6 text-sm text-slate-500 shadow-sm">
+          正在加载...
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser || !currentUser.roles.includes("system_admin")) {
+    return (
+      <div className="flex flex-1 items-center justify-center bg-slate-50">
+        <div className="rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+          <div className="text-lg font-semibold text-slate-800">无权限访问</div>
+          <p className="mt-2 text-sm text-slate-500">当前账号不是系统管理员，无法访问管理后台。</p>
+          <Link
+            href="/"
+            className="mt-4 inline-block rounded-md bg-brand px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-dark"
+          >
+            返回主界面
+          </Link>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 bg-slate-50">
@@ -1070,101 +1160,35 @@ export default function AdminPage() {
                 </thead>
                 <tbody>
                   {users.map((user) => (
-                    <tr key={user.id} className="border-t border-slate-100 align-top">
+                    <tr key={user.id} className="border-t border-slate-100">
                       <td className="px-3 py-2">
-                        <input
-                          value={user.accountName}
-                          disabled={user.id === "user-admin"}
-                          onChange={(e) =>
-                            setUsers((prev) =>
-                              prev.map((item) =>
-                                item.id === user.id ? { ...item, accountName: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-32 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
-                        />
-                        {user.id === "user-admin" && (
-                          <div className="mt-1 text-[11px] text-slate-400">bootstrap admin</div>
-                        )}
+                        <div className="font-medium text-slate-800">{user.accountName}</div>
+                        {user.id === "user-admin" && <div className="text-[11px] text-slate-400">bootstrap admin</div>}
                       </td>
+                      <td className="px-3 py-2 text-slate-600">{user.displayName || "-"}</td>
+                      <td className="px-3 py-2 text-slate-600">{user.email || "-"}</td>
+                      <td className="px-3 py-2 text-slate-600">{user.department || "-"}</td>
                       <td className="px-3 py-2">
-                        <input
-                          value={user.displayName}
-                          onChange={(e) =>
-                            setUsers((prev) =>
-                              prev.map((item) =>
-                                item.id === user.id ? { ...item, displayName: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <input
-                          value={user.email}
-                          onChange={(e) =>
-                            setUsers((prev) =>
-                              prev.map((item) =>
-                                item.id === user.id ? { ...item, email: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-44 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <input
-                          value={user.department}
-                          onChange={(e) =>
-                            setUsers((prev) =>
-                              prev.map((item) =>
-                                item.id === user.id ? { ...item, department: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <select
-                          value={user.status}
-                          disabled={user.id === "user-admin"}
-                          onChange={(e) =>
-                            setUsers((prev) =>
-                              prev.map((item) =>
-                                item.id === user.id ? { ...item, status: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
+                        <span
+                          className={`rounded px-2 py-0.5 text-xs ${
+                            user.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"
+                          }`}
                         >
-                          <option value="active">active</option>
-                          <option value="disabled">disabled</option>
-                        </select>
+                          {user.status === "active" ? "启用" : "停用"}
+                        </span>
                       </td>
                       <td className="px-3 py-2">
-                        <div className="flex flex-wrap gap-2">
-                          {roles.map((role) => {
-                            const checked = user.roles.some((item) => item.roleKey === role.roleKey);
-                            return (
-                              <label key={role.id} className="flex items-center gap-1 rounded bg-slate-50 px-2 py-1 text-xs text-slate-600">
-                                <input
-                                  type="checkbox"
-                                  checked={checked}
-                                  disabled={user.id === "user-admin" && role.roleKey === "system_admin"}
-                                  onChange={() => toggleUserRole(user.id, role)}
-                                />
-                                {role.roleName}
-                              </label>
-                            );
-                          })}
+                        <div className="flex flex-wrap gap-1">
+                          {user.roles.map((role) => (
+                            <span key={role.id} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+                              {role.roleName}
+                            </span>
+                          ))}
                         </div>
                       </td>
                       <td className="px-3 py-2">
-                        <button onClick={() => saveUser(user)} className="text-slate-500 hover:text-slate-700">
-                          保存
+                        <button onClick={() => openEditUser(user)} className="text-sky-600 hover:text-sky-800">
+                          编辑
                         </button>
                       </td>
                     </tr>
@@ -1173,9 +1197,127 @@ export default function AdminPage() {
               </table>
             </div>
             <div className="mt-3">
-              <button onClick={createUser} className={btnCls}>新增用户</button>
+              <button onClick={openCreateUser} className={btnCls}>新增用户</button>
             </div>
           </Card>
+        )}
+
+        {userModal && userDraft && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+            <div
+              className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-lg"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="mb-4 text-base font-semibold text-slate-800">
+                {userModal.mode === "edit" ? "编辑用户" : "新增用户"}
+              </h3>
+              <div className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">账号</label>
+                  <input
+                    value={userDraft.accountName}
+                    disabled={userModal.mode === "edit" && userModal.user.id === "user-admin"}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, accountName: e.target.value } : prev))}
+                    className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
+                    placeholder="登录账号"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">姓名</label>
+                  <input
+                    value={userDraft.displayName}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, displayName: e.target.value } : prev))}
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">邮箱</label>
+                  <input
+                    value={userDraft.email}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, email: e.target.value } : prev))}
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">部门</label>
+                  <input
+                    value={userDraft.department}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, department: e.target.value } : prev))}
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">
+                    密码{userModal.mode === "create" ? "（初始密码，至少 8 位，首登需修改）" : "（留空则不修改；重置后需在下次登录时修改）"}
+                  </label>
+                  <input
+                    type="password"
+                    value={userDraft.password}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, password: e.target.value } : prev))}
+                    className={inputCls}
+                    placeholder={userModal.mode === "create" ? "至少 8 位" : "留空则不修改"}
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">状态</label>
+                  <select
+                    value={userDraft.status}
+                    disabled={userModal.mode === "edit" && userModal.user.id === "user-admin"}
+                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, status: e.target.value } : prev))}
+                    className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
+                  >
+                    <option value="active">启用</option>
+                    <option value="disabled">停用</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">角色</label>
+                  <div className="flex flex-wrap gap-2">
+                    {roles.map((role) => {
+                      const checked = userDraft.roleKeys.includes(role.roleKey);
+                      const isProtected =
+                        userModal.mode === "edit" &&
+                        userModal.user.id === "user-admin" &&
+                        role.roleKey === "system_admin";
+                      return (
+                        <label
+                          key={role.id}
+                          className="flex items-center gap-1 rounded bg-slate-50 px-2 py-1 text-xs text-slate-600"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={isProtected}
+                            onChange={() => toggleDraftRole(role.roleKey)}
+                          />
+                          {role.roleName}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  onClick={closeUserModal}
+                  disabled={savingUser}
+                  className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  取消
+                </button>
+                <button onClick={submitUserModal} disabled={savingUser} className={btnCls}>
+                  {savingUser
+                    ? userModal.mode === "edit"
+                      ? "保存中..."
+                      : "创建中..."
+                    : userModal.mode === "edit"
+                      ? "保存"
+                      : "创建"}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
 
         {!loading && activeTab === "audit" && (
