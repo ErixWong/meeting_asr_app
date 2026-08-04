@@ -8,7 +8,7 @@ import {
 import { SESSION_COOKIE_NAME } from "@/lib/auth-constants";
 
 export const ADMIN_ROLES = ["system_admin"];
-export const CONTENT_MANAGER_ROLES = ["minutes_admin", "system_admin"];
+export const CONTENT_ROLES = ["user", "system_admin"];
 
 function readCookie(req: Request, name: string) {
   const cookieHeader = req.headers.get("cookie") || "";

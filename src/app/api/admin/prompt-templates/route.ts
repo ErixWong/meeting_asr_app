@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CONTENT_MANAGER_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { ADMIN_ROLES, CONTENT_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { createPromptTemplate, listPromptTemplates } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
-  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+  return withRequiredRoles(req, CONTENT_ROLES, async () => {
   return NextResponse.json({ templates: listPromptTemplates() });
   });
 }
 
 export async function POST(req: NextRequest) {
-  return withRequiredRoles(req, CONTENT_MANAGER_ROLES, async () => {
+  return withRequiredRoles(req, ADMIN_ROLES, async () => {
   try {
       const body = await req.json();
       const template = createPromptTemplate({

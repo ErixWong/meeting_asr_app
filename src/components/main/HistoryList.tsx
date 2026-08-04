@@ -90,10 +90,12 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
                   >
                     <button
                       onClick={() => startRename(m)}
-                      className="rounded p-0.5 text-xs text-slate-400 hover:bg-slate-200 hover:text-slate-600"
+                      className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-600"
                       title="重命名"
                     >
-                      ✏️
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5" aria-hidden="true">
+                        <path d="M11.78 1.72a1.5 1.5 0 0 1 2.12 2.12l-7.6 7.6-2.83.71.71-2.83 7.6-7.6Z" />
+                      </svg>
                     </button>
                     <button
                       onClick={() => {
@@ -101,10 +103,12 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
                           onDelete(m.id);
                         }
                       }}
-                      className="rounded p-0.5 text-xs text-slate-400 hover:bg-red-100 hover:text-red-600"
+                      className="rounded p-1 text-slate-400 hover:bg-red-100 hover:text-red-600"
                       title="删除"
                     >
-                      🗑
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5" aria-hidden="true">
+                        <path d="M6.5 1.5A.5.5 0 0 1 7 1h2a.5.5 0 0 1 .5.5V2h3a.5.5 0 0 1 0 1h-.3l-.7 10.05A1.5 1.5 0 0 1 10.01 14.5H5.99a1.5 1.5 0 0 1-1.49-1.45L3.8 3H3.5a.5.5 0 0 1 0-1h3V1.5ZM5 3l.7 10.02a.5.5 0 0 0 .5.48h3.6a.5.5 0 0 0 .5-.48L11 3H5Zm1.5 1.5a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5Zm3 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5Z" />
+                      </svg>
                     </button>
                   </div>
                 </div>

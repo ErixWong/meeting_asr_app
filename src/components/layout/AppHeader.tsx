@@ -10,6 +10,7 @@ type HeaderConfig = {
   action?: {
     href: string;
     label: string;
+    adminOnly?: boolean;
   };
 };
 
@@ -17,7 +18,7 @@ function getHeaderConfig(pathname: string): HeaderConfig | null {
   if (pathname === "/") {
     return {
       title: "🎙 智能会议纪要系统",
-      action: { href: "/admin", label: "⚙ 管理" },
+      action: { href: "/admin", label: "⚙ 管理", adminOnly: true },
     };
   }
 
@@ -39,6 +40,7 @@ export default function AppHeader() {
   const isProtectedPage = pathname === "/" || pathname === "/admin" || pathname.startsWith("/admin/") || pathname === "/change-password";
   const headerConfig = useMemo(() => getHeaderConfig(pathname), [pathname]);
   const { user, loading, setUser } = useAuthSession(isProtectedPage);
+  const isAdmin = Boolean(user?.roles?.includes("system_admin"));
 
   useEffect(() => {
     if (isLoginPage || !isProtectedPage) return;
@@ -76,7 +78,7 @@ export default function AppHeader() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-wrap items-center gap-3">
           <div className="text-lg font-semibold text-slate-800">{headerConfig.title}</div>
-          {headerConfig.action && (
+          {headerConfig.action && (!headerConfig.action.adminOnly || isAdmin) && (
             <Link
               href={headerConfig.action.href}
               className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"

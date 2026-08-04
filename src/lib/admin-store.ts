@@ -1,4 +1,4 @@
-﻿import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -874,17 +874,21 @@ function listUserRoles(userId: string) {
     .all(userId);
 }
 
-export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[] }) {
+export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; password?: string }) {
   const id = newId("user");
   const createdAt = nowIso();
   const accountName = requireNonEmpty(input.accountName, "Account name");
   const displayName = requireNonEmpty(input.displayName, "Display name");
+  const passwordHash = hashOrNull(input.password);
+  if (!passwordHash) {
+    throw new Error("Password is required when creating a user");
+  }
   getDb()
     .prepare(`
       INSERT INTO users (
         id, account_name, display_name, email, department, external_user_id,
-        status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, created_at, updated_at, password_hash, must_change_password
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
     `)
     .run(
       id,
@@ -895,7 +899,8 @@ export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[] })
       null,
       normalizeStatus(input.status),
       createdAt,
-      createdAt
+      createdAt,
+      passwordHash
     );
 
   setUserRoleKeys(id, input.roleKeys ?? ["user"]);
@@ -910,7 +915,10 @@ export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[] })
   return user;
 }
 
-export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[] }) {
+export function updateUser(
+  id: string,
+  patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[]; password?: string }
+) {
   const before = listUsers().find((item: any) => item.id === id);
   if (!before) return null;
   ensureUserChangeAllowed(id, patch);
@@ -933,6 +941,16 @@ export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { r
 
   if (patch.roleKeys !== undefined) {
     setUserRoleKeys(id, patch.roleKeys);
+  }
+
+  if (patch.password !== undefined) {
+    const passwordHash = hashOrNull(patch.password);
+    if (passwordHash) {
+      getDb()
+        .prepare("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? WHERE id = ?")
+        .run(passwordHash, nowIso(), id);
+      getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(id);
+    }
   }
 
   const after = listUsers().find((item: any) => item.id === id);
@@ -1128,6 +1146,15 @@ function hashPassword(password: string) {
   return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key}`;
 }
 
+function hashOrNull(password: string | null | undefined): string | null {
+  const value = String(password ?? "");
+  if (!value) return null;
+  if (value.length < 8) {
+    throw new Error("Password must be at least 8 characters");
+  }
+  return hashPassword(value);
+}
+
 function verifyPassword(password: string, storedHash: string | null | undefined): PasswordVerificationResult {
   if (!storedHash) return { ok: false, needsRehash: false };
 
@@ -1173,7 +1200,6 @@ function seedIdentityDefaults(database: DatabaseSync) {
   if (roleCount === 0) {
     const roles: RoleRow[] = [
       { id: "role-user", roleKey: "user", roleName: "普通用户" },
-      { id: "role-minutes-admin", roleKey: "minutes_admin", roleName: "纪要管理员" },
       { id: "role-system-admin", roleKey: "system_admin", roleName: "系统管理员" },
     ];
 
@@ -1186,6 +1212,25 @@ function seedIdentityDefaults(database: DatabaseSync) {
         `)
         .run(role.id, role.roleKey, role.roleName, nowIso());
     }
+  }
+
+  const legacyMinutesAdminRole = database
+    .prepare("SELECT id FROM roles WHERE role_key = 'minutes_admin'")
+    .get() as { id: string } | undefined;
+  const systemAdminRoleRow = database
+    .prepare("SELECT id FROM roles WHERE role_key = 'system_admin'")
+    .get() as { id: string } | undefined;
+  if (legacyMinutesAdminRole && systemAdminRoleRow) {
+    database
+      .prepare(`
+        INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
+        SELECT 'user-role-migrated-' || ur.user_id, ur.user_id, ?, ?
+        FROM user_roles ur
+        WHERE ur.role_id = ?
+      `)
+      .run(systemAdminRoleRow.id, nowIso(), legacyMinutesAdminRole.id);
+    database.prepare("DELETE FROM user_roles WHERE role_id = ?").run(legacyMinutesAdminRole.id);
+    database.prepare("DELETE FROM roles WHERE id = ?").run(legacyMinutesAdminRole.id);
   }
 
   const existingBootstrapAdmin = database
@@ -1567,7 +1612,7 @@ export function updateMeetingStatus(id: string, status: string, lastErrorMessage
     `)
     .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id);
 
-  return getMeetingById(id);
+  return getMeetingRowById(id);
 }
 
 export function updateMeeting(id: string, patch: { title?: string }) {
@@ -1599,6 +1644,7 @@ export function updateMeeting(id: string, patch: { title?: string }) {
 export function deleteMeeting(id: string) {
   const database = getDb();
   const before = getMeetingById(id);
+  if (!before) return false;
   const asrRows = database
     .prepare("SELECT id FROM meeting_asr_results WHERE meeting_id = ?")
     .all(id) as Array<{ id: string }>;
@@ -1650,30 +1696,10 @@ function mapMeetingRow(row: any) {
 }
 
 export function listMeetings() {
-  const database = getDb();
-  const rows = database
-    .prepare(`
-      SELECT
-        m.id,
-        m.title,
-        m.status,
-        m.last_error_message as lastErrorMessage,
-        m.source_type as sourceType,
-        m.duration_seconds as durationSeconds,
-        m.created_at as createdAt,
-        r.raw_payload as rawPayload,
-        (
-          SELECT result_markdown
-          FROM meeting_llm_results lr
-          WHERE lr.meeting_asr_result_id = r.id AND lr.status = 'succeeded'
-          ORDER BY lr.version_no DESC, lr.created_at DESC
-          LIMIT 1
-        ) as summary
-      FROM meetings m
-      LEFT JOIN meeting_asr_results r ON r.meeting_id = m.id
-      ORDER BY m.created_at DESC
-    `)
-    .all() as any[];
+  const actor = getCurrentActor();
+  const rows = getDb()
+    .prepare(MEETING_ROW_SELECT + " WHERE m.created_by_user_id = ? ORDER BY m.created_at DESC")
+    .all(actor.id) as any[];
 
   return rows.map((row) => {
     const payload = parseJsonOr(row.rawPayload, { segments: [] } as any);
@@ -1683,28 +1709,45 @@ export function listMeetings() {
 
 export function getMeetingById(id: string) {
   const database = getDb();
-  const row = database
-    .prepare(`
-      SELECT
-        m.id,
-        m.title,
-        m.status,
-        m.last_error_message as lastErrorMessage,
-        m.source_type as sourceType,
-        m.duration_seconds as durationSeconds,
-        m.created_at as createdAt,
-        r.raw_payload as rawPayload,
-        (
-          SELECT result_markdown
-          FROM meeting_llm_results lr
-          WHERE lr.meeting_asr_result_id = r.id AND lr.status = 'succeeded'
-          ORDER BY lr.version_no DESC, lr.created_at DESC
-          LIMIT 1
-        ) as summary
-      FROM meetings m
-      LEFT JOIN meeting_asr_results r ON r.meeting_id = m.id
-      WHERE m.id = ?
-    `)
+  const actor = getCurrentActor();
+  const owner = database
+    .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
+    .get(id) as { ownerId: string } | undefined;
+  if (!owner || owner.ownerId !== actor.id) return null;
+
+  return getMeetingRowById(id);
+}
+
+const MEETING_ROW_SELECT = `
+  SELECT
+    m.id,
+    m.title,
+    m.status,
+    m.last_error_message as lastErrorMessage,
+    m.source_type as sourceType,
+    m.duration_seconds as durationSeconds,
+    m.created_at as createdAt,
+    (
+      SELECT r2.raw_payload
+      FROM meeting_asr_results r2
+      WHERE r2.meeting_id = m.id
+      ORDER BY r2.created_at DESC
+      LIMIT 1
+    ) as rawPayload,
+    (
+      SELECT lr.result_markdown
+      FROM meeting_llm_results lr
+      INNER JOIN meeting_asr_results r3 ON r3.id = lr.meeting_asr_result_id
+      WHERE r3.meeting_id = m.id AND lr.status = 'succeeded'
+      ORDER BY lr.version_no DESC, lr.created_at DESC
+      LIMIT 1
+    ) as summary
+  FROM meetings m
+`;
+
+function getMeetingRowById(id: string) {
+  const row = getDb()
+    .prepare(MEETING_ROW_SELECT + " WHERE m.id = ?")
     .get(id) as any;
 
   if (!row) return null;
@@ -2117,7 +2160,7 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
   };
 
   insertMeetingLlmResult(row);
-  updateMeetingStatus(meetingId, "pending_review");
+  updateMeetingStatus(meetingId, "generated");
   writeAuditLog({
     actionType: row.generationMode === "default_auto" ? "llm.generate_default" : "llm.regenerate",
     resourceType: "meeting_llm_result",
