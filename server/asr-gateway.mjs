@@ -54,6 +54,22 @@ function parseJsonMessage(value) {
   }
 }
 
+const MAX_PARTIAL_ACCUM_CHARS = 2000;
+
+// Local FunASR 2pass 的 online partial 是增量文本（每次只含新识别出的片段），
+// 而前端契约是"当前句完整文本"整体替换。这里把增量累积成完整句子再转发；
+// 若增量恰好是已累积文本的尾部（上游重复/重发），直接跳过，避免拼接重复。
+function accumulatePartialText(accum, delta) {
+  const text = typeof delta === "string" ? delta : "";
+  if (!text) return accum;
+  if (accum.endsWith(text)) return accum;
+  let next = accum + text;
+  if (next.length > MAX_PARTIAL_ACCUM_CHARS) {
+    next = next.slice(-MAX_PARTIAL_ACCUM_CHARS);
+  }
+  return next;
+}
+
 function sendAppMessage(clientWs, type, payload = {}) {
   if (clientWs.readyState !== WebSocket.OPEN) return;
   clientWs.send(JSON.stringify({ type, ...payload }));
@@ -272,6 +288,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   let captureSessionId = "";
   let providerAdapter = null;
   let upstreamConnectTimer = null;
+  let partialAccumText = "";
   const pendingAudio = [];
   const MAX_PENDING_AUDIO_CHUNKS = 120;
   const UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
@@ -280,6 +297,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   function failSession(errorMessage) {
     if (sessionFinished || sessionFailed) return;
     sessionFailed = true;
+    partialAccumText = "";
     console.error("[ASR Gateway] Session failed:", errorMessage);
     if (captureSessionId) {
       finishCaptureSession(captureSessionId, "failed");
@@ -328,6 +346,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   function finishSession() {
     if (sessionFinished || sessionFailed) return;
     sessionFinished = true;
+    partialAccumText = "";
     if (captureSessionId) {
       finishCaptureSession(captureSessionId);
     }
@@ -406,6 +425,14 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       }
 
       if (event.type === "transcript") {
+        if (providerAdapter.name === "local_funasr") {
+          if (event.isFinal) {
+            partialAccumText = "";
+          } else {
+            partialAccumText = accumulatePartialText(partialAccumText, event.transcript.text);
+            event.transcript = { ...event.transcript, text: partialAccumText };
+          }
+        }
         sendAppMessage(clientWs, event.isFinal ? "transcript.final" : "transcript.partial", {
           sessionId,
           ...event.transcript,
