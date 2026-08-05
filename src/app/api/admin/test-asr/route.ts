@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { getSettingValue } from "@/lib/admin-store";
 
 type DiagnosticStep = {
   step: string;
@@ -16,6 +17,30 @@ type AsrDiagnostics = {
   workspaceId?: string;
   steps: DiagnosticStep[];
 };
+
+type HttpRequestOptions = import("http").RequestOptions & {
+  rejectUnauthorized?: boolean;
+};
+
+type HttpClient = {
+  request: (
+    options: HttpRequestOptions,
+    callback: (response: import("http").IncomingMessage) => void
+  ) => import("http").ClientRequest;
+};
+
+type WebSocketProbe = {
+  terminate: () => void;
+  close: () => void;
+  on: {
+    (event: "open", listener: () => void): WebSocketProbe;
+    (event: "unexpected-response", listener: (request: unknown, response: { statusCode?: number; statusMessage?: string }) => void): WebSocketProbe;
+    (event: "close", listener: (code: number, reason: Buffer) => void): WebSocketProbe;
+    (event: "error", listener: (error: Error) => void): WebSocketProbe;
+  };
+};
+
+type WebSocketConstructor = new (url: string, options?: { headers?: Record<string, string> }) => WebSocketProbe;
 
 function normalizeFunasrUrl(rawUrl: string) {
   if (!rawUrl) return "";
@@ -97,7 +122,7 @@ async function probeHttp(url: URL, headers?: Record<string, string>): Promise<Di
   return new Promise((resolve) => {
     const client = (eval("require") as NodeRequire)(
       url.protocol === "wss:" ? "https" : "http"
-    ) as { request: (...args: any[]) => import("http").ClientRequest };
+    ) as HttpClient;
     const req = client.request(
       {
         hostname: url.hostname,
@@ -137,7 +162,7 @@ async function probeHttp(url: URL, headers?: Record<string, string>): Promise<Di
 async function probeWebSocket(url: string, headers?: Record<string, string>): Promise<DiagnosticStep> {
   const startedAt = Date.now();
   return new Promise((resolve) => {
-    const Ws = (eval("require") as NodeRequire)("ws").WebSocket as any;
+    const Ws = (eval("require") as NodeRequire)("ws").WebSocket as WebSocketConstructor;
     const ws = new Ws(url, headers ? { headers } : undefined);
     let settled = false;
     const finish = (step: DiagnosticStep) => {
@@ -209,7 +234,7 @@ export async function POST(req: NextRequest) {
       const body = await req.json();
       const providerType = body.providerType || "local_funasr";
       const endpoint = String(body.endpoint || "");
-      const apiKey = String(body.apiKey || "");
+      const apiKey = String(body.apiKey || getSettingValue("asr", "api_key"));
       const workspaceId = String(body.workspaceId || "");
 
       const targetUrl = providerType === "dashscope"

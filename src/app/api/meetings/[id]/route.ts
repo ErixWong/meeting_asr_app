@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CONTENT_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { deleteMeeting, getMeetingById, updateMeeting } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
-    const meeting = getMeetingById(params.id);
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
+    const meeting = getMeetingById(id);
     if (!meeting) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
@@ -14,11 +15,12 @@ export async function GET(req: Request, { params }: { params: { id: string } }) 
   });
 }
 
-export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
       const body = await req.json();
-      const meeting = updateMeeting(params.id, {
+      const meeting = updateMeeting(id, {
         title: body.title,
       });
 
@@ -36,9 +38,10 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
   });
 }
 
-export async function DELETE(req: Request, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
-    const deleted = deleteMeeting(params.id);
+export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
+    const deleted = deleteMeeting(id);
     if (!deleted) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

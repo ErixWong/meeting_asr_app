@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { deleteHotword, updateHotword } from "@/lib/admin-store";
 
-export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
+export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json();
-      const hotword = updateHotword(params.id, {
+      const hotword = updateHotword(id, {
         term: body.term,
         weight: body.weight === undefined ? undefined : Number(body.weight),
         status: body.status,
@@ -25,10 +26,11 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
   });
 }
 
-export async function DELETE(req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
-      const deleted = deleteHotword(params.id);
+      const deleted = deleteHotword(id);
       if (!deleted) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

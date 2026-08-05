@@ -1,6 +1,6 @@
 import net from "net";
 
-const ports = [3123, 8123];
+const ports = [Number(process.env.PORT || 3123)];
 const host = "127.0.0.1";
 
 function checkPort(port) {
@@ -35,4 +35,4 @@ if (blocked.length > 0) {
   process.exit(1);
 }
 
-console.log("Dev ports available: 3123, 8123");
+console.log(`Dev port available: ${ports[0]}`);

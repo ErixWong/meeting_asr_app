@@ -1,17 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CONTENT_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import { createMeeting, createMeetingLlmResult, listMeetings } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
   return NextResponse.json({ meetings: listMeetings() });
   });
 }
 
 export async function POST(req: NextRequest) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
   try {
       const body = await req.json();
       const meeting = createMeeting({

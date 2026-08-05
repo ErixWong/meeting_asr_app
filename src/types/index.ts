@@ -29,7 +29,8 @@ export interface MeetingRecord {
 
 export interface MeetingLlmResult {
   id: string;
-  meetingAsrResultId: string;
+  meetingId: string;
+  inputTranscriptSnapshot: string;
   promptTemplateId: string;
   generationMode: string;
   status: string;

@@ -1,17 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CONTENT_ROLES, withRequiredRoles } from "@/lib/api-auth";
-import { createMeetingSendRecord, getMeetingById } from "@/lib/admin-store";
+import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { createMeetingSendRecord } from "@/lib/admin-store";
 
-export async function POST(req: NextRequest, { params }: { params: { id: string } }) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
+export async function POST(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
-      const meeting = getMeetingById(params.id);
-      if (!meeting) {
-        return NextResponse.json({ error: "Not found" }, { status: 404 });
-      }
       const body = await req.json();
       const sendRecord = await createMeetingSendRecord({
-        meetingId: params.id,
+        meetingId: id,
         meetingLlmResultId: body.meetingLlmResultId,
         subject: body.subject,
         toRecipients: body.toRecipients ?? [],

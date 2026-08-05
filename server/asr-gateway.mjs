@@ -2,15 +2,15 @@ import { randomUUID } from "crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import {
   appendCaptureEvent,
+  authorizeAsrGatewaySession,
   cleanupExpiredCaptureSessions,
   createCaptureSession,
   finishCaptureSession,
   getAsrRuntimeConfig,
 } from "./runtime-store.mjs";
 
-const PORT = Number(process.env.ASR_GATEWAY_PORT || 8123);
-const HOST = process.env.ASR_GATEWAY_HOST || "127.0.0.1";
-const DEFAULT_ALLOWED_ORIGINS = "http://localhost:3123,http://127.0.0.1:3123";
+const APP_PORT = Number(process.env.PORT || 3123);
+const DEFAULT_ALLOWED_ORIGINS = `http://localhost:${APP_PORT},http://127.0.0.1:${APP_PORT}`;
 const allowedOrigins = new Set(
   (process.env.ASR_GATEWAY_ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS)
     .split(",")
@@ -18,11 +18,31 @@ const allowedOrigins = new Set(
     .filter(Boolean)
 );
 
-const wss = new WebSocketServer({ host: HOST, port: PORT });
-
 function isAllowedClientOrigin(req) {
   const origin = req.headers.origin;
   return typeof origin === "string" && allowedOrigins.has(origin);
+}
+
+function readCookie(req, name) {
+  const cookieHeader = req.headers.cookie || "";
+  const cookie = cookieHeader
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${name}=`));
+  if (!cookie) return "";
+  try {
+    return decodeURIComponent(cookie.slice(name.length + 1));
+  } catch {
+    return "";
+  }
+}
+
+function rejectUpgrade(socket, status, message) {
+  const statusText = status === 403 ? "Forbidden" : "Unauthorized";
+  socket.write(
+    `HTTP/1.1 ${status} ${statusText}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`
+  );
+  socket.destroy();
 }
 
 function parseJsonMessage(value) {
@@ -231,9 +251,10 @@ function createProviderAdapter(runtimeConfig, session) {
   return null;
 }
 
-console.log(`[ASR Gateway] Running on ws://${HOST}:${PORT}`);
+export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, devMode = false } = {}) {
+  const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", (clientWs, req) => {
+  wss.on("connection", (clientWs, req) => {
   if (!isAllowedClientOrigin(req)) {
     console.warn(`[ASR Gateway] Rejected client origin: ${req.headers.origin || "(missing)"}`);
     clientWs.close(1008, "Origin is not allowed");
@@ -335,7 +356,11 @@ wss.on("connection", (clientWs, req) => {
       const rawMessage = typeof data === "string" ? data : data.toString();
       const messageFromAsr = parseJsonMessage(rawMessage);
       if (captureSessionId && messageFromAsr) {
-        appendCaptureEvent(captureSessionId, messageFromAsr);
+        const accepted = appendCaptureEvent(captureSessionId, messageFromAsr);
+        if (!accepted) {
+          failSession("ASR capture event limit exceeded or session expired");
+          return;
+        }
       }
 
       const event = providerAdapter.parseMessage(messageFromAsr);
@@ -445,4 +470,43 @@ wss.on("connection", (clientWs, req) => {
       targetWs.close();
     }
   });
-});
+  });
+
+  function handleUpgrade(req, socket, head) {
+    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (requestUrl.pathname !== path) {
+      onUnhandledUpgrade?.(req, socket, head);
+      return;
+    }
+
+    if (!isAllowedClientOrigin(req)) {
+      console.warn(`[ASR Gateway] Rejected client origin: ${req.headers.origin || "(missing)"}`);
+      rejectUpgrade(socket, 403, "Origin is not allowed");
+      return;
+    }
+
+    const devAccountName = devMode ? process.env.DEV_ACTOR_ACCOUNT || "" : "";
+    const authorization = authorizeAsrGatewaySession(
+      readCookie(req, "meeting_asr_session"),
+      devAccountName
+    );
+    if (!authorization.ok) {
+      console.warn(`[ASR Gateway] Rejected client authentication: ${authorization.error}`);
+      rejectUpgrade(socket, authorization.status, authorization.error);
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (clientWs) => {
+      wss.emit("connection", clientWs, req, authorization.actor);
+    });
+  }
+
+  server.on("upgrade", handleUpgrade);
+
+  return {
+    close: () => {
+      server.off("upgrade", handleUpgrade);
+      wss.close();
+    },
+  };
+}

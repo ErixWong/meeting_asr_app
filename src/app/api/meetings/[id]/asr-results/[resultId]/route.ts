@@ -1,19 +1,16 @@
 import { NextResponse } from "next/server";
-import { CONTENT_ROLES, withRequiredRoles } from "@/lib/api-auth";
-import { getMeetingAsrResultDetail, getMeetingById } from "@/lib/admin-store";
+import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { getMeetingAsrResultDetail } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(
   req: Request,
-  { params }: { params: { id: string; resultId: string } }
+  { params }: { params: Promise<{ id: string; resultId: string }> }
 ) {
-  return withRequiredRoles(req, CONTENT_ROLES, async () => {
-    const meeting = getMeetingById(params.id);
-    if (!meeting) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
-    const asrResult = getMeetingAsrResultDetail(params.id, params.resultId);
+  const { id, resultId } = await params;
+  return withRequiredRoles(req, BUSINESS_ROLES, async () => {
+    const asrResult = getMeetingAsrResultDetail(id, resultId);
     if (!asrResult) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

@@ -5,7 +5,6 @@ import { TranscriptSegment } from "@/types";
 
 interface Props {
   segments: TranscriptSegment[];
-  isHistory?: boolean;
   autoScroll?: boolean;
 }
 
@@ -73,7 +72,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
   return paragraphs;
 }
 
-export default function TranscriptView({ segments, isHistory, autoScroll = true }: Props) {
+export default function TranscriptView({ segments, autoScroll = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const paragraphs = useMemo(() => mergeSegments(segments), [segments]);
@@ -88,7 +87,7 @@ export default function TranscriptView({ segments, isHistory, autoScroll = true 
     return (
       <div className="flex h-full flex-col items-center justify-center text-slate-400">
         <div className="mb-4 text-6xl">🎙</div>
-        <p className="text-lg">点击"开始录音"即可开始</p>
+        <p className="text-lg">点击 &quot;开始录音&quot; 即可开始</p>
         <p className="mt-1 text-sm">系统将自动识别语音并转写为文字</p>
       </div>
     );
@@ -97,7 +96,7 @@ export default function TranscriptView({ segments, isHistory, autoScroll = true 
   return (
     <div ref={containerRef} className="scroll-thin h-full overflow-y-auto px-1 py-2">
       <div className="space-y-3">
-        {paragraphs.map((para, idx) => (
+        {paragraphs.map((para) => (
           <div key={para.id} className="flex gap-3">
             <div className="w-14 shrink-0 pt-0.5 text-right text-xs text-slate-400">
               {para.time}
