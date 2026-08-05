@@ -5,6 +5,7 @@ import {
   createMeetingLlmResult,
   deleteMeeting,
   getMeetingById,
+  getMeetingLightById,
   updateMeeting,
   updateTranscriptMeetingStatus,
 } from "@/lib/admin-store";
@@ -14,7 +15,8 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const meeting = getMeetingById(id);
+    const view = new URL(req.url).searchParams.get("view");
+    const meeting = view === "light" ? getMeetingLightById(id) : getMeetingById(id);
     if (!meeting) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

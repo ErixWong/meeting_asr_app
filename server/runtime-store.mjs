@@ -1,34 +1,24 @@
-import { DatabaseSync } from "node:sqlite";
 import { createHash } from "crypto";
-import { existsSync, mkdirSync } from "fs";
-import { join } from "path";
-import { initializeDatabase } from "./database-schema.mjs";
+import { getDb as getSharedDb } from "./db-shared.mjs";
 
-const dataDir = join(process.cwd(), "data");
-const dbPath = join(dataDir, "meeting-asr-app.db");
-
-let db = null;
 const MAX_CAPTURE_EVENTS = 10000;
 const MAX_CAPTURE_EVENT_CHARS = 512 * 1024;
 const MAX_CAPTURE_EVENT_CHARS_TOTAL = 8 * 1024 * 1024;
 const ASR_GATEWAY_ROLE_KEYS = new Set(["user", "system_admin"]);
+
+let dbSeeded = false;
 
 function nowIso() {
   return new Date().toISOString();
 }
 
 function getDb() {
-  if (db) return db;
-
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true });
+  const database = getSharedDb();
+  if (!dbSeeded) {
+    dbSeeded = true;
+    seedAsrDefaults();
   }
-
-  db = new DatabaseSync(dbPath);
-  initializeDatabase(db);
-
-  seedAsrDefaults();
-  return db;
+  return database;
 }
 
 function insertMissingSetting(section, mark, title, description, value) {
@@ -145,7 +135,9 @@ function normalizeFunasrUrl(rawUrl) {
   return url.toString();
 }
 
-export function getAsrRuntimeConfig() {
+let cachedRuntimeConfig = null;
+
+function loadAsrRuntimeConfig() {
   const database = getDb();
   const settings = database
     .prepare(`
@@ -193,6 +185,17 @@ export function getAsrRuntimeConfig() {
   };
 }
 
+export function getAsrRuntimeConfig() {
+  if (!cachedRuntimeConfig) {
+    cachedRuntimeConfig = loadAsrRuntimeConfig();
+  }
+  return cachedRuntimeConfig;
+}
+
+export function invalidateAsrRuntimeConfig() {
+  cachedRuntimeConfig = null;
+}
+
 export function createCaptureSession(input) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
@@ -223,71 +226,245 @@ export function createCaptureSession(input) {
       createdAt,
       expiresAt
     );
+
+  captureStats.set(input.captureSessionId, {
+    totalEvents: 0,
+    onlineEvents: 0,
+    offlineEvents: 0,
+    finalSegmentsCount: 0,
+    firstEventAt: null,
+    lastEventAt: null,
+    speakerIds: new Set(),
+  });
 }
 
-export function appendCaptureEvent(captureSessionId, event) {
+// ---------------------------------------------------------------------------
+// In-memory capture event queue (hot path: no synchronous DB I/O per event)
+// ---------------------------------------------------------------------------
+
+const pendingQueues = new Map();
+const captureStats = new Map();
+
+function collectEventStats(captureSessionId, event, receivedAt) {
+  const stats = captureStats.get(captureSessionId);
+  if (!stats) return;
+
+  stats.totalEvents++;
+  const mode = String(event?.payload?.mode ?? "");
+  if (mode.includes("2pass-online")) stats.onlineEvents++;
+  if (mode.includes("2pass-offline")) stats.offlineEvents++;
+
+  const result = event?.payload?.result ?? event?.payload;
+  if (Boolean(result?.is_final)) {
+    const segments = Array.isArray(result?.segments) ? result.segments : [];
+    stats.finalSegmentsCount += segments.length > 0 ? segments.length : 1;
+    for (const segment of segments) {
+      if (Number.isFinite(Number(segment?.spk))) {
+        stats.speakerIds.add(Number(segment.spk));
+      }
+    }
+  }
+  if (Number.isFinite(Number(result?.spk))) {
+    stats.speakerIds.add(Number(result.spk));
+  }
+
+  if (!stats.firstEventAt) stats.firstEventAt = receivedAt;
+  stats.lastEventAt = receivedAt;
+}
+
+/**
+ * Snapshot of in-memory capture session statistics (see round07-audit).
+ * Null when the session is unknown.
+ */
+export function getCaptureSessionStats(captureSessionId) {
+  const stats = captureStats.get(captureSessionId);
+  if (!stats) return null;
+  return {
+    totalEvents: stats.totalEvents,
+    onlineEvents: stats.onlineEvents,
+    offlineEvents: stats.offlineEvents,
+    finalSegmentsCount: stats.finalSegmentsCount,
+    firstEventAt: stats.firstEventAt,
+    lastEventAt: stats.lastEventAt,
+    speakerIds: [...stats.speakerIds],
+  };
+}
+
+/**
+ * Release in-memory state (stats + pending queue) for a capture session.
+ * Called after the session row is deleted by meeting save (round04).
+ */
+export function releaseCaptureSession(captureSessionId) {
+  captureStats.delete(captureSessionId);
+  pendingQueues.delete(captureSessionId);
+}
+
+let prepared = null;
+
+function getPreparedStatements() {
   const database = getDb();
+  if (prepared) return prepared;
+
+  prepared = {
+    sessionExpires: database.prepare(
+      "SELECT expires_at as expiresAt FROM asr_capture_sessions WHERE capture_session_id = ?"
+    ),
+    nextSequence: database.prepare(
+      "SELECT COALESCE(MAX(sequence_no), 0) + 1 as nextSequence FROM asr_capture_events WHERE capture_session_id = ?"
+    ),
+    insertEvent: database.prepare(`
+      INSERT INTO asr_capture_events (
+        id, capture_session_id, sequence_no, event_json, received_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `),
+    updateSession: database.prepare(
+      "UPDATE asr_capture_sessions SET updated_at = ? WHERE capture_session_id = ?"
+    ),
+  };
+
+  return prepared;
+}
+
+function getQueueState(captureSessionId) {
+  let state = pendingQueues.get(captureSessionId);
+  if (state) return state;
+
+  const session = getPreparedStatements().sessionExpires.get(captureSessionId);
+  if (!session) return null;
+
+  state = {
+    expiresAt: String(session.expiresAt),
+    events: [],
+    bytes: 0,
+  };
+  pendingQueues.set(captureSessionId, state);
+  return state;
+}
+
+/**
+ * Enqueue one ASR upstream event for a capture session. Pure in-memory on the
+ * hot path; the database is only touched by flushCaptureEvents().
+ * Returns false when the session is missing/expired or a limit is exceeded
+ * (same semantics as the previous synchronous insert).
+ */
+export function appendCaptureEvent(captureSessionId, event) {
   const eventJson = JSON.stringify(event);
   if (typeof eventJson !== "string" || eventJson.length > MAX_CAPTURE_EVENT_CHARS) return false;
 
+  const state = getQueueState(captureSessionId);
+  if (!state || String(state.expiresAt) < nowIso()) {
+    if (state) {
+      pendingQueues.delete(captureSessionId);
+      captureStats.delete(captureSessionId);
+    }
+    return false;
+  }
+
+  if (state.events.length >= MAX_CAPTURE_EVENTS) return false;
+  if (state.bytes + eventJson.length > MAX_CAPTURE_EVENT_CHARS_TOTAL) return false;
+
+  state.events.push({ eventJson, receivedAt: nowIso() });
+  state.bytes += eventJson.length;
+  collectEventStats(captureSessionId, event, state.events[state.events.length - 1].receivedAt);
+  return true;
+}
+
+function flushQueueState(database, captureSessionId, state) {
+  const events = state.events;
+  state.events = [];
+  state.bytes = 0;
+
+  const statements = getPreparedStatements();
+
   database.exec("BEGIN IMMEDIATE");
   try {
-    const session = database
-      .prepare("SELECT expires_at as expiresAt FROM asr_capture_sessions WHERE capture_session_id = ?")
-      .get(captureSessionId);
+    const session = statements.sessionExpires.get(captureSessionId);
     if (!session || String(session.expiresAt) < nowIso()) {
       database.exec("ROLLBACK");
-      return false;
+      pendingQueues.delete(captureSessionId);
+      captureStats.delete(captureSessionId);
+      return 0;
     }
 
-    const limits = database
-      .prepare(`
-        SELECT
-          COUNT(*) as eventCount,
-          COALESCE(SUM(length(event_json)), 0) as eventChars
-        FROM asr_capture_events
-        WHERE capture_session_id = ?
-      `)
-      .get(captureSessionId);
-    if (Number(limits.eventCount) >= MAX_CAPTURE_EVENTS) {
-      database.exec("ROLLBACK");
-      return false;
-    }
-    if (Number(limits.eventChars) + eventJson.length > MAX_CAPTURE_EVENT_CHARS_TOTAL) {
-      database.exec("ROLLBACK");
-      return false;
-    }
-
-    const nextSequence = Number(
-      database
-        .prepare("SELECT COALESCE(MAX(sequence_no), 0) + 1 as nextSequence FROM asr_capture_events WHERE capture_session_id = ?")
-        .get(captureSessionId)?.nextSequence ?? 1
+    let sequenceNo = Number(
+      statements.nextSequence.get(captureSessionId)?.nextSequence ?? 1
     );
-    const receivedAt = nowIso();
-    database
-      .prepare(`
-        INSERT INTO asr_capture_events (
-          id, capture_session_id, sequence_no, event_json, received_at
-        ) VALUES (?, ?, ?, ?, ?)
-      `)
-      .run(`${captureSessionId}-${nextSequence}`, captureSessionId, nextSequence, eventJson, receivedAt);
+    for (const item of events) {
+      statements.insertEvent.run(
+        `${captureSessionId}-${sequenceNo}`,
+        captureSessionId,
+        sequenceNo,
+        item.eventJson,
+        item.receivedAt
+      );
+      sequenceNo++;
+    }
 
-    database
-      .prepare(`
-        UPDATE asr_capture_sessions
-        SET updated_at = ?
-        WHERE capture_session_id = ?
-      `)
-      .run(receivedAt, captureSessionId);
+    statements.updateSession.run(events[events.length - 1].receivedAt, captureSessionId);
     database.exec("COMMIT");
-    return true;
+    return events.length;
   } catch (error) {
     try {
       database.exec("ROLLBACK");
     } catch {
       // Preserve the original database error if rollback itself fails.
     }
-    throw error;
+    // Batching is best-effort by design (analysis.md C4: loss window <= flush
+    // interval is acceptable for capture/replay data). Never throw into the
+    // gateway hot path.
+    console.error("[Capture Store] batch flush failed, dropping events:", error);
+    return 0;
+  }
+}
+
+/**
+ * Persist queued capture events. With an argument, flushes only that capture
+ * session (used as drain before reading events for a saved meeting).
+ */
+export function flushCaptureEvents(captureSessionId) {
+  const database = getDb();
+
+  if (captureSessionId) {
+    const state = pendingQueues.get(captureSessionId);
+    if (!state || state.events.length === 0) return 0;
+    return flushQueueState(database, captureSessionId, state);
+  }
+
+  let flushed = 0;
+  for (const [sessionId, state] of pendingQueues) {
+    if (state.events.length === 0) continue;
+    flushed += flushQueueState(database, sessionId, state);
+  }
+  return flushed;
+}
+
+export function drainCaptureEvents(captureSessionId) {
+  return flushCaptureEvents(captureSessionId);
+}
+
+let flushTimer = null;
+
+export function startCaptureFlushTimer(intervalMs = 500) {
+  if (flushTimer) return;
+  flushTimer = setInterval(() => {
+    try {
+      flushCaptureEvents();
+    } catch (error) {
+      console.error("[Capture Store] timer flush failed:", error);
+    }
+  }, intervalMs);
+  flushTimer.unref();
+}
+
+export function closeCaptureStore() {
+  try {
+    flushCaptureEvents();
+  } catch (error) {
+    console.error("[Capture Store] final flush failed:", error);
+  }
+  if (flushTimer) {
+    clearInterval(flushTimer);
+    flushTimer = null;
   }
 }
 

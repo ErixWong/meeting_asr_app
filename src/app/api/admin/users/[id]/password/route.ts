@@ -7,7 +7,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json().catch(() => ({}));
-      const user = resetUserPassword(id, body.nextPassword);
+      const user = await resetUserPassword(id, body.nextPassword);
       if (!user) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

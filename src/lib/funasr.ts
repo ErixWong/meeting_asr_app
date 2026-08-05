@@ -32,6 +32,9 @@ export class FunASRClient {
   private captureSessionId: string = "";
   private audioBuffer: Float32Array[] = [];
   private audioBufferStartTime: number = 0;
+  private audioBufferStartSample: number = 0;
+  private readonly maxAudioBufferChunks = 3515;
+  private sessionFinishedResolve: (() => void) | null = null;
 
   getCaptureSessionId(): string {
     return this.captureSessionId;
@@ -214,6 +217,10 @@ export class FunASRClient {
         clearTimeout(timeout);
         console.log("[FunASR] WebSocket closed:", event.code, event.reason);
         this.options?.onStatusChange?.("disconnected");
+        if (this.sessionFinishedResolve) {
+          this.sessionFinishedResolve();
+          this.sessionFinishedResolve = null;
+        }
       };
     });
   }
@@ -250,6 +257,10 @@ export class FunASRClient {
           }
         } else if (message.type === "session.finished") {
           console.log("[FunASR] Session finished");
+          if (this.sessionFinishedResolve) {
+            this.sessionFinishedResolve();
+            this.sessionFinishedResolve = null;
+          }
         } else if (message.type === "session.failed") {
           const errorMessage = message.error || "ASR session failed";
           console.error("[FunASR] Session failed:", errorMessage);
@@ -272,6 +283,7 @@ export class FunASRClient {
     console.log("[FunASR] AudioContext state:", this.audioContext.state, "sampleRate:", this.audioContext.sampleRate);
 
     this.audioBuffer = [];
+    this.audioBufferStartSample = 0;
     this.audioBufferStartTime = performance.now();
 
     this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
@@ -286,6 +298,10 @@ export class FunASRClient {
       this.ws.send(pcmData.buffer);
 
       this.audioBuffer.push(new Float32Array(inputData));
+      if (this.audioBuffer.length > this.maxAudioBufferChunks) {
+        const dropped = this.audioBuffer.shift();
+        if (dropped) this.audioBufferStartSample += dropped.length;
+      }
 
       if (sentCount < 5) {
         sentCount++;
@@ -302,25 +318,29 @@ export class FunASRClient {
     const sampleRate = 16000;
     const startSample = Math.floor((beginTimeMs / 1000) * sampleRate);
     const endSample = Math.floor((endTimeMs / 1000) * sampleRate);
-    const totalSamples = this.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+    const windowStart = this.audioBufferStartSample;
+    let windowEnd = windowStart;
+    for (const chunk of this.audioBuffer) windowEnd += chunk.length;
 
-    if (startSample >= totalSamples) return new Float32Array(0);
+    const from = Math.max(startSample, windowStart);
+    const to = Math.min(endSample, windowEnd);
+    if (to <= from) return new Float32Array(0);
 
-    const result: number[] = [];
-    let currentSample = 0;
-
+    const result = new Float32Array(to - from);
+    let skip = from - windowStart;
+    let written = 0;
     for (const chunk of this.audioBuffer) {
-      for (let i = 0; i < chunk.length; i++) {
-        if (currentSample >= startSample && currentSample < endSample) {
-          result.push(chunk[i]);
-        }
-        currentSample++;
-        if (currentSample >= endSample) break;
+      if (skip >= chunk.length) {
+        skip -= chunk.length;
+        continue;
       }
-      if (currentSample >= endSample) break;
+      const take = Math.min(chunk.length - skip, result.length - written);
+      result.set(chunk.subarray(skip, skip + take), written);
+      written += take;
+      skip = 0;
+      if (written >= result.length) break;
     }
-
-    return new Float32Array(result);
+    return result;
   }
 
   private convertFloat32ToInt16(float32Array: Float32Array): Int16Array {
@@ -340,13 +360,30 @@ export class FunASRClient {
     this.isPaused = false;
   }
 
+  private waitForSessionFinished(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.sessionStarted) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.sessionFinishedResolve = null;
+        resolve();
+      }, timeoutMs);
+      this.sessionFinishedResolve = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+  }
+
   async stopRecording(): Promise<void> {
     this.isRecording = false;
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "session.finish", sessionId: this.sessionId }));
 
-      await new Promise((r) => setTimeout(r, 2000));
+      await this.waitForSessionFinished(3000);
     }
 
     this.scriptProcessor?.disconnect();
@@ -360,6 +397,9 @@ export class FunASRClient {
     this.audioContext = null;
     this.mediaStream = null;
     this.ws = null;
+    this.audioBuffer = [];
+    this.audioBufferStartSample = 0;
+    this.sessionFinishedResolve = null;
     this.sessionStarted = false;
   }
 }

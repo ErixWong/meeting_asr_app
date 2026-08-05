@@ -15,7 +15,7 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({}));
   try {
-    changeUserPassword(actor.accountName, body.currentPassword, body.nextPassword);
+    await changeUserPassword(actor.accountName, body.currentPassword, body.nextPassword);
     const session = createAuthSession(actor.id);
     const response = NextResponse.json({ ok: true });
     response.cookies.set({

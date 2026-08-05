@@ -3,7 +3,6 @@ import { WebSocket, WebSocketServer } from "ws";
 import {
   appendCaptureEvent,
   authorizeAsrGatewaySession,
-  cleanupExpiredCaptureSessions,
   createCaptureSession,
   finishCaptureSession,
   getAsrRuntimeConfig,
@@ -261,20 +260,26 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     return;
   }
 
-  cleanupExpiredCaptureSessions();
-
   const runtimeConfig = getAsrRuntimeConfig();
   let targetWs = null;
   let targetReady = false;
   let sessionStarted = false;
   let providerStarted = false;
   let finishRequested = false;
+  let sessionFailed = false;
+  let sessionFinished = false;
   let sessionId = "";
   let captureSessionId = "";
   let providerAdapter = null;
+  let upstreamConnectTimer = null;
   const pendingAudio = [];
+  const MAX_PENDING_AUDIO_CHUNKS = 120;
+  const UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
+  const MAX_SEND_BUFFERED_BYTES = 16 * 1024 * 1024;
 
   function failSession(errorMessage) {
+    if (sessionFinished || sessionFailed) return;
+    sessionFailed = true;
     console.error("[ASR Gateway] Session failed:", errorMessage);
     if (captureSessionId) {
       finishCaptureSession(captureSessionId, "failed");
@@ -307,11 +312,22 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     if (!targetReady || !targetWs) return;
     if (!providerStarted) return;
     while (pendingAudio.length > 0) {
-      targetWs.send(pendingAudio.shift());
+      if (!safeSend(targetWs, pendingAudio.shift())) {
+        failSession("ASR upstream send buffer overflow");
+        return;
+      }
     }
   }
 
+  function safeSend(ws, data) {
+    if (ws.bufferedAmount > MAX_SEND_BUFFERED_BYTES) return false;
+    ws.send(data);
+    return true;
+  }
+
   function finishSession() {
+    if (sessionFinished || sessionFailed) return;
+    sessionFinished = true;
     if (captureSessionId) {
       finishCaptureSession(captureSessionId);
     }
@@ -342,7 +358,14 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     targetWs = providerAdapter.headers
       ? new WebSocket(runtimeConfig.targetWsUrl, { headers: providerAdapter.headers })
       : new WebSocket(runtimeConfig.targetWsUrl);
+    upstreamConnectTimer = setTimeout(() => {
+      if (targetWs?.readyState === WebSocket.CONNECTING) {
+        targetWs.terminate();
+        failSession(`ASR upstream connection timeout after ${UPSTREAM_CONNECT_TIMEOUT_MS}ms`);
+      }
+    }, UPSTREAM_CONNECT_TIMEOUT_MS);
     targetWs.on("open", () => {
+      clearTimeout(upstreamConnectTimer);
       targetReady = true;
       targetWs.send(providerAdapter.startMessage());
       if (providerAdapter.startsAfterOpen) {
@@ -400,6 +423,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     });
 
     targetWs.on("close", (code, reason) => {
+      clearTimeout(upstreamConnectTimer);
       if (clientWs.readyState !== WebSocket.OPEN) return;
 
       if (finishRequested) {
@@ -432,8 +456,14 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       }
 
       if (targetReady && providerStarted && targetWs) {
-        targetWs.send(data);
+        if (!safeSend(targetWs, data)) {
+          failSession("ASR upstream send buffer overflow");
+        }
       } else {
+        if (pendingAudio.length >= MAX_PENDING_AUDIO_CHUNKS) {
+          failSession("ASR upstream not ready, audio buffer overflow");
+          return;
+        }
         pendingAudio.push(data);
       }
       return;
@@ -459,6 +489,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   });
 
   clientWs.on("close", () => {
+    clearTimeout(upstreamConnectTimer);
     if (targetWs?.readyState === WebSocket.OPEN || targetWs?.readyState === WebSocket.CONNECTING) {
       targetWs.close();
     }

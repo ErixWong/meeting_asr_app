@@ -759,17 +759,17 @@ export default function MeetingPage() {
   }, [isActiveMeeting, requestJson]);
 
   const refreshMeeting = useCallback(async (meetingId: string) => {
-    const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`);
+    const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}?view=light`);
     const meeting = data.meeting;
     if (!meeting) return null;
 
     setMeetings((prev) => prev.map((item) => (item.id === meetingId ? meeting : item)));
-    setSelected((prev) => (prev && prev.id === meetingId ? meeting : prev));
+    setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, ...meeting, transcript: prev.transcript } : meeting));
     return meeting;
   }, [requestJson]);
 
   useEffect(() => {
-    if (!selected?.id || selected.status !== "llm_processing" || selected.summary) {
+    if (!selected?.id || selected.status !== "llm_processing") {
       return;
     }
 
@@ -926,35 +926,29 @@ export default function MeetingPage() {
     const meetingId = selected.id;
     updateSummaryGenerating(true, meetingId);
     try {
-      const data = await requestJson<{ llmResult?: MeetingLlmResult }>(`/api/meetings/${meetingId}/llm-results`, {
+      await requestJson(`/api/meetings/${meetingId}/llm-results`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(promptTemplateId ? { promptTemplateId } : {}),
       });
       if (!isActiveMeeting(meetingId)) return;
-      const llmResult = data.llmResult;
-      if (llmResult?.resultMarkdown) {
-        const updated = { ...selected, summary: llmResult.resultMarkdown };
-        setSelected(updated);
-        setSelectedLlmResultId(llmResult.id);
-        setMeetings((prev) => prev.map((m) => m.id === meetingId ? updated : m));
-        await loadLlmResults(meetingId);
-        await refreshMeeting(meetingId);
-        showNotice("success", "会议纪要已生成");
-      } else {
-        throw new Error("LLM 未返回会议纪要结果");
-      }
+      setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, status: "llm_processing" } : prev));
+      showNotice("info", "会议纪要生成已开始，完成后自动更新");
     } catch (err) {
       console.error("Generate summary failed:", err);
       if (!isActiveMeeting(meetingId)) return;
       await refreshMeeting(meetingId).catch(console.error);
-      showNotice("error", `生成会议纪要失败: ${(err as Error).message}`);
+      if (err instanceof ApiRequestError && err.status === 409) {
+        showNotice("info", "纪要正在生成中，请稍候");
+      } else {
+        showNotice("error", `生成会议纪要失败: ${(err as Error).message}`);
+      }
     } finally {
       if (summaryGeneratingMeetingIdRef.current === meetingId) {
         updateSummaryGenerating(false, null);
       }
     }
-  }, [isActiveMeeting, loadLlmResults, refreshMeeting, requestJson, selected, showNotice, updateSummaryGenerating]);
+  }, [isActiveMeeting, refreshMeeting, requestJson, selected, showNotice, updateSummaryGenerating]);
 
   const sendSummary = useCallback(async () => {
     if (!selected || !selected.summary) return;
@@ -1123,6 +1117,14 @@ export default function MeetingPage() {
                 loadLlmResults(m.id).catch(console.error);
                 loadSendRecords(m.id).catch(console.error);
                 loadAsrResults(m.id).catch(console.error);
+                requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${m.id}`)
+                  .then((data) => {
+                    const meeting = data.meeting;
+                    if (!meeting || selectedMeetingIdRef.current !== m.id) return;
+                    setSelected(meeting);
+                    setMeetings((prev) => prev.map((item) => (item.id === m.id ? meeting : item)));
+                  })
+                  .catch(console.error);
               }}
               onCreateNew={handleCreateNew}
               onRename={async (id, newTitle) => {
@@ -1298,7 +1300,7 @@ export default function MeetingPage() {
                           </div>
                         </div>
                         <div className="min-w-0">
-                          <div className="mb-2 text-xs font-medium text-slate-500">原始 Payload</div>
+                          <div className="mb-2 text-xs font-medium text-slate-500">会话信息（结构化）</div>
                           <pre className="max-h-[28rem] max-w-full overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">
                             {rawAsrPayloadText}
                           </pre>

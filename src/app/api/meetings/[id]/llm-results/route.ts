@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import {
+  claimMeetingLlmGeneration,
   createMeetingLlmResult,
   deleteMeetingLlmResult,
   listMeetingLlmResults,
@@ -12,7 +13,11 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    return NextResponse.json({ llmResults: listMeetingLlmResults(id) });
+    const llmResults = listMeetingLlmResults(id);
+    if (llmResults === null) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+    return NextResponse.json({ llmResults });
   });
 }
 
@@ -21,8 +26,16 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
       const body = await req.json().catch(() => ({}));
-      const llmResult = await createMeetingLlmResult(id, body.promptTemplateId);
-      return NextResponse.json({ llmResult });
+      const claim = claimMeetingLlmGeneration(id);
+      if (!claim.ok) {
+        return NextResponse.json({ error: claim.error }, { status: claim.status });
+      }
+
+      void createMeetingLlmResult(id, body.promptTemplateId, { skipClaim: true }).catch((error) => {
+        console.error("Failed to generate LLM result:", error);
+      });
+
+      return NextResponse.json({ started: true, status: "llm_processing" });
     } catch (error) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Failed to generate llm result" },
