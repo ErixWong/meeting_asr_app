@@ -3,6 +3,7 @@ node_modules/
 data/
 data.db-shm
 data.db-wal
+.docker/
 .env.local
 *.tsbuildinfo
 dev.err

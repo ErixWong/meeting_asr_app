@@ -1,0 +1,40 @@
+services:
+  app:
+    # 直接使用官方 node:24-slim 基座，不构建自定义镜像
+    # node:24-slim = Debian bookworm (glibc)，满足:
+    #   - node:sqlite 内置模块 (Node >= 23.4 免 flag)
+    #   - sharp@0.35.3 的 linux-x64 glibc 预编译二进制
+    #   - @next/swc-linux-x64-gnu 预编译二进制
+    image: node:24-slim
+    working_dir: /app
+    command: >
+      sh -c "test -d node_modules || npm ci --no-audit --no-fund;
+      test -f .next/BUILD_ID || npm run build;
+      exec node server/app-server.mjs"
+    environment:
+      PORT: 3123
+      APP_HOST: 0.0.0.0
+      # 线上通过域名/IP 访问时，必须把实际 Origin 加进来，否则 WebSocket 握手被拒
+      ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-http://localhost:3123}
+      BOOTSTRAP_ADMIN_ACCOUNT: ${BOOTSTRAP_ADMIN_ACCOUNT:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
+    ports:
+      - "3123:3123"
+    volumes:
+      # 源码 bind mount
+      - .:/app
+      # 运行产物单独挂到宿主机 ./.docker 目录，
+      # 遮罩宿主机 Windows 的 node_modules / .next (平台二进制不同)，
+      # 由容器内 npm ci / npm run build 生成 Linux 版本
+      - ./.docker/node_modules:/app/node_modules
+      - ./.docker/.next:/app/.next
+      # SQLite 数据持久化 (process.cwd()/data)，存于 ./.docker/data
+      - ./.docker/data:/app/data
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3123/login').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
