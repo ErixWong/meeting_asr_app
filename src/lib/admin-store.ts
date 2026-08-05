@@ -3,10 +3,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { StringDecoder } from "node:string_decoder";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "crypto";
-import { existsSync, mkdirSync } from "fs";
-import { join } from "path";
-import { initializeDatabase } from "../../server/database-schema.mjs";
+import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
+import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
+import {
+  drainCaptureEvents,
+  getCaptureSessionStats,
+  invalidateAsrRuntimeConfig,
+  releaseCaptureSession,
+} from "../../server/runtime-store.mjs";
 import type { TranscriptSegment } from "@/types";
 import {
   escapeHtml,
@@ -179,11 +183,6 @@ type AsrCaptureSessionRow = {
   asrConfigSnapshot: string;
   hotwordsJson: string;
   status: string;
-};
-
-type AsrCaptureEventRow = {
-  eventJson: string;
-  receivedAt: string;
 };
 
 type ActorContext = {
@@ -401,10 +400,7 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   },
 };
 
-const dataDir = join(process.cwd(), "data");
-const dbPath = join(dataDir, "meeting-asr-app.db");
-
-let db: DatabaseSync | null = null;
+let dbSeeded = false;
 const actorContext = new AsyncLocalStorage<ActorContext>();
 let transactionDepth = 0;
 
@@ -431,19 +427,14 @@ function withTransaction<T>(callback: () => T): T {
   }
 }
 
-function getDb() {
-  if (db) return db;
-
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true });
+function getDb(): DatabaseSync {
+  const database = getSharedDb();
+  if (!dbSeeded) {
+    dbSeeded = true;
+    migrateAuthSchema(database);
+    seedDefaults(database);
   }
-
-  db = new DatabaseSync(dbPath);
-  initializeDatabase(db);
-
-  migrateAuthSchema(db);
-  seedDefaults(db);
-  return db;
+  return database;
 }
 
 function migrateAuthSchema(database: DatabaseSync) {
@@ -867,6 +858,7 @@ export function saveSettings(settings: unknown) {
           : setting.itemValue,
       })),
     });
+    invalidateAsrRuntimeConfig();
   });
 }
 
@@ -983,6 +975,7 @@ export function createHotword(input: Omit<HotwordRow, "id">) {
       resourceName: hotword.term,
       afterSnapshot: created,
     });
+    invalidateAsrRuntimeConfig();
     return created;
   });
 }
@@ -1010,6 +1003,7 @@ export function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>
       beforeSnapshot: existing,
       afterSnapshot: updated,
     });
+    invalidateAsrRuntimeConfig();
     return updated;
   });
 }
@@ -1027,6 +1021,7 @@ export function deleteHotword(id: string) {
       resourceName: existing?.term ?? id,
       beforeSnapshot: existing,
     });
+    invalidateAsrRuntimeConfig();
     return true;
   });
 }
@@ -1083,13 +1078,14 @@ function listUserRoles(userId: string) {
     .all(userId);
 }
 
-export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; initialPassword: string }) {
+export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; initialPassword: string }) {
+  const id = newId("user");
+  const createdAt = nowIso();
+  const accountName = requireNonEmpty(input.accountName, "Account name");
+  const displayName = requireNonEmpty(input.displayName, "Display name");
+  const initialPassword = validatePassword(input.initialPassword);
+  const passwordHash = await hashPassword(initialPassword);
   return withTransaction(() => {
-    const id = newId("user");
-    const createdAt = nowIso();
-    const accountName = requireNonEmpty(input.accountName, "Account name");
-    const displayName = requireNonEmpty(input.displayName, "Display name");
-    const initialPassword = validatePassword(input.initialPassword);
     getDb()
       .prepare(`
         INSERT INTO users (
@@ -1104,7 +1100,7 @@ export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; i
         input.email,
         input.department,
         null,
-        hashPassword(initialPassword),
+        passwordHash,
         1,
         normalizeStatus(input.status),
         createdAt,
@@ -1124,19 +1120,20 @@ export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; i
   });
 }
 
-export function resetUserPassword(userId: string, nextPassword: string) {
-  return withTransaction(() => {
-    const existing = listUsers().find((item) => item.id === userId);
-    if (!existing) return null;
+export async function resetUserPassword(userId: string, nextPassword: string) {
+  const next = validatePassword(nextPassword);
+  const existing = listUsers().find((item) => item.id === userId);
+  if (!existing) return null;
 
-    const next = validatePassword(nextPassword);
+  const passwordHash = await hashPassword(next);
+  return withTransaction(() => {
     getDb()
       .prepare(`
         UPDATE users
         SET password_hash = ?, must_change_password = 1, updated_at = ?
         WHERE id = ?
       `)
-      .run(hashPassword(next), nowIso(), userId);
+      .run(passwordHash, nowIso(), userId);
     getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
 
     const updated = listUsers().find((item) => item.id === userId);
@@ -1265,6 +1262,10 @@ export function listAuditLogs(limit = 100) {
     .all(limit);
 }
 
+export function cleanupExpiredAuditLogs(retentionDays = 30) {
+  return cleanupSharedAuditLogs(retentionDays);
+}
+
 export function getRuntimeConfig() {
   const settings = listSettings();
   const templates = listPromptTemplates();
@@ -1332,24 +1333,6 @@ function getAsrCaptureSession(captureSessionId: string) {
   return row ?? null;
 }
 
-function listAsrCaptureEvents(captureSessionId: string) {
-  const rows = getDb()
-    .prepare(`
-      SELECT
-        event_json as eventJson,
-        received_at as receivedAt
-      FROM asr_capture_events
-      WHERE capture_session_id = ?
-      ORDER BY sequence_no ASC
-    `)
-    .all(captureSessionId) as AsrCaptureEventRow[];
-
-  return rows.map((row) => ({
-    receivedAt: row.receivedAt,
-    event: parseJsonOr(row.eventJson, null),
-  }));
-}
-
 function redactAsrConfigSnapshot(snapshot: unknown) {
   const record = isRecord(snapshot) ? snapshot : {};
   const hotwords = record.hotwords;
@@ -1390,7 +1373,23 @@ function getBootstrapAdminPassword() {
   return { password: fallbackPassword, mustChangePassword: true, source: "default" as const };
 }
 
-function hashPassword(password: string) {
+function scryptAsync(password: string, salt: string, keylen: number, options: { N: number; r: number; p: number }): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scryptCallback(password, salt, keylen, options, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
+}
+
+async function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  const key = await scryptAsync(password, salt, 64, { N: 16384, r: 8, p: 1 });
+  return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key.toString("hex")}`;
+}
+
+// 仅供 getDb() 同步初始化（seedIdentityDefaults）使用；交互路径一律使用异步 hashPassword。
+function hashPasswordSync(password: string) {
   const salt = randomBytes(16).toString("hex");
   const key = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
   return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key}`;
@@ -1407,7 +1406,7 @@ function validatePassword(password: unknown) {
   return value;
 }
 
-function verifyPassword(password: string, storedHash: string | null | undefined): PasswordVerificationResult {
+async function verifyPassword(password: string, storedHash: string | null | undefined): Promise<PasswordVerificationResult> {
   if (!storedHash) return { ok: false, needsRehash: false };
 
   const parts = storedHash.split("$");
@@ -1417,7 +1416,7 @@ function verifyPassword(password: string, storedHash: string | null | undefined)
 
   const [, nRaw, rRaw, pRaw, salt, expectedHex] = parts;
   const expected = Buffer.from(expectedHex, "hex");
-  const actual = scryptSync(password, salt, expected.length, {
+  const actual = await scryptAsync(password, salt, expected.length, {
     N: Number(nRaw),
     r: Number(rRaw),
     p: Number(pRaw),
@@ -1511,7 +1510,7 @@ function seedIdentityDefaults(database: DatabaseSync) {
         "",
         "系统",
         null,
-        hashPassword(bootstrapAdminPassword.password),
+        hashPasswordSync(bootstrapAdminPassword.password),
         bootstrapAdminPassword.mustChangePassword ? 1 : 0,
         "active",
         nowIso(),
@@ -1531,7 +1530,7 @@ function seedIdentityDefaults(database: DatabaseSync) {
       database
         .prepare("UPDATE users SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?")
         .run(
-          hashPassword(bootstrapAdminPassword.password),
+          hashPasswordSync(bootstrapAdminPassword.password),
           bootstrapAdminPassword.mustChangePassword ? 1 : 0,
           nowIso(),
           adminUser.id
@@ -1576,7 +1575,7 @@ export function getActorByAccountName(accountName: string) {
     .get(normalizedAccount) as ActorContext | null;
 }
 
-export function authenticateUser(accountName: string, password: string) {
+export async function authenticateUser(accountName: string, password: string) {
   const normalizedAccount = String(accountName ?? "").trim();
   if (!normalizedAccount || !password) return null;
 
@@ -1595,13 +1594,14 @@ export function authenticateUser(accountName: string, password: string) {
     .get(normalizedAccount) as (ActorContext & { passwordHash?: string | null }) | null;
 
   if (!user || user.status !== "active") return null;
-  const verification = verifyPassword(password, user.passwordHash);
+  const verification = await verifyPassword(password, user.passwordHash);
   if (!verification.ok) return null;
 
   if (verification.needsRehash) {
+    const passwordHash = await hashPassword(password);
     getDb()
       .prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
-      .run(hashPassword(password), nowIso(), user.id);
+      .run(passwordHash, nowIso(), user.id);
   }
 
   getDb()
@@ -1663,7 +1663,7 @@ export function deleteAuthSession(token: string) {
   getDb().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(hashSessionToken(sessionToken));
 }
 
-export function changeUserPassword(accountName: string, currentPassword: string, nextPassword: string) {
+export async function changeUserPassword(accountName: string, currentPassword: string, nextPassword: string) {
   const normalizedAccount = requireNonEmpty(accountName, "Account name");
   const next = validatePassword(nextPassword);
 
@@ -1675,14 +1675,15 @@ export function changeUserPassword(accountName: string, currentPassword: string,
     `)
     .get(normalizedAccount) as { id: string; passwordHash?: string | null } | undefined;
 
-  if (!user || !verifyPassword(currentPassword, user.passwordHash).ok) {
+  if (!user || !(await verifyPassword(currentPassword, user.passwordHash)).ok) {
     throw new Error("Current password is incorrect");
   }
 
+  const passwordHash = await hashPassword(next);
   return withTransaction(() => {
     getDb()
       .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
-      .run(hashPassword(next), nowIso(), user.id);
+      .run(passwordHash, nowIso(), user.id);
     getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
 
     return true;
@@ -1771,8 +1772,12 @@ export function createMeeting(input: MeetingInput) {
     throw new Error("transcriptSegments must include text");
   }
 
-  const captureSession = getAsrCaptureSession(input.captureSessionId);
-  const rawEvents = captureSession ? listAsrCaptureEvents(input.captureSessionId) : null;
+  const captureSessionId = String(input.captureSessionId || "").trim();
+  if (captureSessionId) {
+    drainCaptureEvents(captureSessionId);
+  }
+  const captureSession = getAsrCaptureSession(captureSessionId);
+  const captureStats = captureSession ? getCaptureSessionStats(captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
     : {
@@ -1785,15 +1790,26 @@ export function createMeeting(input: MeetingInput) {
   const asrConfigSnapshot = redactAsrConfigSnapshot(rawAsrConfigSnapshot);
   const rawPayload = captureSession
     ? {
-        captureSessionId: input.captureSessionId,
+        captureSessionId,
         taskId: captureSession.taskId,
         status: captureSession.status,
-        events: rawEvents ?? [],
+        asrProvider: captureSession.asrProvider,
+        eventStats: captureStats
+          ? {
+              totalEvents: captureStats.totalEvents,
+              onlineEvents: captureStats.onlineEvents,
+              offlineEvents: captureStats.offlineEvents,
+              finalSegmentsCount: captureStats.finalSegmentsCount,
+              firstEventAt: captureStats.firstEventAt,
+              lastEventAt: captureStats.lastEventAt,
+            }
+          : null,
+        speakerIds: captureStats?.speakerIds ?? [],
         transcriptSegments,
       }
-    : { segments: transcriptSegments };
+    : { captureSessionId, segments: transcriptSegments };
 
-  return withTransaction(() => {
+  const meetingResult = withTransaction(() => {
     database
       .prepare(`
         INSERT INTO meetings (
@@ -1830,12 +1846,18 @@ export function createMeeting(input: MeetingInput) {
         captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
         "current",
         JSON.stringify(asrConfigSnapshot),
-        input.captureSessionId,
+        captureSessionId,
         captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
         JSON.stringify(rawPayload),
         normalizedText,
         createdAt
       );
+
+    if (captureSession) {
+      database
+        .prepare("DELETE FROM asr_capture_sessions WHERE capture_session_id = ?")
+        .run(captureSessionId);
+    }
 
     const meeting = getMeetingById(meetingId);
     writeAuditLog({
@@ -1843,10 +1865,24 @@ export function createMeeting(input: MeetingInput) {
       resourceType: "meeting",
       resourceId: meetingId,
       resourceName: title,
-      afterSnapshot: meeting,
+      afterSnapshot: meeting
+        ? {
+            id: meeting.id,
+            title: meeting.title,
+            status: meeting.status,
+            lastErrorMessage: meeting.lastErrorMessage,
+            date: meeting.date,
+            durationLabel: meeting.durationLabel,
+          }
+        : null,
     });
     return meeting;
   });
+
+  if (captureSession) {
+    releaseCaptureSession(captureSessionId);
+  }
+  return meetingResult;
 }
 
 export function appendMeetingTranscript(input: {
@@ -1867,8 +1903,12 @@ export function appendMeetingTranscript(input: {
 
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
-  const captureSession = getAsrCaptureSession(input.captureSessionId);
-  const rawEvents = captureSession ? listAsrCaptureEvents(input.captureSessionId) : null;
+  const captureSessionId = String(input.captureSessionId || "").trim();
+  if (captureSessionId) {
+    drainCaptureEvents(captureSessionId);
+  }
+  const captureSession = getAsrCaptureSession(captureSessionId);
+  const captureStats = captureSession ? getCaptureSessionStats(captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
     : {
@@ -1881,13 +1921,24 @@ export function appendMeetingTranscript(input: {
   const asrConfigSnapshot = redactAsrConfigSnapshot(rawAsrConfigSnapshot);
   const rawPayload = captureSession
     ? {
-        captureSessionId: input.captureSessionId,
+        captureSessionId,
         taskId: captureSession.taskId,
         status: captureSession.status,
-        events: rawEvents ?? [],
+        asrProvider: captureSession.asrProvider,
+        eventStats: captureStats
+          ? {
+              totalEvents: captureStats.totalEvents,
+              onlineEvents: captureStats.onlineEvents,
+              offlineEvents: captureStats.offlineEvents,
+              finalSegmentsCount: captureStats.finalSegmentsCount,
+              firstEventAt: captureStats.firstEventAt,
+              lastEventAt: captureStats.lastEventAt,
+            }
+          : null,
+        speakerIds: captureStats?.speakerIds ?? [],
         transcriptSegments,
       }
-    : { captureSessionId: input.captureSessionId, segments: transcriptSegments };
+    : { captureSessionId, segments: transcriptSegments };
 
   return withTransaction(() => {
     database
@@ -1914,16 +1965,7 @@ export function appendMeetingTranscript(input: {
       .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
       .run(createdAt, input.meetingId);
 
-    const updated = getMeetingById(input.meetingId);
-    writeAuditLog({
-      actionType: "meeting.transcript.append",
-      resourceType: "meeting",
-      resourceId: input.meetingId,
-      resourceName: updated?.title ?? existing.title,
-      beforeSnapshot: existing,
-      afterSnapshot: updated,
-    });
-    return updated;
+    return getMeetingById(input.meetingId);
   });
 }
 
@@ -1975,8 +2017,20 @@ export function updateTranscriptMeetingStatus(
       resourceType: "meeting",
       resourceId: id,
       resourceName: updated?.title ?? existing.title,
-      beforeSnapshot: existing,
-      afterSnapshot: updated,
+      beforeSnapshot: {
+        id: existing.id,
+        title: existing.title,
+        status: existing.status,
+        lastErrorMessage: existing.lastErrorMessage,
+      },
+      afterSnapshot: updated
+        ? {
+            id: updated.id,
+            title: updated.title,
+            status: updated.status,
+            lastErrorMessage: updated.lastErrorMessage,
+          }
+        : null,
     });
     return updated;
   });
@@ -2003,8 +2057,18 @@ export function updateMeeting(id: string, patch: { title?: string }) {
       resourceType: "meeting",
       resourceId: id,
       resourceName: updated?.title ?? existing.title,
-      beforeSnapshot: existing,
-      afterSnapshot: updated,
+      beforeSnapshot: {
+        id: existing.id,
+        title: existing.title,
+        status: existing.status,
+      },
+      afterSnapshot: updated
+        ? {
+            id: updated.id,
+            title: updated.title,
+            status: updated.status,
+          }
+        : null,
     });
     return updated;
   });
@@ -2013,8 +2077,11 @@ export function updateMeeting(id: string, patch: { title?: string }) {
 export function deleteMeeting(id: string) {
   return withTransaction(() => {
     const database = getDb();
+    const actor = getCurrentActor();
     const before = getMeetingById(id);
-    const result = database.prepare("DELETE FROM meetings WHERE id = ?").run(id);
+    const result = database
+      .prepare("DELETE FROM meetings WHERE id = ? AND created_by_user_id = ?")
+      .run(id, actor.id);
     const deleted = Number(result.changes ?? 0) > 0;
     if (deleted) {
       writeAuditLog({
@@ -2022,7 +2089,14 @@ export function deleteMeeting(id: string) {
         resourceType: "meeting",
         resourceId: id,
         resourceName: before?.title ?? id,
-        beforeSnapshot: before,
+        beforeSnapshot: before
+          ? {
+              id: before.id,
+              title: before.title,
+              status: before.status,
+              lastErrorMessage: before.lastErrorMessage,
+            }
+          : null,
       });
     }
     return deleted;
@@ -2073,18 +2147,11 @@ export function listMeetings() {
     `)
     .all<MeetingRow>(actor.id);
 
-  return rows.map((row) => mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(row.id) }));
+  return rows.map((row) => mapMeetingRow({ ...row, transcript: [] }));
 }
 
-export function getMeetingById(id: string) {
-  const database = getDb();
-  const actor = getCurrentActor();
-  const owner = database
-    .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
-    .get(id) as { ownerId: string } | undefined;
-  if (!owner || owner.ownerId !== actor.id) return null;
-
-  const row = database
+function queryMeetingRowById(id: string) {
+  return getDb()
     .prepare(`
       SELECT
         m.id,
@@ -2105,7 +2172,26 @@ export function getMeetingById(id: string) {
       WHERE m.id = ?
     `)
     .get<MeetingRow>(id);
+}
 
+function ensureMeetingOwned(id: string) {
+  const actor = getCurrentActor();
+  const owner = getDb()
+    .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
+    .get(id) as { ownerId: string } | undefined;
+  return Boolean(owner && owner.ownerId === actor.id);
+}
+
+export function getMeetingLightById(id: string) {
+  if (!ensureMeetingOwned(id)) return null;
+  const row = queryMeetingRowById(id);
+  if (!row) return null;
+  return mapMeetingRow({ ...row, transcript: [] });
+}
+
+export function getMeetingById(id: string) {
+  if (!ensureMeetingOwned(id)) return null;
+  const row = queryMeetingRowById(id);
   if (!row) return null;
   return mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) });
 }
@@ -2181,8 +2267,6 @@ function listMeetingLlmResultsByMeetingId(meetingId: string) {
         version_no as versionNo,
         result_type as resultType,
         result_title as resultTitle,
-        raw_prompt as rawPrompt,
-        raw_response as rawResponse,
         result_markdown as resultMarkdown,
         error_message as errorMessage,
         created_at as createdAt
@@ -2194,6 +2278,7 @@ function listMeetingLlmResultsByMeetingId(meetingId: string) {
 }
 
 export function listMeetingAsrResults(meetingId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
   return getDb()
     .prepare(`
       SELECT
@@ -2214,6 +2299,7 @@ export function listMeetingAsrResults(meetingId: string) {
 }
 
 export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
   const row = getDb()
     .prepare(`
       SELECT
@@ -2242,6 +2328,7 @@ export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
 }
 
 export function listMeetingLlmResults(meetingId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
   return listMeetingLlmResultsByMeetingId(meetingId);
 }
 
@@ -2349,11 +2436,17 @@ function llmRequest(
   });
 }
 
-export async function createMeetingLlmResult(meetingId: string, templateId?: string) {
-  const meeting = getMeetingById(meetingId);
-  if (!meeting) throw new Error("Meeting not found");
+export function claimMeetingLlmGeneration(meetingId: string):
+  { ok: true } | { ok: false; status: 404 | 409; error: string } {
+  const database = getDb();
+  const owner = database
+    .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
+    .get(meetingId) as { ownerId: string } | undefined;
+  if (!owner || owner.ownerId !== getCurrentActor().id) {
+    return { ok: false, status: 404, error: "Meeting not found" };
+  }
 
-  const claim = getDb()
+  const claim = database
     .prepare(`
       UPDATE meetings
       SET status = 'llm_processing', status_updated_at = ?, last_error_message = NULL, updated_at = ?
@@ -2361,7 +2454,17 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
     `)
     .run(nowIso(), nowIso(), meetingId);
   if (Number(claim.changes ?? 0) === 0) {
-    throw new Error("LLM generation already in progress");
+    return { ok: false, status: 409, error: "LLM generation already in progress" };
+  }
+  return { ok: true };
+}
+
+export async function createMeetingLlmResult(meetingId: string, templateId?: string, options?: { skipClaim?: boolean }) {
+  if (!ensureMeetingOwned(meetingId)) throw new Error("Meeting not found");
+
+  if (!options?.skipClaim) {
+    const claim = claimMeetingLlmGeneration(meetingId);
+    if (!claim.ok) throw new Error(claim.error);
   }
 
   const inputTranscriptSnapshot = getMergedMeetingTranscript(meetingId);
@@ -2625,6 +2728,7 @@ function insertMeetingLlmResult(row: MeetingLlmResultRow) {
 
 export function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
   return withTransaction(() => {
+    if (!ensureMeetingOwned(meetingId)) return null;
     const existing = getMeetingLlmResultById(id);
     if (!existing) return null;
     if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
@@ -2652,12 +2756,10 @@ export function updateMeetingLlmResult(meetingId: string, id: string, patch: { r
       resourceName: updated?.resultTitle ?? existing.resultTitle,
       beforeSnapshot: {
         resultTitle: existing.resultTitle,
-        resultMarkdown: existing.resultMarkdown,
       },
       afterSnapshot: {
         meetingId,
         resultTitle: updated?.resultTitle,
-        resultMarkdown: updated?.resultMarkdown,
       },
     });
     return updated;
@@ -2666,6 +2768,7 @@ export function updateMeetingLlmResult(meetingId: string, id: string, patch: { r
 
 export function deleteMeetingLlmResult(meetingId: string, id: string) {
   return withTransaction(() => {
+    if (!ensureMeetingOwned(meetingId)) return null;
     const existing = getMeetingLlmResultById(id);
     if (!existing) return false;
     if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
@@ -2740,6 +2843,7 @@ function parseStringArray(value: string | null | undefined): string[] {
 }
 
 export function listMeetingSendRecords(meetingId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
   const database = getDb();
   return database
     .prepare(`
@@ -2783,6 +2887,9 @@ export async function createMeetingSendRecord(input: {
   const llmResult = getMeetingLlmResultById(input.meetingLlmResultId);
   if (!llmResult) {
     throw new Error("Meeting LLM result not found");
+  }
+  if (!ensureMeetingOwned(input.meetingId)) {
+    throw new Error("Meeting LLM result does not belong to this meeting");
   }
   if (!meetingLlmResultBelongsToMeeting(input.meetingLlmResultId, input.meetingId)) {
     throw new Error("Meeting LLM result does not belong to this meeting");
@@ -2917,7 +3024,7 @@ export async function createMeetingSendRecord(input: {
     });
   });
 
-  return listMeetingSendRecords(input.meetingId)[0];
+  return listMeetingSendRecords(input.meetingId)?.[0] ?? null;
 }
 
 function insertMeetingSendRecord(row: MeetingSendRecordRow, sentAt: string | null) {

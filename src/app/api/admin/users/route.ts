@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "roleKeys must be an array" }, { status: 400 });
       }
 
-      const user = createUser({
+      const user = await createUser({
         accountName: body.accountName,
         displayName: body.displayName,
         email: body.email ?? "",

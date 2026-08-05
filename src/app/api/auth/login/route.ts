@@ -8,7 +8,7 @@ const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
-  const actor = authenticateUser(body.accountName, body.password);
+  const actor = await authenticateUser(body.accountName, body.password);
 
   if (!actor) {
     return NextResponse.json({ error: "Invalid account or password" }, { status: 401 });
