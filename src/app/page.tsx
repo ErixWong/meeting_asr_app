@@ -25,6 +25,7 @@ import MarkdownPreview from "@/components/main/MarkdownPreview";
 import RecordingControls from "@/components/main/RecordingControls";
 import TranscriptView from "@/components/main/TranscriptView";
 import HistoryList from "@/components/main/HistoryList";
+import AsrResultDetailView from "@/components/main/AsrResultDetailView";
 import { formatTime } from "@/components/main/RecordingControls";
 import { useAuthSession } from "@/lib/use-auth-session";
 
@@ -1067,12 +1068,6 @@ export default function MeetingPage() {
 
   const selectedDeviceLabel =
     devices.find((d) => d.deviceId === device)?.label ?? "";
-  const rawAsrPayloadText = selectedAsrResult
-    ? JSON.stringify(selectedAsrResult.rawPayload, null, 2)
-    : "";
-  const asrConfigText = selectedAsrResult
-    ? JSON.stringify(selectedAsrResult.asrConfigSnapshot, null, 2)
-    : "";
   const selectedStatusMeta = selected ? getMeetingStatusMeta(selected.status) : null;
   const noticeClassName =
     notice?.type === "success"
@@ -1270,42 +1265,7 @@ export default function MeetingPage() {
                         </div>
                         <div className="scroll-thin min-w-0 flex-1 overflow-y-auto pl-2">
                           {selectedAsrResult ? (
-                            <div className="min-w-0 space-y-4 text-sm">
-                              <div className="grid min-w-0 gap-3 md:grid-cols-3">
-                          <div className="min-w-0 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                            <div className="text-xs text-slate-400">Provider</div>
-                            <div className="mt-1 break-words font-medium text-slate-700">{selectedAsrResult.asrProvider}</div>
-                          </div>
-                          <div className="min-w-0 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                            <div className="text-xs text-slate-400">Capture Session</div>
-                            <div className="mt-1 truncate font-mono text-xs text-slate-700">{selectedAsrResult.captureSessionId}</div>
-                          </div>
-                          <div className="min-w-0 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                            <div className="text-xs text-slate-400">Format</div>
-                            <div className="mt-1 break-words font-medium text-slate-700">{selectedAsrResult.resultFormat}</div>
-                          </div>
-                        </div>
-                        <div className="grid min-w-0 gap-4 lg:grid-cols-2">
-                          <div className="min-w-0">
-                            <div className="mb-2 text-xs font-medium text-slate-500">ASR 配置快照</div>
-                            <pre className="max-h-56 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">
-                              {asrConfigText}
-                            </pre>
-                          </div>
-                          <div className="min-w-0">
-                            <div className="mb-2 text-xs font-medium text-slate-500">规范化文本</div>
-                            <pre className="max-h-56 max-w-full overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
-                              {selectedAsrResult.normalizedText || "-"}
-                            </pre>
-                          </div>
-                        </div>
-                        <div className="min-w-0">
-                          <div className="mb-2 text-xs font-medium text-slate-500">会话信息（结构化）</div>
-                          <pre className="max-h-[28rem] max-w-full overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 text-xs leading-relaxed text-slate-100">
-                            {rawAsrPayloadText}
-                          </pre>
-                        </div>
-                            </div>
+                            <AsrResultDetailView result={selectedAsrResult} />
                           ) : (
                             <div className="flex h-full flex-col items-center justify-center text-slate-400">
                               <p>选择左侧记录查看详情</p>
