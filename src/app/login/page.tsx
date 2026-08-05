@@ -1,11 +1,9 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { useAuthSession } from "@/lib/use-auth-session";
 
 export default function LoginPage() {
-  const router = useRouter();
   const { user, loading } = useAuthSession(true);
   const [accountName, setAccountName] = useState("admin");
   const [password, setPassword] = useState("");
@@ -21,13 +19,12 @@ export default function LoginPage() {
     if (loading || !user) return;
 
     if (user.mustChangePassword) {
-      router.replace("/change-password");
+      window.location.replace("/change-password");
       return;
     }
 
-    router.replace(getNextUrl());
-    router.refresh();
-  }, [loading, router, user]);
+    window.location.replace(getNextUrl());
+  }, [loading, user]);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -46,12 +43,11 @@ export default function LoginPage() {
       }
 
       if (data.user?.mustChangePassword) {
-        router.replace("/change-password");
+        window.location.replace("/change-password");
         return;
       }
 
-      router.replace(getNextUrl());
-      router.refresh();
+      window.location.replace(getNextUrl());
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败");
     } finally {

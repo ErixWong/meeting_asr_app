@@ -1,10 +1,8 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { useRouter } from "next/navigation";
 
 export default function ChangePasswordPage() {
-  const router = useRouter();
   const [currentPassword, setCurrentPassword] = useState("");
   const [nextPassword, setNextPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -32,8 +30,7 @@ export default function ChangePasswordPage() {
         throw new Error(data.error || "修改密码失败");
       }
 
-      router.replace("/");
-      router.refresh();
+      window.location.replace("/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "修改密码失败");
     } finally {
