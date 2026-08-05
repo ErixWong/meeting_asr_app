@@ -15,6 +15,11 @@ import {
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
+import {
+  finalizeTranscriptSegments,
+  updateTranscriptSegments,
+  type TranscriptResult,
+} from "@/lib/transcript-state";
 import DeviceSelector from "@/components/main/DeviceSelector";
 import MarkdownPreview from "@/components/main/MarkdownPreview";
 import RecordingControls from "@/components/main/RecordingControls";
@@ -24,6 +29,7 @@ import { formatTime } from "@/components/main/RecordingControls";
 import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
+const PARTIAL_RENDER_INTERVAL_MS = 150;
 
 function formatAsrCreatedAt(value?: string) {
   if (!value) return "-";
@@ -36,6 +42,12 @@ function formatAsrCreatedAt(value?: string) {
 type ActionNotice = {
   type: "success" | "error" | "info";
   message: string;
+};
+
+type TranscriptCommitListener = (segments: TranscriptSegment[]) => void;
+
+type PendingPartial = TranscriptResult & {
+  generation: number;
 };
 
 export default function MeetingPage() {
@@ -63,6 +75,7 @@ export default function MeetingPage() {
   const [selectedAsrResult, setSelectedAsrResult] = useState<MeetingAsrResultDetail | null>(null);
   const [sendingMail, setSendingMail] = useState(false);
   const [asrReady, setAsrReady] = useState(false);
+  const [asrErrorMessage, setAsrErrorMessage] = useState<string | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -75,6 +88,15 @@ export default function MeetingPage() {
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<VoiceprintFeature[]>([]);
   const speakerIdsRef = useRef<number[]>([]);
+  const partialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingPartialRef = useRef<PendingPartial | null>(null);
+  const transcriptGenerationRef = useRef(0);
+  const transcriptSessionRef = useRef(0);
+  const lastPartialRenderAtRef = useRef(0);
+  const asrRecoveryRef = useRef(false);
+  const persistedMeetingIdRef = useRef<string | null>(null);
+  const persistedSegmentCountRef = useRef(0);
+  const checkpointPromiseRef = useRef<Promise<void> | null>(null);
 
   const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
     setNotice({ type, message });
@@ -85,6 +107,87 @@ export default function MeetingPage() {
     summaryGeneratingMeetingIdRef.current = value ? meetingId ?? summaryGeneratingMeetingIdRef.current : null;
     setSummaryGenerating(value);
   }, []);
+
+  const clearPendingPartial = useCallback(() => {
+    if (partialTimerRef.current !== null) {
+      clearTimeout(partialTimerRef.current);
+      partialTimerRef.current = null;
+    }
+    pendingPartialRef.current = null;
+  }, []);
+
+  const resetTranscriptScheduler = useCallback(() => {
+    transcriptGenerationRef.current += 1;
+    transcriptSessionRef.current += 1;
+    clearPendingPartial();
+    lastPartialRenderAtRef.current = 0;
+  }, [clearPendingPartial]);
+
+  const commitTranscriptResult = useCallback(
+    (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
+      setLiveSegments((prev) => {
+        const next = updateTranscriptSegments(prev, result, () => `live-${segCounter++}`);
+        segmentsRef.current = next;
+        onCommitted?.(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const flushPendingPartial = useCallback(() => {
+    partialTimerRef.current = null;
+    const pending = pendingPartialRef.current;
+    pendingPartialRef.current = null;
+
+    if (!pending || pending.generation !== transcriptGenerationRef.current) return;
+
+    lastPartialRenderAtRef.current = Date.now();
+    commitTranscriptResult(pending);
+  }, [commitTranscriptResult]);
+
+  const queuePartialResult = useCallback(
+    (result: TranscriptResult) => {
+      pendingPartialRef.current = {
+        ...result,
+        generation: transcriptGenerationRef.current,
+      };
+
+      if (partialTimerRef.current !== null) return;
+
+      const elapsedSinceLastRender = Date.now() - lastPartialRenderAtRef.current;
+      const delay = lastPartialRenderAtRef.current === 0
+        ? 0
+        : Math.max(0, PARTIAL_RENDER_INTERVAL_MS - elapsedSinceLastRender);
+      partialTimerRef.current = setTimeout(flushPendingPartial, delay);
+    },
+    [flushPendingPartial]
+  );
+
+  const commitFinalResult = useCallback(
+    (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
+      transcriptGenerationRef.current += 1;
+      clearPendingPartial();
+      lastPartialRenderAtRef.current = 0;
+      commitTranscriptResult(result, onCommitted);
+    },
+    [clearPendingPartial, commitTranscriptResult]
+  );
+
+  const handleTranscriptResult = useCallback(
+    (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
+      if (result.isFinal) {
+        commitFinalResult(result, onCommitted);
+      } else {
+        queuePartialResult(result);
+      }
+    },
+    [commitFinalResult, queuePartialResult]
+  );
+
+  useEffect(() => {
+    return () => resetTranscriptScheduler();
+  }, [resetTranscriptScheduler]);
 
   const requestJson = useCallback(async <T = unknown,>(input: RequestInfo | URL, init?: RequestInit) => {
     const res = await fetch(input, init);
@@ -97,6 +200,92 @@ export default function MeetingPage() {
     }
     return data as T;
   }, []);
+
+  const materializeCheckpointTranscript = useCallback(() => {
+    if (partialTimerRef.current !== null) {
+      clearTimeout(partialTimerRef.current);
+      partialTimerRef.current = null;
+    }
+
+    const pending = pendingPartialRef.current;
+    pendingPartialRef.current = null;
+    let nextSegments = segmentsRef.current;
+
+    if (pending && pending.generation === transcriptGenerationRef.current) {
+      lastPartialRenderAtRef.current = Date.now();
+      nextSegments = updateTranscriptSegments(nextSegments, pending, () => `live-${segCounter++}`);
+    }
+
+    nextSegments = finalizeTranscriptSegments(nextSegments);
+    segmentsRef.current = nextSegments;
+    setLiveSegments(nextSegments);
+    return nextSegments;
+  }, []);
+
+  const saveAsrCheckpoint = useCallback(async (segments: TranscriptSegment[], errorMessage: string) => {
+    if (segments.length === 0 || !segments.some((segment) => segment.text.trim())) return;
+
+    const captureSessionId = asrClientRef.current?.getCaptureSessionId() || `capture-${Date.now()}`;
+    let meetingId = persistedMeetingIdRef.current;
+
+    if (!meetingId) {
+      const now = new Date();
+      const pad = (value: number) => value.toString().padStart(2, "0");
+      const title = `录音 ${now.getMonth() + 1}月${now.getDate()}日 ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          sourceType: "live_recording",
+          sourceFileName: null,
+          durationSeconds: elapsedRef.current,
+          captureSessionId,
+          transcriptSegments: segments,
+          triggerLlm: false,
+        }),
+      });
+      const createdMeeting = data.meeting;
+      meetingId = createdMeeting?.id ?? null;
+      if (!meetingId) throw new Error("ASR checkpoint meeting was not created");
+      persistedMeetingIdRef.current = meetingId;
+      persistedSegmentCountRef.current = segments.length;
+      if (createdMeeting) {
+        setMeetings((prev) => [createdMeeting, ...prev]);
+      }
+    } else {
+      const appendedSegments = segments.slice(persistedSegmentCountRef.current);
+      if (appendedSegments.length > 0) {
+        await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            appendTranscriptSegments: appendedSegments,
+            captureSessionId,
+          }),
+        });
+        persistedSegmentCountRef.current = segments.length;
+      }
+    }
+
+    const pausedData = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status: "paused",
+        lastErrorMessage: errorMessage,
+      }),
+    });
+    const pausedMeeting = pausedData.meeting;
+    if (pausedMeeting) {
+      setMeetings((prev) => {
+        const exists = prev.some((meeting) => meeting.id === pausedMeeting.id);
+        return exists
+          ? prev.map((meeting) => meeting.id === pausedMeeting.id ? pausedMeeting : meeting)
+          : [pausedMeeting, ...prev];
+      });
+    }
+  }, [requestJson]);
 
   useEffect(() => {
     segmentsRef.current = liveSegments;
@@ -200,7 +389,7 @@ export default function MeetingPage() {
     };
   }, [loadRuntimeConfig, requestJson, showNotice]);
 
-  const startRecording = useCallback(async () => {
+  const startRecording = useCallback(async (preserveTranscript = false) => {
     let nextAsrReady = asrReady;
 
     if (!nextAsrReady) {
@@ -218,11 +407,19 @@ export default function MeetingPage() {
     }
 
     setStatus("connecting");
-    setLiveSegments([]);
-    selectedMeetingIdRef.current = null;
-    setSelected(null);
-    voiceprintFeaturesRef.current = [];
-    speakerIdsRef.current = [];
+    setAsrErrorMessage(null);
+    resetTranscriptScheduler();
+    const recordingSession = transcriptSessionRef.current;
+    asrRecoveryRef.current = false;
+    if (!preserveTranscript) {
+      persistedMeetingIdRef.current = null;
+      persistedSegmentCountRef.current = 0;
+      setLiveSegments([]);
+      selectedMeetingIdRef.current = null;
+      setSelected(null);
+      voiceprintFeaturesRef.current = [];
+      speakerIdsRef.current = [];
+    }
 
     try {
       const client = new FunASRClient();
@@ -231,6 +428,8 @@ export default function MeetingPage() {
       await client.startRecording(
         {
           onResult: (text, isFinal, speakerId, audioData) => {
+            if (recordingSession !== transcriptSessionRef.current) return;
+
             let clusterSpeakerId = speakerId;
 
             if (isFinal && audioData && audioData.length > 1000) {
@@ -251,57 +450,44 @@ export default function MeetingPage() {
               }
             }
 
-            setLiveSegments((prev) => {
-              const lastSeg = prev[prev.length - 1];
-
-              if (isFinal) {
-                if (lastSeg && !lastSeg.isFinal) {
-                  const updated = [...prev];
-                  updated[updated.length - 1] = { ...lastSeg, text, isFinal: true, speakerId: clusterSpeakerId };
-                  return updated;
-                }
-                return [
-                  ...prev,
-                  {
-                    id: `live-${segCounter++}`,
-                    speaker: "",
-                    speakerId: clusterSpeakerId,
-                    text,
-                    time: formatTime(elapsedRef.current),
-                    timeSeconds: elapsedRef.current,
-                    isFinal: true,
-                  },
-                ];
-              } else {
-                if (lastSeg && !lastSeg.isFinal) {
-                  const updated = [...prev];
-                  updated[updated.length - 1] = { ...lastSeg, text };
-                  return updated;
-                }
-                return [
-                  ...prev,
-                  {
-                    id: `live-${segCounter++}`,
-                    speaker: "",
-                    speakerId: clusterSpeakerId,
-                    text,
-                    time: formatTime(elapsedRef.current),
-                    timeSeconds: elapsedRef.current,
-                    isFinal: false,
-                  },
-                ];
-              }
+            handleTranscriptResult({
+              text,
+              isFinal,
+              speakerId: clusterSpeakerId,
+              time: formatTime(elapsedRef.current),
+              timeSeconds: elapsedRef.current,
             });
           },
           onError: (error) => {
             console.error("FunASR error:", error);
-            setStatus("idle");
-            showNotice("error", `ASR 连接失败: ${error.message}`);
+            if (timerRef.current) clearInterval(timerRef.current);
+            const checkpointSegments = materializeCheckpointTranscript();
+            resetTranscriptScheduler();
+            asrRecoveryRef.current = true;
+            setAsrErrorMessage(error.message);
+            setStatus("paused");
+            showNotice("error", `ASR 连接失败，录音已暂停: ${error.message}`);
+
+            if (!checkpointPromiseRef.current) {
+              const checkpointPromise = saveAsrCheckpoint(checkpointSegments, error.message);
+              checkpointPromiseRef.current = checkpointPromise;
+              void checkpointPromise
+                .catch((checkpointError) => {
+                  const message = checkpointError instanceof Error ? checkpointError.message : String(checkpointError);
+                  setAsrErrorMessage(`${error.message}（自动保存失败：${message}）`);
+                  showNotice("error", `ASR 已暂停，但自动保存失败: ${message}`);
+                })
+                .finally(() => {
+                  if (checkpointPromiseRef.current === checkpointPromise) {
+                    checkpointPromiseRef.current = null;
+                  }
+                });
+            }
           },
           onStatusChange: (s) => {
             if (s === "recording") {
               setStatus("recording");
-              setElapsed(0);
+              if (!preserveTranscript) setElapsed(0);
               timerRef.current = setInterval(
                 () => setElapsed((e) => e + 1),
                 1000
@@ -313,21 +499,63 @@ export default function MeetingPage() {
       );
     } catch (error) {
       console.error("Failed to start recording:", error);
-      setStatus("idle");
-      showNotice("error", `启动录音失败: ${(error as Error).message}`);
+      resetTranscriptScheduler();
+      if (preserveTranscript) {
+        asrRecoveryRef.current = true;
+        const message = (error as Error).message;
+        setAsrErrorMessage(message);
+        setStatus("paused");
+        showNotice("error", `ASR 重连失败，录音仍已暂停: ${message}`);
+      } else {
+        asrRecoveryRef.current = false;
+        setStatus("idle");
+        showNotice("error", `启动录音失败: ${(error as Error).message}`);
+      }
     }
-  }, [asrReady, device, loadRuntimeConfig, showNotice]);
+  }, [
+    asrReady,
+    device,
+    handleTranscriptResult,
+    loadRuntimeConfig,
+    materializeCheckpointTranscript,
+    resetTranscriptScheduler,
+    saveAsrCheckpoint,
+    showNotice,
+  ]);
 
   const pauseRecording = useCallback(() => {
     if (asrClientRef.current) {
+      asrRecoveryRef.current = false;
+      setAsrErrorMessage(null);
       asrClientRef.current.pause();
       setStatus("paused");
       if (timerRef.current) clearInterval(timerRef.current);
     }
   }, []);
 
-  const resumeRecording = useCallback(() => {
+  const resumeRecording = useCallback(async () => {
+    if (asrRecoveryRef.current) {
+      if (checkpointPromiseRef.current) {
+        await checkpointPromiseRef.current.catch((error) => {
+          console.warn("ASR checkpoint did not complete before resume:", error);
+        });
+      }
+
+      const failedClient = asrClientRef.current;
+      asrClientRef.current = null;
+
+      if (failedClient) {
+        await failedClient.stopRecording().catch((error) => {
+          console.warn("Failed to clean up failed ASR session:", error);
+        });
+      }
+
+      await startRecording(true);
+      return;
+    }
+
     if (asrClientRef.current) {
+      setAsrErrorMessage(null);
       asrClientRef.current.resume();
       setStatus("recording");
       timerRef.current = setInterval(
@@ -335,9 +563,15 @@ export default function MeetingPage() {
         1000
       );
     }
-  }, []);
+  }, [startRecording]);
 
   const stopRecording = useCallback(async () => {
+    if (checkpointPromiseRef.current) {
+      await checkpointPromiseRef.current.catch((error) => {
+        console.warn("ASR checkpoint did not complete before stop:", error);
+      });
+    }
+
     if (timerRef.current) clearInterval(timerRef.current);
     setStatus("generating");
 
@@ -349,7 +583,8 @@ export default function MeetingPage() {
       asrClientRef.current = null;
     }
 
-    const finalSegments = segmentsRef.current.filter((s) => s.isFinal);
+    resetTranscriptScheduler();
+    const finalSegments = segmentsRef.current.filter((segment) => segment.isFinal);
     if (finalSegments.length === 0) {
       setStatus("idle");
       return;
@@ -367,21 +602,40 @@ export default function MeetingPage() {
     const title = name.trim() || defaultName;
     setSavingMeeting(true);
     try {
-      const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title,
-          sourceType: "live_recording",
-          sourceFileName: null,
-          durationSeconds: elapsedRef.current,
-          captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
-          transcriptSegments: finalSegments,
-        }),
-      });
+      const existingMeetingId = persistedMeetingIdRef.current;
+      const data = existingMeetingId
+        ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
+              captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              title,
+              status: "transcribed",
+              lastErrorMessage: null,
+              finalize: true,
+            }),
+          })
+        : await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title,
+              sourceType: "live_recording",
+              sourceFileName: null,
+              durationSeconds: elapsedRef.current,
+              captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              transcriptSegments: finalSegments,
+            }),
+          });
       const meeting = data.meeting;
       if (meeting) {
-        setMeetings((prev) => [meeting, ...prev]);
+        setMeetings((prev) => {
+          const exists = prev.some((item) => item.id === meeting.id);
+          return exists
+            ? prev.map((item) => item.id === meeting.id ? meeting : item)
+            : [meeting, ...prev];
+        });
         selectedMeetingIdRef.current = meeting.id;
         setSelected(meeting);
         setLlmResults([]);
@@ -391,7 +645,10 @@ export default function MeetingPage() {
         setSelectedAsrResult(null);
         primeMeetingAsyncState(meeting.id).catch(console.error);
       }
+      persistedMeetingIdRef.current = null;
+      persistedSegmentCountRef.current = 0;
       setLiveSegments([]);
+      setAsrErrorMessage(null);
       setStatus("idle");
       setElapsed(0);
     } catch (error) {
@@ -401,9 +658,14 @@ export default function MeetingPage() {
     } finally {
       setSavingMeeting(false);
     }
-  }, [primeMeetingAsyncState, requestJson, showNotice]);
+  }, [primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
+    resetTranscriptScheduler();
+    asrRecoveryRef.current = false;
+    persistedMeetingIdRef.current = null;
+    persistedSegmentCountRef.current = 0;
+    setAsrErrorMessage(null);
     selectedMeetingIdRef.current = null;
     setSelected(null);
     updateSummaryGenerating(false, null);
@@ -416,7 +678,7 @@ export default function MeetingPage() {
     setSendRecords([]);
     setAsrResults([]);
     setSelectedAsrResult(null);
-  }, [updateSummaryGenerating]);
+  }, [resetTranscriptScheduler, updateSummaryGenerating]);
 
   const loadLlmResults = useCallback(async (meetingId: string) => {
     try {
@@ -542,6 +804,8 @@ export default function MeetingPage() {
     }
 
     setStatus("connecting");
+    resetTranscriptScheduler();
+    const uploadSession = transcriptSessionRef.current;
     setLiveSegments([]);
     selectedMeetingIdRef.current = null;
     setSelected(null);
@@ -556,51 +820,27 @@ export default function MeetingPage() {
       await client.transcribeFile(
         file,
         (text, isFinal, speakerId) => {
-          if (isFinal) {
-            setLiveSegments((prev) => {
-              const lastSeg = prev[prev.length - 1];
-              if (lastSeg && !lastSeg.isFinal) {
-                const updated = [...prev];
-                updated[updated.length - 1] = { ...lastSeg, text, isFinal: true, speakerId };
-                allSegments.length = 0;
-                allSegments.push(...updated.filter((s) => s.isFinal));
-                return updated;
-              }
-              const newSeg: TranscriptSegment = {
-                id: `live-${segCounter++}`,
-                speaker: "",
-                speakerId,
-                text,
-                time: formatTime(uploadTimeSeconds),
-                timeSeconds: uploadTimeSeconds,
-                isFinal: true,
-              };
-              allSegments.push(newSeg);
-              return [...prev, newSeg];
-            });
-          } else {
+          if (uploadSession !== transcriptSessionRef.current) return;
+
+          if (!isFinal) {
             setStatus("recording");
-            setLiveSegments((prev) => {
-              const lastSeg = prev[prev.length - 1];
-              if (lastSeg && !lastSeg.isFinal) {
-                const updated = [...prev];
-                updated[updated.length - 1] = { ...lastSeg, text };
-                return updated;
-              }
-              return [
-                ...prev,
-                {
-                  id: `live-${segCounter++}`,
-                  speaker: "",
-                  speakerId,
-                  text,
-                  time: formatTime(uploadTimeSeconds),
-                  timeSeconds: uploadTimeSeconds,
-                  isFinal: false,
-                },
-              ];
-            });
           }
+
+          handleTranscriptResult(
+            {
+              text,
+              isFinal,
+              speakerId,
+              time: formatTime(uploadTimeSeconds),
+              timeSeconds: uploadTimeSeconds,
+            },
+            isFinal
+              ? (segments) => {
+                  allSegments.length = 0;
+                  allSegments.push(...segments.filter((segment) => segment.isFinal));
+                }
+              : undefined
+          );
         },
         (progress) => {
           console.log("[Upload] progress:", progress + "%");
@@ -643,16 +883,29 @@ export default function MeetingPage() {
         }
       }
 
+      resetTranscriptScheduler();
       setLiveSegments([]);
       setStatus("idle");
     } catch (err) {
       console.error("Upload transcribe failed:", err);
+      if (timerRef.current) clearInterval(timerRef.current);
+      flushPendingPartial();
+      resetTranscriptScheduler();
       showNotice("error", `音频识别失败: ${(err as Error).message}`);
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
     }
-  }, [asrReady, loadRuntimeConfig, primeMeetingAsyncState, requestJson, showNotice]);
+  }, [
+    asrReady,
+    flushPendingPartial,
+    handleTranscriptResult,
+    loadRuntimeConfig,
+    primeMeetingAsyncState,
+    requestJson,
+    resetTranscriptScheduler,
+    showNotice,
+  ]);
 
   const generateSummary = useCallback(async (promptTemplateId?: string) => {
     if (!selected || summaryGeneratingRef.current) return;
@@ -841,8 +1094,13 @@ export default function MeetingPage() {
             <HistoryList
               meetings={meetings}
               selectedId={selected?.id ?? null}
-              onSelect={(m) => {
-                selectedMeetingIdRef.current = m.id;
+               onSelect={(m) => {
+                 resetTranscriptScheduler();
+                 asrRecoveryRef.current = false;
+                 persistedMeetingIdRef.current = null;
+                 persistedSegmentCountRef.current = 0;
+                 setAsrErrorMessage(null);
+                 selectedMeetingIdRef.current = m.id;
                 setSelected(m);
                 updateSummaryGenerating(false, null);
                 setSendingMail(false);
@@ -1289,9 +1547,9 @@ export default function MeetingPage() {
                     >
                       上传音频
                     </button>
-                    <RecordingControls
-                      status={status}
-                      onStart={startRecording}
+                     <RecordingControls
+                       status={status}
+                       onStart={startRecording}
                       onPause={pauseRecording}
                       onResume={resumeRecording}
                       onStop={stopRecording}
@@ -1299,31 +1557,35 @@ export default function MeetingPage() {
                   </div>
                 </div>
                 {status === "recording" || status === "paused" || status === "connecting" ? (
-                  <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-2 text-sm">
-                    <span
-                      className={
-                        status === "recording"
-                          ? "rec-dot"
-                          : status === "paused"
-                          ? "h-3 w-3 rounded-full bg-amber-400"
+                   <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-2 text-sm">
+                     <span
+                       className={
+                         status === "recording"
+                           ? "rec-dot"
+                           : status === "paused"
+                           ? "h-3 w-3 rounded-full bg-amber-400"
                           : "h-3 w-3 rounded-full bg-amber-400"
                       }
                     />
-                    <span className="text-slate-600">
+                    <span className="min-w-0 truncate text-slate-600" title={asrErrorMessage ?? undefined}>
                       {status === "recording"
                         ? `录音中 ${formatTime(elapsed)}`
                         : status === "paused"
-                        ? `已暂停 ${formatTime(elapsed)}`
-                        : savingMeeting
+                         ? asrErrorMessage
+                           ? `ASR 已暂停：${asrErrorMessage}`
+                           : `已暂停 ${formatTime(elapsed)}`
+                         : savingMeeting
                         ? "保存会议中..."
                         : "连接中..."}
                     </span>
                     <span className="ml-auto text-slate-400">
                       FunASR:{" "}
-                      {status === "recording" ? (
-                        <span className="text-green-600">已连接</span>
-                      ) : (
-                        "连接中"
+                        {status === "recording" ? (
+                          <span className="text-green-600">已连接</span>
+                        ) : status === "paused" && asrErrorMessage ? (
+                          <span className="text-red-600">连接异常</span>
+                        ) : (
+                          "连接中"
                       )}
                     </span>
                   </div>
@@ -1337,7 +1599,7 @@ export default function MeetingPage() {
 
           {!selected && (
             <div className="border-t border-slate-100 bg-slate-50 px-6 py-1 text-xs text-slate-400">
-              FunASR: {status === "recording" || status === "paused" ? "已连接" : "待连接"} | 设备: {selectedDeviceLabel}
+              FunASR: {status === "recording" || status === "paused" ? asrErrorMessage ? "连接异常" : "已连接" : "待连接"} | 设备: {selectedDeviceLabel}
             </div>
           )}
         </main>

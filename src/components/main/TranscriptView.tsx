@@ -27,6 +27,7 @@ const SPEAKER_COLORS = [
   "text-pink-600",
   "text-indigo-600",
 ];
+const AUTO_SCROLL_THRESHOLD_PX = 48;
 
 function getSpeakerLabel(speakerId: number | null): string {
   if (speakerId === null || speakerId === undefined) return "";
@@ -74,14 +75,18 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
 
 export default function TranscriptView({ segments, autoScroll = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
 
   const paragraphs = useMemo(() => mergeSegments(segments), [segments]);
 
   useEffect(() => {
-    if (autoScroll && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    if (segments.length === 0) {
+      shouldAutoScrollRef.current = true;
+      return;
     }
-  }, [paragraphs, autoScroll]);
+    if (!autoScroll || !shouldAutoScrollRef.current || !containerRef.current) return;
+    containerRef.current.scrollTop = containerRef.current.scrollHeight;
+  }, [autoScroll, paragraphs, segments.length]);
 
   if (segments.length === 0) {
     return (
@@ -94,7 +99,15 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
   }
 
   return (
-    <div ref={containerRef} className="scroll-thin h-full overflow-y-auto px-1 py-2">
+    <div
+      ref={containerRef}
+      onScroll={(event) => {
+        const target = event.currentTarget;
+        const distanceFromBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
+        shouldAutoScrollRef.current = distanceFromBottom <= AUTO_SCROLL_THRESHOLD_PX;
+      }}
+      className="scroll-thin h-full overflow-y-auto px-1 py-2"
+    >
       <div className="space-y-3">
         {paragraphs.map((para) => (
           <div key={para.id} className="flex gap-3">
@@ -110,7 +123,7 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
               <div className="text-[15px] leading-relaxed text-slate-700">
                 {para.text}
                 {!para.isFinal && (
-                  <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-brand/60" />
+                  <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 bg-brand/50" />
                 )}
               </div>
             </div>

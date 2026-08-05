@@ -21,6 +21,8 @@ export function getMeetingStatusMeta(status: string): MeetingStatusMeta {
       return { label: "发送失败", className: "bg-red-50 text-red-700" };
     case "transcribe_failed":
       return { label: "转写失败", className: "bg-red-50 text-red-700" };
+    case "paused":
+      return { label: "已暂停", className: "bg-amber-50 text-amber-700" };
     default:
       return { label: status || "未知状态", className: "bg-slate-100 text-slate-600" };
   }

@@ -28,7 +28,7 @@ export async function POST(req: NextRequest) {
         status: "skipped",
       };
 
-      if (meeting?.id) {
+       if (meeting?.id && body.triggerLlm !== false) {
         defaultLlmResult = { triggered: true, status: "pending" };
         void createMeetingLlmResult(meeting.id).catch((error) => {
           console.error("Failed to generate default LLM result:", error);

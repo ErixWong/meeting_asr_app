@@ -114,21 +114,23 @@ type AuditLogRow = {
   createdAt: string;
 };
 
+type MeetingTranscriptSegment = {
+  id: string;
+  speaker: string;
+  speakerId?: number | null;
+  text: string;
+  time: string;
+  timeSeconds: number;
+  isFinal: boolean;
+};
+
 type MeetingInput = {
   title: string;
   sourceType: string;
   sourceFileName: string | null;
   durationSeconds: number | null;
   captureSessionId: string;
-  transcriptSegments: Array<{
-    id: string;
-    speaker: string;
-    speakerId?: number | null;
-    text: string;
-    time: string;
-    timeSeconds: number;
-    isFinal: boolean;
-  }>;
+  transcriptSegments: MeetingTranscriptSegment[];
 };
 
 type MeetingLlmResultRow = {
@@ -1847,6 +1849,84 @@ export function createMeeting(input: MeetingInput) {
   });
 }
 
+export function appendMeetingTranscript(input: {
+  meetingId: string;
+  captureSessionId: string;
+  transcriptSegments: MeetingTranscriptSegment[];
+}) {
+  const existing = getMeetingById(input.meetingId);
+  if (!existing) return null;
+
+  const database = getDb();
+  const createdAt = nowIso();
+  const settings = listSettings();
+  const activeHotwords = listActiveHotwordMap();
+  const transcriptSegments = Array.isArray(input.transcriptSegments) ? input.transcriptSegments : [];
+  const normalizedText = transcriptSegments.map((segment) => String(segment.text ?? "")).join("");
+  if (!normalizedText.trim()) return existing;
+
+  const get = (section: string, mark: string) =>
+    settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
+  const captureSession = getAsrCaptureSession(input.captureSessionId);
+  const rawEvents = captureSession ? listAsrCaptureEvents(input.captureSessionId) : null;
+  const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
+    ? parseJsonOr(captureSession.asrConfigSnapshot, {})
+    : {
+        providerType: get("asr", "provider"),
+        endpoint: get("asr", "endpoint"),
+        workspaceId: get("asr", "workspace_id"),
+        hasApiKey: Boolean(get("asr", "api_key")),
+        hotwords: activeHotwords,
+      };
+  const asrConfigSnapshot = redactAsrConfigSnapshot(rawAsrConfigSnapshot);
+  const rawPayload = captureSession
+    ? {
+        captureSessionId: input.captureSessionId,
+        taskId: captureSession.taskId,
+        status: captureSession.status,
+        events: rawEvents ?? [],
+        transcriptSegments,
+      }
+    : { captureSessionId: input.captureSessionId, segments: transcriptSegments };
+
+  return withTransaction(() => {
+    database
+      .prepare(`
+        INSERT INTO meeting_asr_results (
+          id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
+          capture_session_id, result_format, raw_payload, normalized_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        newId("asr"),
+        input.meetingId,
+        captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
+        "checkpoint",
+        JSON.stringify(asrConfigSnapshot),
+        input.captureSessionId,
+        captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
+        JSON.stringify(rawPayload),
+        normalizedText,
+        createdAt
+      );
+
+    database
+      .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
+      .run(createdAt, input.meetingId);
+
+    const updated = getMeetingById(input.meetingId);
+    writeAuditLog({
+      actionType: "meeting.transcript.append",
+      resourceType: "meeting",
+      resourceId: input.meetingId,
+      resourceName: updated?.title ?? existing.title,
+      beforeSnapshot: existing,
+      afterSnapshot: updated,
+    });
+    return updated;
+  });
+}
+
 export function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null) {
   const updatedAt = nowIso();
   getDb()
@@ -1858,6 +1938,48 @@ export function updateMeetingStatus(id: string, status: string, lastErrorMessage
     .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id);
 
   return getMeetingById(id);
+}
+
+export function updateTranscriptMeetingStatus(
+  id: string,
+  status: "paused" | "transcribed",
+  lastErrorMessage?: string | null
+) {
+  const existing = getMeetingById(id);
+  if (!existing) return null;
+
+  const allowedFrom = status === "paused"
+    ? ["transcribed", "paused"]
+    : ["paused"];
+  if (!allowedFrom.includes(existing.status)) {
+    throw new Error(`Invalid meeting status transition: ${existing.status} -> ${status}`);
+  }
+
+  return withTransaction(() => {
+    const updatedAt = nowIso();
+    const result = getDb()
+      .prepare(`
+        UPDATE meetings
+        SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
+        WHERE id = ? AND status IN (?, ?)
+      `)
+      .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id, ...allowedFrom);
+
+    if (Number(result.changes ?? 0) === 0) {
+      throw new Error(`Meeting status changed before transition: ${id}`);
+    }
+
+    const updated = getMeetingById(id);
+    writeAuditLog({
+      actionType: "meeting.status.update",
+      resourceType: "meeting",
+      resourceId: id,
+      resourceName: updated?.title ?? existing.title,
+      beforeSnapshot: existing,
+      afterSnapshot: updated,
+    });
+    return updated;
+  });
 }
 
 export function updateMeeting(id: string, patch: { title?: string }) {
@@ -2228,7 +2350,20 @@ function llmRequest(
 }
 
 export async function createMeetingLlmResult(meetingId: string, templateId?: string) {
-  updateMeetingStatus(meetingId, "llm_processing");
+  const meeting = getMeetingById(meetingId);
+  if (!meeting) throw new Error("Meeting not found");
+
+  const claim = getDb()
+    .prepare(`
+      UPDATE meetings
+      SET status = 'llm_processing', status_updated_at = ?, last_error_message = NULL, updated_at = ?
+      WHERE id = ? AND status <> 'llm_processing'
+    `)
+    .run(nowIso(), nowIso(), meetingId);
+  if (Number(claim.changes ?? 0) === 0) {
+    throw new Error("LLM generation already in progress");
+  }
+
   const inputTranscriptSnapshot = getMergedMeetingTranscript(meetingId);
   if (!inputTranscriptSnapshot) {
     updateMeetingStatus(meetingId, "llm_failed", "Meeting ASR transcript not found");
