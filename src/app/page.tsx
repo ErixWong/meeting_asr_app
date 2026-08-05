@@ -50,6 +50,16 @@ type PendingPartial = TranscriptResult & {
   generation: number;
 };
 
+class ApiRequestError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+  }
+}
+
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
@@ -196,7 +206,7 @@ export default function MeetingPage() {
       ? String(data.error)
       : `Request failed: ${res.status}`;
     if (!res.ok || (typeof data === "object" && data !== null && "error" in data)) {
-      throw new Error(error);
+      throw new ApiRequestError(error, res.status);
     }
     return data as T;
   }, []);
@@ -691,6 +701,7 @@ export default function MeetingPage() {
         setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: nextResults[0].resultMarkdown } : prev));
       }
     } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load llm results:", error);
       if (!isActiveMeeting(meetingId)) return;
       setLlmResults([]);
@@ -704,6 +715,7 @@ export default function MeetingPage() {
       if (!isActiveMeeting(meetingId)) return;
       setSendRecords(data.sendRecords ?? []);
     } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load send records:", error);
       if (!isActiveMeeting(meetingId)) return;
       setSendRecords([]);
@@ -725,6 +737,7 @@ export default function MeetingPage() {
         setSelectedAsrResult(null);
       }
     } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load asr results:", error);
       if (!isActiveMeeting(meetingId)) return;
       setAsrResults([]);
@@ -738,6 +751,7 @@ export default function MeetingPage() {
       if (!isActiveMeeting(meetingId)) return;
       setSelectedAsrResult(data.asrResult ?? null);
     } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load asr result detail:", error);
       if (!isActiveMeeting(meetingId)) return;
       setSelectedAsrResult(null);

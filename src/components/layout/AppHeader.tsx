@@ -67,8 +67,7 @@ export default function AppHeader() {
   const logout = async () => {
     await performLogout();
     setUser(null);
-    router.replace("/login");
-    router.refresh();
+    window.location.replace("/login");
   };
 
   if (!headerConfig) return null;

@@ -25,10 +25,33 @@ type PromptTemplateItem = {
   isSystem?: boolean;
 };
 
+type TemplateModalState = { mode: "create" } | { mode: "edit"; template: PromptTemplateItem };
+
+type TemplateDraft = {
+  id?: string;
+  templateKey: string;
+  templateName: string;
+  templateType: string;
+  content: string;
+  description: string;
+  status: string;
+  isSystem?: boolean;
+};
+
 type HotwordItem = {
   id: string;
   term: string;
   weight: number;
+  status: string;
+  note: string;
+};
+
+type HotwordModalState = { mode: "create" } | { mode: "edit"; hotword: HotwordItem };
+
+type HotwordDraft = {
+  id?: string;
+  term: string;
+  weight: string;
   status: string;
   note: string;
 };
@@ -203,7 +226,13 @@ export default function AdminPage() {
 
   const [defaultTemplateId, setDefaultTemplateId] = useState("");
   const [templates, setTemplates] = useState<PromptTemplateItem[]>([]);
+  const [templateModal, setTemplateModal] = useState<TemplateModalState | null>(null);
+  const [templateDraft, setTemplateDraft] = useState<TemplateDraft | null>(null);
+  const [savingTemplate, setSavingTemplate] = useState(false);
   const [hotwords, setHotwords] = useState<HotwordItem[]>([]);
+  const [hotwordModal, setHotwordModal] = useState<HotwordModalState | null>(null);
+  const [hotwordDraft, setHotwordDraft] = useState<HotwordDraft | null>(null);
+  const [savingHotword, setSavingHotword] = useState(false);
   const [users, setUsers] = useState<UserItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
@@ -493,16 +522,6 @@ export default function AdminPage() {
     return data.template as PromptTemplateItem;
   };
 
-  const saveTemplate = async (template: PromptTemplateItem) => {
-    try {
-      const savedTemplate = await persistTemplate(template);
-      setTemplates((prev) => prev.map((item) => (item.id === template.id ? savedTemplate : item)));
-      showSuccess("模板已保存");
-    } catch (error) {
-      showError(`模板保存失败: ${(error as Error).message}`);
-    }
-  };
-
   const saveDefaultTemplate = async (templateId: string) => {
     setSavingSettings(true);
     try {
@@ -546,51 +565,158 @@ export default function AdminPage() {
     }
   };
 
-  const createTemplate = async () => {
+  const openCreateTemplate = () => {
+    setTemplateDraft({
+      templateKey: `custom_${Date.now()}`,
+      templateName: "",
+      templateType: "custom",
+      content: "请根据以下会议转写内容输出结果。\n\n{transcript}",
+      description: "",
+      status: "active",
+      isSystem: false,
+    });
+    setTemplateModal({ mode: "create" });
+  };
+
+  const openEditTemplate = (template: PromptTemplateItem) => {
+    setTemplateDraft({
+      id: template.id,
+      templateKey: template.templateKey,
+      templateName: template.templateName,
+      templateType: template.templateType,
+      content: template.content,
+      description: template.description,
+      status: template.status,
+      isSystem: template.isSystem,
+    });
+    setTemplateModal({ mode: "edit", template });
+  };
+
+  const closeTemplateModal = () => {
+    if (savingTemplate) return;
+    setTemplateModal(null);
+    setTemplateDraft(null);
+  };
+
+  const submitTemplateModal = async () => {
+    if (!templateDraft || !templateModal || savingTemplate) return;
+
+    const templateKey = templateDraft.templateKey.trim();
+    const templateName = templateDraft.templateName.trim();
+    const content = templateDraft.content.trim();
+    if (!templateKey || !templateName || !content) {
+      showError("模板标识、名称和内容不能为空");
+      return;
+    }
+
+    setSavingTemplate(true);
     try {
-      const data = await requestJson<{ template: PromptTemplateItem }>("/api/admin/prompt-templates", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          templateKey: `custom_${Date.now()}`,
-          templateName: "新模板",
-          templateType: "custom",
-          content: "请根据以下会议转写内容输出结果。\n\n{transcript}",
-          description: "请补充说明",
-        }),
-      });
-      setTemplates((prev) => [...prev, data.template]);
-      showSuccess("模板已新增");
+      if (templateModal.mode === "create") {
+        const data = await requestJson<{ template: PromptTemplateItem }>("/api/admin/prompt-templates", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            templateKey,
+            templateName,
+            templateType: templateDraft.templateType,
+            content,
+            description: templateDraft.description.trim(),
+            status: templateDraft.status,
+          }),
+        });
+        setTemplates((prev) => [...prev, data.template]);
+      } else {
+        if (!templateDraft.id) return;
+        const data = await requestJson<{ template: PromptTemplateItem }>(`/api/admin/prompt-templates/${templateDraft.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            templateKey,
+            templateName,
+            templateType: templateDraft.templateType,
+            content,
+            description: templateDraft.description.trim(),
+            status: templateDraft.status,
+            isSystem: templateDraft.isSystem,
+          }),
+        });
+        setTemplates((prev) => prev.map((item) => (item.id === data.template.id ? data.template : item)));
+      }
+
+      const auditRefreshed = await refreshAuditLogsBestEffort();
+      setTemplateModal(null);
+      setTemplateDraft(null);
+      showSuccess(auditRefreshed ? "模板已保存" : "模板已保存，但审计日志刷新失败");
     } catch (error) {
-      showError(`新增模板失败: ${(error as Error).message}`);
+      showError(`模板保存失败: ${(error as Error).message}`);
+    } finally {
+      setSavingTemplate(false);
     }
   };
 
-  const saveHotword = async (hotword: HotwordItem) => {
+  const openCreateHotword = () => {
+    setHotwordDraft({ term: "", weight: "10", status: "active", note: "" });
+    setHotwordModal({ mode: "create" });
+  };
+
+  const openEditHotword = (hotword: HotwordItem) => {
+    setHotwordDraft({
+      id: hotword.id,
+      term: hotword.term,
+      weight: String(hotword.weight),
+      status: hotword.status,
+      note: hotword.note,
+    });
+    setHotwordModal({ mode: "edit", hotword });
+  };
+
+  const closeHotwordModal = () => {
+    if (savingHotword) return;
+    setHotwordModal(null);
+    setHotwordDraft(null);
+  };
+
+  const submitHotwordModal = async () => {
+    if (!hotwordDraft || !hotwordModal || savingHotword) return;
+
+    const term = hotwordDraft.term.trim();
+    const weight = Number(hotwordDraft.weight);
+    if (!term) {
+      showError("热词不能为空");
+      return;
+    }
+    if (!Number.isFinite(weight)) {
+      showError("权重必须是数字");
+      return;
+    }
+
+    setSavingHotword(true);
     try {
-      const data = await requestJson<{ hotword: HotwordItem }>(`/api/admin/hotwords/${hotword.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(hotword),
-      });
-      setHotwords((prev) => prev.map((item) => (item.id === hotword.id ? data.hotword : item)));
-      showSuccess("热词已保存");
+      if (hotwordModal.mode === "create") {
+        const data = await requestJson<{ hotword: HotwordItem }>("/api/admin/hotwords", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ term, weight, status: hotwordDraft.status, note: hotwordDraft.note.trim() }),
+        });
+        setHotwords((prev) => [...prev, data.hotword]);
+      } else {
+        if (!hotwordDraft.id) return;
+        const data = await requestJson<{ hotword: HotwordItem }>(`/api/admin/hotwords/${hotwordDraft.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ term, weight, status: hotwordDraft.status, note: hotwordDraft.note.trim() }),
+        });
+        setHotwords((prev) => prev.map((item) => (item.id === data.hotword.id ? data.hotword : item)));
+      }
+
+      const auditRefreshed = await refreshAuditLogsBestEffort();
+      setHotwordModal(null);
+      setHotwordDraft(null);
+      showSuccess(auditRefreshed ? "热词已保存" : "热词已保存，但审计日志刷新失败");
     } catch (error) {
       showError(`热词保存失败: ${(error as Error).message}`);
-    }
-  };
-
-  const createHotword = async () => {
-    try {
-      const data = await requestJson<{ hotword: HotwordItem }>("/api/admin/hotwords", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ term: `新热词${Date.now()}`, weight: 10, status: "active", note: "" }),
-      });
-      setHotwords((prev) => [...prev, data.hotword]);
-      showSuccess("热词已新增");
-    } catch (error) {
-      showError(`新增热词失败: ${(error as Error).message}`);
+    } finally {
+      setSavingHotword(false);
     }
   };
 
@@ -1005,195 +1131,300 @@ export default function AdminPage() {
         )}
 
         {!loading && activeTab === "templates" && (
-          <Card title="模板管理" icon="📝">
-            <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
-              模板是独立资源，不再使用单个系统提示词文本框维护。默认模板通过列表中的“设为默认”操作选择。
-            </div>
-            <div className="space-y-3">
-              {templates.map((template) => (
-                <div key={template.id} className="rounded-lg border border-slate-200 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-semibold text-slate-800">{template.templateName}</h3>
-                      <span className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-500">{template.templateType}</span>
-                      <span className={`rounded px-2 py-0.5 text-xs ${template.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"}`}>
-                        {template.status === "active" ? "启用中" : "已停用"}
-                      </span>
-                      {defaultTemplateId === template.id && (
-                        <span className="rounded bg-brand/10 px-2 py-0.5 text-xs text-brand">默认模板</span>
-                      )}
-                    </div>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => saveTemplate(template)}
-                        className="rounded-md border border-brand bg-brand px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-brand-dark"
-                      >
-                        保存
-                      </button>
-                      <button
-                        onClick={() => saveDefaultTemplate(template.id)}
-                        className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-                          defaultTemplateId === template.id
-                            ? "cursor-default border-slate-200 bg-slate-100 text-slate-400"
-                            : "border-sky-500 bg-sky-50 text-sky-700 hover:bg-sky-100"
-                        }`}
-                        disabled={savingSettings || defaultTemplateId === template.id}
-                      >
-                        {defaultTemplateId === template.id ? "已默认" : "设为默认"}
-                      </button>
-                      <button
-                        onClick={() => toggleTemplateStatus(template)}
-                        className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-                          template.status === "active"
-                            ? "border-rose-500 bg-rose-50 text-rose-700 hover:bg-rose-100"
-                            : "border-emerald-500 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-                        }`}
-                      >
-                        {template.status === "active" ? "停用" : "启用"}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                    <input
-                      value={template.templateName}
-                      onChange={(e) =>
-                        setTemplates((prev) =>
-                          prev.map((item) =>
-                            item.id === template.id ? { ...item, templateName: e.target.value } : item
-                          )
-                        )
-                      }
-                      className={inputCls}
-                    />
-                    <input
-                      value={template.description}
-                      onChange={(e) =>
-                        setTemplates((prev) =>
-                          prev.map((item) =>
-                            item.id === template.id ? { ...item, description: e.target.value } : item
-                          )
-                        )
-                      }
-                      className={inputCls}
-                    />
-                  </div>
-                  <textarea
-                    value={template.content}
-                    onChange={(e) =>
-                      setTemplates((prev) =>
-                        prev.map((item) =>
-                          item.id === template.id ? { ...item, content: e.target.value } : item
-                        )
-                      )
-                    }
-                    rows={6}
-                    className={`${inputCls} mt-3 font-mono leading-relaxed`}
-                  />
+          <>
+            <Card title="模板管理" icon="📝">
+              <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700 sm:flex-1">
+                  模板是独立资源，列表只展示摘要；新增和编辑通过 modal 完成。默认模板通过列表中的“设为默认”操作选择。
                 </div>
-              ))}
-            </div>
-            <div className="mt-3 flex gap-2">
-              <button onClick={createTemplate} className={btnCls}>新增模板</button>
-            </div>
-          </Card>
+                <button onClick={openCreateTemplate} className={`${btnCls} shrink-0`}>
+                  新增模板
+                </button>
+              </div>
+              <div className="overflow-x-auto rounded-lg border border-slate-200">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">模板</th>
+                      <th className="px-3 py-2 font-medium">类型</th>
+                      <th className="px-3 py-2 font-medium">状态</th>
+                      <th className="px-3 py-2 font-medium">说明</th>
+                      <th className="px-3 py-2 font-medium">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {templates.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-8 text-center text-slate-400">
+                          暂无模板
+                        </td>
+                      </tr>
+                    ) : (
+                      templates.map((template) => (
+                        <tr key={template.id} className="border-t border-slate-100">
+                          <td className="px-3 py-2">
+                            <div className="font-medium text-slate-700">{template.templateName}</div>
+                            <div className="mt-1 font-mono text-xs text-slate-400">{template.templateKey}</div>
+                          </td>
+                          <td className="px-3 py-2 text-slate-600">{template.templateType}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-wrap gap-1">
+                              <span className={`rounded px-2 py-0.5 text-xs ${
+                                template.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"
+                              }`}>
+                                {template.status === "active" ? "启用中" : "已停用"}
+                              </span>
+                              {defaultTemplateId === template.id && (
+                                <span className="rounded bg-brand/10 px-2 py-0.5 text-xs text-brand">默认</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="max-w-sm truncate px-3 py-2 text-slate-600">{template.description || "-"}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-wrap gap-3">
+                              <button onClick={() => openEditTemplate(template)} className="text-sky-600 hover:text-sky-800">
+                                编辑
+                              </button>
+                              <button
+                                onClick={() => saveDefaultTemplate(template.id)}
+                                disabled={savingSettings || defaultTemplateId === template.id}
+                                className="text-brand hover:text-brand-dark disabled:cursor-not-allowed disabled:text-slate-400"
+                              >
+                                {defaultTemplateId === template.id ? "已默认" : "设为默认"}
+                              </button>
+                              <button
+                                onClick={() => toggleTemplateStatus(template)}
+                                className={template.status === "active" ? "text-rose-600 hover:text-rose-800" : "text-emerald-600 hover:text-emerald-800"}
+                              >
+                                {template.status === "active" ? "停用" : "启用"}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            {templateModal && templateDraft && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+                <div className="max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-lg">
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-base font-semibold text-slate-800">
+                      {templateModal.mode === "edit" ? "编辑模板" : "新增模板"}
+                    </h3>
+                    <button
+                      onClick={closeTemplateModal}
+                      disabled={savingTemplate}
+                      className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      aria-label="关闭模板编辑"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">模板标识</label>
+                      <input
+                        value={templateDraft.templateKey}
+                        disabled={templateModal.mode === "edit"}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, templateKey: event.target.value } : prev)}
+                        className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">模板名称</label>
+                      <input
+                        value={templateDraft.templateName}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, templateName: event.target.value } : prev)}
+                        className={inputCls}
+                        autoFocus
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">模板类型</label>
+                      <input
+                        value={templateDraft.templateType}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, templateType: event.target.value } : prev)}
+                        className={inputCls}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">状态</label>
+                      <select
+                        value={templateDraft.status}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, status: event.target.value } : prev)}
+                        className={inputCls}
+                      >
+                        <option value="active">启用</option>
+                        <option value="disabled">停用</option>
+                      </select>
+                    </div>
+                    <div className="md:col-span-2">
+                      <label className="mb-1 block text-xs text-slate-500">说明</label>
+                      <input
+                        value={templateDraft.description}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, description: event.target.value } : prev)}
+                        className={inputCls}
+                      />
+                    </div>
+                    <div className="md:col-span-2">
+                      <label className="mb-1 block text-xs text-slate-500">模板内容</label>
+                      <textarea
+                        value={templateDraft.content}
+                        onChange={(event) => setTemplateDraft((prev) => prev ? { ...prev, content: event.target.value } : prev)}
+                        rows={14}
+                        className={`${inputCls} resize-y font-mono leading-relaxed`}
+                        spellCheck={false}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-5 flex justify-end gap-2">
+                    <button
+                      onClick={closeTemplateModal}
+                      disabled={savingTemplate}
+                      className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      取消
+                    </button>
+                    <button onClick={submitTemplateModal} disabled={savingTemplate} className={btnCls}>
+                      {savingTemplate ? "保存中..." : templateModal.mode === "edit" ? "保存" : "创建"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {!loading && activeTab === "hotwords" && (
-          <Card title="热词管理" icon="🔥">
-            <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-700">
-              热词会在新建 FunASR WebSocket 连接时被拼装进首帧 `hotwords` JSON。这里只维护管理员热词表，主页面不再单独编辑热词。
-            </div>
-            <div className="overflow-hidden rounded-lg border border-slate-200">
-              <table className="w-full text-sm">
-                <thead className="bg-slate-50 text-left text-slate-500">
-                  <tr>
-                    <th className="px-3 py-2 font-medium">热词</th>
-                    <th className="px-3 py-2 font-medium">权重</th>
-                    <th className="px-3 py-2 font-medium">状态</th>
-                    <th className="px-3 py-2 font-medium">备注</th>
-                    <th className="px-3 py-2 font-medium">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {hotwords.map((word) => (
-                    <tr key={word.id} className="border-t border-slate-100">
-                      <td className="px-3 py-2">
-                        <input
-                          value={word.term}
-                          onChange={(e) =>
-                            setHotwords((prev) =>
-                              prev.map((item) =>
-                                item.id === word.id ? { ...item, term: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-40 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <input
-                          type="number"
-                          min={1}
-                          max={100}
-                          value={word.weight}
-                          onChange={(e) =>
-                            setHotwords((prev) =>
-                              prev.map((item) =>
-                                item.id === word.id ? { ...item, weight: Number(e.target.value) || 1 } : item
-                              )
-                            )
-                          }
-                          className="w-20 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <button
-                          onClick={() =>
-                            setHotwords((prev) =>
-                              prev.map((item) =>
-                                item.id === word.id
-                                  ? { ...item, status: item.status === "active" ? "disabled" : "active" }
-                                  : item
-                              )
-                            )
-                          }
-                          className={`rounded px-2 py-1 text-xs ${word.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"}`}
-                        >
-                          {word.status === "active" ? "启用中" : "已停用"}
-                        </button>
-                      </td>
-                      <td className="px-3 py-2">
-                        <input
-                          value={word.note}
-                          onChange={(e) =>
-                            setHotwords((prev) =>
-                              prev.map((item) =>
-                                item.id === word.id ? { ...item, note: e.target.value } : item
-                              )
-                            )
-                          }
-                          className="w-40 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="flex gap-3">
-                          <button onClick={() => saveHotword(word)} className="text-slate-500 hover:text-slate-700">
-                            保存
-                          </button>
-                          <button onClick={() => removeHotword(word.id)} className="text-red-500 hover:text-red-700">
-                            删除
-                          </button>
-                        </div>
-                      </td>
+          <>
+            <Card title="热词管理" icon="🔥">
+              <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-700">
+                热词会在新建 FunASR WebSocket 连接时被拼装进首帧 `hotwords` JSON。这里只维护管理员热词表，主页面不再单独编辑热词。
+              </div>
+              <div className="overflow-x-auto rounded-lg border border-slate-200">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2 font-medium">热词</th>
+                      <th className="px-3 py-2 font-medium">权重</th>
+                      <th className="px-3 py-2 font-medium">状态</th>
+                      <th className="px-3 py-2 font-medium">备注</th>
+                      <th className="px-3 py-2 font-medium">操作</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="mt-3 flex gap-2">
-              <button onClick={createHotword} className={btnCls}>新增热词</button>
-            </div>
-          </Card>
+                  </thead>
+                  <tbody>
+                    {hotwords.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-8 text-center text-slate-400">
+                          暂无热词
+                        </td>
+                      </tr>
+                    ) : (
+                      hotwords.map((word) => (
+                        <tr key={word.id} className="border-t border-slate-100">
+                          <td className="px-3 py-2 font-medium text-slate-700">{word.term}</td>
+                          <td className="px-3 py-2 text-slate-600">{word.weight}</td>
+                          <td className="px-3 py-2">
+                            <span className={`rounded px-2 py-0.5 text-xs ${
+                              word.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"
+                            }`}>
+                              {word.status === "active" ? "启用中" : "已停用"}
+                            </span>
+                          </td>
+                          <td className="max-w-xs truncate px-3 py-2 text-slate-600">{word.note || "-"}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex gap-3">
+                              <button onClick={() => openEditHotword(word)} className="text-sky-600 hover:text-sky-800">
+                                编辑
+                              </button>
+                              <button onClick={() => removeHotword(word.id)} className="text-red-500 hover:text-red-700">
+                                删除
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-3">
+                <button onClick={openCreateHotword} className={btnCls}>新增热词</button>
+              </div>
+            </Card>
+
+            {hotwordModal && hotwordDraft && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+                <div
+                  className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-lg"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <h3 className="mb-4 text-base font-semibold text-slate-800">
+                    {hotwordModal.mode === "edit" ? "编辑热词" : "新增热词"}
+                  </h3>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">热词</label>
+                      <input
+                        value={hotwordDraft.term}
+                        onChange={(event) => setHotwordDraft((prev) => prev ? { ...prev, term: event.target.value } : prev)}
+                        className={inputCls}
+                        placeholder="例如：项目代号"
+                        autoFocus
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">权重</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={hotwordDraft.weight}
+                        onChange={(event) => setHotwordDraft((prev) => prev ? { ...prev, weight: event.target.value } : prev)}
+                        className={inputCls}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">状态</label>
+                      <select
+                        value={hotwordDraft.status}
+                        onChange={(event) => setHotwordDraft((prev) => prev ? { ...prev, status: event.target.value } : prev)}
+                        className={inputCls}
+                      >
+                        <option value="active">启用</option>
+                        <option value="disabled">停用</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">备注</label>
+                      <textarea
+                        value={hotwordDraft.note}
+                        onChange={(event) => setHotwordDraft((prev) => prev ? { ...prev, note: event.target.value } : prev)}
+                        className={`${inputCls} min-h-24 resize-y`}
+                        placeholder="可选"
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-5 flex justify-end gap-2">
+                    <button
+                      onClick={closeHotwordModal}
+                      disabled={savingHotword}
+                      className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      取消
+                    </button>
+                    <button onClick={submitHotwordModal} disabled={savingHotword} className={btnCls}>
+                      {savingHotword ? "保存中..." : hotwordModal.mode === "edit" ? "保存" : "创建"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {!loading && activeTab === "users" && (
@@ -1267,10 +1498,7 @@ export default function AdminPage() {
             </Card>
 
             {userModal && userDraft && (
-              <div
-                className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
-                onClick={closeUserModal}
-              >
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
                 <div
                   className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-lg"
                   onClick={(event) => event.stopPropagation()}
