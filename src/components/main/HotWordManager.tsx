@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 
 interface HotWord {
   id: string;
@@ -17,7 +17,7 @@ const STORAGE_KEY = "meeting-hotwords";
 export default function HotWordManager({ onChange }: Props) {
   const [words, setWords] = useState<HotWord[]>([]);
   const [newWord, setNewWord] = useState("");
-  const [newWeight, setNewWeight] = useState(4);
+  const newWeight = 4;
 
   useEffect(() => {
     try {

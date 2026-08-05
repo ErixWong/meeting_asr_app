@@ -25,6 +25,14 @@ import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
 
+function formatAsrCreatedAt(value?: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  const pad = (n: number) => n.toString().padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 type ActionNotice = {
   type: "success" | "error" | "info";
   message: string;
@@ -78,11 +86,14 @@ export default function MeetingPage() {
     setSummaryGenerating(value);
   }, []);
 
-  const requestJson = useCallback(async <T = any,>(input: RequestInfo | URL, init?: RequestInit) => {
+  const requestJson = useCallback(async <T = unknown,>(input: RequestInfo | URL, init?: RequestInit) => {
     const res = await fetch(input, init);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.error) {
-      throw new Error(data.error || `Request failed: ${res.status}`);
+    const data: unknown = await res.json().catch(() => ({}));
+    const error = typeof data === "object" && data !== null && "error" in data
+      ? String(data.error)
+      : `Request failed: ${res.status}`;
+    if (!res.ok || (typeof data === "object" && data !== null && "error" in data)) {
+      throw new Error(error);
     }
     return data as T;
   }, []);
@@ -541,7 +552,7 @@ export default function MeetingPage() {
     const allSegments: TranscriptSegment[] = [];
 
     try {
-      let uploadTimeSeconds = 0;
+      const uploadTimeSeconds = 0;
       await client.transcribeFile(
         file,
         (text, isFinal, speakerId) => {
@@ -946,32 +957,47 @@ export default function MeetingPage() {
                     </div>
                   </div>
                 </div>
-                <div className="min-h-0 min-w-0 flex-1 overflow-auto rounded-xl border border-slate-200 bg-white p-4">
+                <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
-                    <TranscriptView segments={selected.transcript} isHistory />
+                    <TranscriptView segments={selected.transcript} />
                   ) : viewTab === "asrRaw" ? (
-                    selectedAsrResult ? (
-                      <div className="min-w-0 space-y-4 text-sm">
-                        {asrResults.length > 0 && (
-                          <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                            <div>
-                              <div className="text-sm font-medium text-slate-700">ASR 结果版本</div>
-                              <div className="text-xs text-slate-400">仅用于查看识别结果，不影响会议纪要模板。</div>
-                            </div>
-                            <select
-                              value={selectedAsrResult?.id ?? ""}
-                              onChange={(e) => selected && loadAsrResultDetail(selected.id, e.target.value)}
-                              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-600"
-                            >
-                              {asrResults.map((result) => (
-                                <option key={result.id} value={result.id}>
-                                  {result.asrProvider} / {result.resultFormat}
-                                </option>
-                              ))}
-                            </select>
+                    asrResults.length === 0 ? (
+                      <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                        <p>暂无原始 ASR 结果</p>
+                      </div>
+                    ) : (
+                      <div className="flex min-h-0 flex-1 gap-4">
+                        <div className="flex w-72 shrink-0 flex-col">
+                          <div>
+                            <div className="text-sm font-semibold text-slate-700">ASR 识别记录</div>
+                            <div className="mt-0.5 text-xs text-slate-400">每次转写写入一条记录，点击查看详情。</div>
                           </div>
-                        )}
-                        <div className="grid min-w-0 gap-3 md:grid-cols-3">
+                          <div className="scroll-thin mt-2 min-h-0 flex-1 overflow-y-auto pr-1">
+                            {asrResults.map((result) => {
+                              const active = selectedAsrResult?.id === result.id;
+                              return (
+                                <button
+                                  key={result.id}
+                                  onClick={() => selected && loadAsrResultDetail(selected.id, result.id)}
+                                  className={`mb-1 w-full rounded-lg border-l-2 px-3 py-2 text-left transition ${
+                                    active ? "border-brand bg-brand/5" : "border-transparent hover:bg-slate-100"
+                                  }`}
+                                >
+                                  <div className="truncate text-sm font-medium text-slate-700">
+                                    {result.asrProvider} / {result.resultFormat}
+                                  </div>
+                                  <div className="mt-0.5 truncate text-xs text-slate-400">
+                                    {formatAsrCreatedAt(result.createdAt)} · {result.captureSessionId}
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        <div className="scroll-thin min-w-0 flex-1 overflow-y-auto pl-2">
+                          {selectedAsrResult ? (
+                            <div className="min-w-0 space-y-4 text-sm">
+                              <div className="grid min-w-0 gap-3 md:grid-cols-3">
                           <div className="min-w-0 rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <div className="text-xs text-slate-400">Provider</div>
                             <div className="mt-1 break-words font-medium text-slate-700">{selectedAsrResult.asrProvider}</div>
@@ -1005,10 +1031,13 @@ export default function MeetingPage() {
                             {rawAsrPayloadText}
                           </pre>
                         </div>
-                      </div>
-                    ) : (
-                      <div className="flex h-full flex-col items-center justify-center text-slate-400">
-                        <p>暂无原始 ASR 结果</p>
+                            </div>
+                          ) : (
+                            <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                              <p>选择左侧记录查看详情</p>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )
                   ) : (

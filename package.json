@@ -4,20 +4,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/check-dev-ports.mjs && concurrently --kill-others-on-fail \"node server/asr-gateway.mjs\" \"next dev --port 3123\"",
-    "asr-gateway": "node server/asr-gateway.mjs",
+    "dev": "node scripts/check-dev-ports.mjs && node server/app-server.mjs --dev",
     "probe:service": "node scripts/probe-service.mjs",
     "build": "next build",
-    "start": "next start --port 3123",
+    "start": "node server/app-server.mjs",
     "lint": "next lint"
   },
   "dependencies": {
-    "next": "^14.2.5",
+    "next": "^15.5.16",
     "node-fetch": "^3.3.2",
-    "nodemailer": "^9.0.3",
+    "nodemailer": "^9.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "ws": "^8.21.1",
+    "ws": "^8.21.2",
     "zustand": "^4.5.4"
   },
   "devDependencies": {
@@ -25,10 +24,15 @@
     "@types/nodemailer": "^8.0.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "autoprefixer": "^10.4.19",
-    "concurrently": "^9.2.0",
-    "postcss": "^8.4.40",
+    "autoprefixer": "^10.5.4",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^15.5.16",
+    "postcss": "^8.5.25",
     "tailwindcss": "^3.4.7",
     "typescript": "^5.5.4"
+  },
+  "overrides": {
+    "postcss": "$postcss",
+    "sharp": "0.35.3"
   }
 }

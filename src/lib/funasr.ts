@@ -117,7 +117,7 @@ export class FunASRClient {
 
       ws.onerror = () => {
         clearTimeout(timeout);
-        reject(new Error("无法连接到语音识别服务，请确认 ASR Gateway 已启动 (npm run asr-gateway)"));
+        reject(new Error("无法连接到语音识别服务，请确认应用服务已启动 (npm run dev)"));
       };
     });
 
@@ -142,7 +142,8 @@ export class FunASRClient {
   }
 
   private getWebSocketUrl(): string {
-    return `ws://127.0.0.1:8123`;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}/asr`;
   }
 
   async startRecording(options: FunASROptions, deviceId?: string): Promise<void> {

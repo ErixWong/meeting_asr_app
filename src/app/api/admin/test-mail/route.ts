@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { getSettingValue } from "@/lib/admin-store";
 
 export async function POST(req: NextRequest) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
@@ -8,7 +9,7 @@ export async function POST(req: NextRequest) {
       const host = String(body.smtpHost || "");
       const port = Number(body.smtpPort || 465);
       const user = String(body.smtpUsername || "");
-      const pass = String(body.smtpPassword || "");
+      const pass = String(body.smtpPassword || getSettingValue("mail", "smtp_password"));
 
       if (!host || !port) {
         return NextResponse.json({ ok: false, error: "Mail config incomplete" }, { status: 400 });

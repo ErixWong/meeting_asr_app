@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
         department: body.department ?? "",
         status: body.status ?? "active",
         roleKeys: body.roleKeys,
-        password: body.password,
+        initialPassword: body.initialPassword,
       });
 
       return NextResponse.json({ user });

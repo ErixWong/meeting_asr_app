@@ -1,8 +1,6 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { useAuthSession } from "@/lib/use-auth-session";
 
 type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit";
 
@@ -49,19 +47,6 @@ type UserItem = {
   roles: RoleItem[];
 };
 
-type UserModalState = { mode: "create" } | { mode: "edit"; user: UserItem };
-
-type UserDraft = {
-  id?: string;
-  accountName: string;
-  displayName: string;
-  email: string;
-  department: string;
-  status: string;
-  roleKeys: string[];
-  password: string;
-};
-
 type AuditLogItem = {
   id: string;
   actorAccountName: string;
@@ -91,10 +76,16 @@ type AsrDiagnostics = {
   steps: DiagnosticStep[];
 };
 
-class ApiRequestError extends Error {
-  data: any;
+type ApiResponse = Record<string, unknown>;
 
-  constructor(message: string, data: any) {
+function isApiResponse(value: unknown): value is ApiResponse {
+  return typeof value === "object" && value !== null;
+}
+
+class ApiRequestError extends Error {
+  data: ApiResponse;
+
+  constructor(message: string, data: ApiResponse) {
     super(message);
     this.name = "ApiRequestError";
     this.data = data;
@@ -170,7 +161,6 @@ export default function AdminPage() {
   const [activeTab, setActiveTab] = useState<AdminTab>("asr");
   const [loading, setLoading] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
-  const { user: currentUser, loading: authLoading } = useAuthSession(true);
 
   const [funasrProvider, setFunasrProvider] = useState("local_funasr");
   const [funasrUrl, setFunasrUrl] = useState("ws://funasr.local:10095/ws");
@@ -201,10 +191,9 @@ export default function AdminPage() {
   const [users, setUsers] = useState<UserItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
+  const [creatingUser, setCreatingUser] = useState(false);
+  const [resettingUserId, setResettingUserId] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ type: "success" | "error"; text: string } | null>(null);
-  const [userModal, setUserModal] = useState<UserModalState | null>(null);
-  const [userDraft, setUserDraft] = useState<UserDraft | null>(null);
-  const [savingUser, setSavingUser] = useState(false);
 
   const inputCls =
     "w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand";
@@ -354,20 +343,21 @@ export default function AdminPage() {
     ]
   );
 
-  const requestJson = async (input: RequestInfo | URL, init?: RequestInit) => {
+  const requestJson = async <T extends ApiResponse = ApiResponse>(input: RequestInfo | URL, init?: RequestInit) => {
     const res = await fetch(input, init);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.error) {
-      throw new ApiRequestError(data.error || `Request failed: ${res.status}`, data);
+    const parsed: unknown = await res.json().catch(() => ({}));
+    const data = isApiResponse(parsed) ? parsed : {};
+    const error = typeof data.error === "string" ? data.error : `Request failed: ${res.status}`;
+    if (!res.ok || typeof data.error === "string") {
+      throw new ApiRequestError(error, data);
     }
-    return data;
+    return data as T;
   };
 
   const showSuccess = (text: string) => setNotice({ type: "success", text });
   const showError = (text: string) => setNotice({ type: "error", text });
 
   useEffect(() => {
-    if (authLoading || !currentUser || !currentUser.roles.includes("system_admin")) return;
     const loadAdminData = async () => {
       try {
         const [settingsData, templatesData, hotwordsData, usersData, rolesData, auditLogsData] = await Promise.all([
@@ -420,7 +410,7 @@ export default function AdminPage() {
     };
 
     loadAdminData().catch(console.error);
-  }, [authLoading, currentUser]);
+  }, []);
 
   const saveSettings = async () => {
     setSavingSettings(true);
@@ -445,7 +435,7 @@ export default function AdminPage() {
   };
 
   const persistTemplate = async (template: PromptTemplateItem) => {
-    const data = await requestJson(`/api/admin/prompt-templates/${template.id}`, {
+    const data = await requestJson<{ template: PromptTemplateItem }>(`/api/admin/prompt-templates/${template.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -516,7 +506,7 @@ export default function AdminPage() {
 
   const createTemplate = async () => {
     try {
-      const data = await requestJson("/api/admin/prompt-templates", {
+      const data = await requestJson<{ template: PromptTemplateItem }>("/api/admin/prompt-templates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -536,7 +526,7 @@ export default function AdminPage() {
 
   const saveHotword = async (hotword: HotwordItem) => {
     try {
-      const data = await requestJson(`/api/admin/hotwords/${hotword.id}`, {
+      const data = await requestJson<{ hotword: HotwordItem }>(`/api/admin/hotwords/${hotword.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(hotword),
@@ -550,7 +540,7 @@ export default function AdminPage() {
 
   const createHotword = async () => {
     try {
-      const data = await requestJson("/api/admin/hotwords", {
+      const data = await requestJson<{ hotword: HotwordItem }>("/api/admin/hotwords", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ term: `新热词${Date.now()}`, weight: 10, status: "active", note: "" }),
@@ -574,113 +564,102 @@ export default function AdminPage() {
 
   const roleKeysOf = (user: UserItem) => user.roles.map((role) => role.roleKey);
 
-  const openCreateUser = () => {
-    setUserDraft({ accountName: "", displayName: "", email: "", department: "", status: "active", roleKeys: ["user"], password: "" });
-    setUserModal({ mode: "create" });
+  const createTemporaryPassword = () => {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    const bytes = new Uint8Array(12);
+    crypto.getRandomValues(bytes);
+    return `Temp-${Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("")}`;
   };
 
-  const openEditUser = (user: UserItem) => {
-    setUserDraft({
-      id: user.id,
-      accountName: user.accountName,
-      displayName: user.displayName,
-      email: user.email,
-      department: user.department,
-      status: user.status,
-      roleKeys: roleKeysOf(user),
-      password: "",
-    });
-    setUserModal({ mode: "edit", user });
-  };
-
-  const closeUserModal = () => {
-    setUserModal(null);
-    setUserDraft(null);
-  };
-
-  const toggleDraftRole = (roleKey: string) => {
-    setUserDraft((prev) => {
-      if (!prev) return prev;
-      const hasRole = prev.roleKeys.includes(roleKey);
-      return {
-        ...prev,
-        roleKeys: hasRole ? prev.roleKeys.filter((key) => key !== roleKey) : [...prev.roleKeys, roleKey],
-      };
-    });
-  };
-
-  const submitUserModal = async () => {
-    if (!userDraft || savingUser) return;
-    const password = userDraft.password.trim();
-    if (userModal?.mode === "create") {
-      if (!password) {
-        showError("请设置初始密码");
-        return;
-      }
-      if (password.length < 8) {
-        showError("密码至少 8 位");
-        return;
-      }
-    }
-    if (userModal?.mode === "edit" && password && password.length < 8) {
-      showError("密码至少 8 位");
-      return;
-    }
-    setSavingUser(true);
+  const saveUser = async (user: UserItem) => {
     try {
-      if (userModal?.mode === "edit" && userDraft.id) {
-        const data = await requestJson(`/api/admin/users/${userDraft.id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            accountName: userDraft.accountName,
-            displayName: userDraft.displayName,
-            email: userDraft.email,
-            department: userDraft.department,
-            status: userDraft.status,
-            roleKeys: userDraft.roleKeys,
-            password: password ? userDraft.password : undefined,
-          }),
-        });
-        setUsers((prev) => prev.map((item) => (item.id === userDraft.id ? data.user : item)));
-        showSuccess(password ? "用户已保存（密码已重置）" : "用户已保存");
-      } else {
-        if (!userDraft.accountName.trim()) {
-          showError("账号不能为空");
-          return;
-        }
-        const data = await requestJson("/api/admin/users", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            accountName: userDraft.accountName,
-            displayName: userDraft.displayName,
-            email: userDraft.email,
-            department: userDraft.department,
-            status: userDraft.status,
-            roleKeys: userDraft.roleKeys,
-            password: userDraft.password,
-          }),
-        });
-        setUsers((prev) => [...prev, data.user]);
-        showSuccess("用户已新增");
-      }
+      const data = await requestJson<{ user: UserItem }>(`/api/admin/users/${user.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountName: user.accountName,
+          displayName: user.displayName,
+          email: user.email,
+          department: user.department,
+          status: user.status,
+          roleKeys: roleKeysOf(user),
+        }),
+      });
+      setUsers((prev) => prev.map((item) => (item.id === user.id ? data.user : item)));
       await loadAuditLogs();
-      closeUserModal();
+      showSuccess("用户已保存");
     } catch (error) {
-      showError(
-        userModal?.mode === "edit" ? `保存用户失败: ${(error as Error).message}` : `新增用户失败: ${(error as Error).message}`
-      );
-    } finally {
-      setSavingUser(false);
+      showError(`保存用户失败: ${(error as Error).message}`);
     }
+  };
+
+  const createUser = async () => {
+    if (creatingUser) return;
+    setCreatingUser(true);
+    const initialPassword = createTemporaryPassword();
+    try {
+      const data = await requestJson<{ user: UserItem }>("/api/admin/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountName: `user_${Date.now()}`,
+          displayName: "新用户",
+          email: "",
+          department: "",
+          status: "active",
+          roleKeys: ["user"],
+          initialPassword,
+        }),
+      });
+      setUsers((prev) => [...prev, data.user]);
+      await loadAuditLogs();
+      showSuccess(`用户已新增，临时密码：${initialPassword}。首次登录后必须修改密码。`);
+    } catch (error) {
+      showError(`新增用户失败: ${(error as Error).message}`);
+    } finally {
+      setCreatingUser(false);
+    }
+  };
+
+  const resetUserPassword = async (user: UserItem) => {
+    if (resettingUserId) return;
+    setResettingUserId(user.id);
+    const nextPassword = createTemporaryPassword();
+    try {
+      await requestJson(`/api/admin/users/${user.id}/password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nextPassword }),
+      });
+      await loadAuditLogs();
+      showSuccess(`已重置 ${user.accountName} 的密码，临时密码：${nextPassword}。首次登录后必须修改密码。`);
+    } catch (error) {
+      showError(`重置密码失败: ${(error as Error).message}`);
+    } finally {
+      setResettingUserId(null);
+    }
+  };
+
+  const toggleUserRole = (userId: string, role: RoleItem) => {
+    setUsers((prev) =>
+      prev.map((user) => {
+        if (user.id !== userId) return user;
+        const hasRole = user.roles.some((item) => item.roleKey === role.roleKey);
+        return {
+          ...user,
+          roles: hasRole
+            ? user.roles.filter((item) => item.roleKey !== role.roleKey)
+            : [...user.roles, role],
+        };
+      })
+    );
   };
 
   const testFunasr = async () => {
     setFunasrStatus("idle");
     setFunasrDiagnostics(null);
     try {
-      const data = await requestJson("/api/admin/test-asr", {
+      const data = await requestJson<{ diagnostics?: AsrDiagnostics }>("/api/admin/test-asr", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -743,33 +722,6 @@ export default function AdminPage() {
     }
   };
 
-  if (authLoading) {
-    return (
-      <div className="flex flex-1 items-center justify-center bg-slate-50">
-        <div className="rounded-xl border border-slate-200 bg-white px-8 py-6 text-sm text-slate-500 shadow-sm">
-          正在加载...
-        </div>
-      </div>
-    );
-  }
-
-  if (!currentUser || !currentUser.roles.includes("system_admin")) {
-    return (
-      <div className="flex flex-1 items-center justify-center bg-slate-50">
-        <div className="rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
-          <div className="text-lg font-semibold text-slate-800">无权限访问</div>
-          <p className="mt-2 text-sm text-slate-500">当前账号不是系统管理员，无法访问管理后台。</p>
-          <Link
-            href="/"
-            className="mt-4 inline-block rounded-md bg-brand px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-dark"
-          >
-            返回主界面
-          </Link>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="flex-1 bg-slate-50">
       <div className="mx-auto max-w-6xl space-y-5 p-6">
@@ -809,7 +761,7 @@ export default function AdminPage() {
               </div>
               <div>
                 <label className="mb-1 block text-xs text-slate-500">ASR API Key</label>
-                <input value={funasrApiKey} onChange={(e) => setFunasrApiKey(e.target.value)} className={inputCls} />
+                <input type="password" value={funasrApiKey} onChange={(e) => setFunasrApiKey(e.target.value)} className={inputCls} placeholder="留空保持已保存值" />
               </div>
               <div>
                 <label className="mb-1 block text-xs text-slate-500">Workspace ID</label>
@@ -880,7 +832,7 @@ export default function AdminPage() {
             <label className="mb-1 block text-xs text-slate-500">端点地址</label>
             <input value={llmUrl} onChange={(e) => setLlmUrl(e.target.value)} className={inputCls} placeholder="http://host:port/v1" />
             <label className="mb-1 mt-3 block text-xs text-slate-500">API Key</label>
-            <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} className={inputCls} />
+            <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} className={inputCls} placeholder="留空保持已保存值" />
             <label className="mb-1 mt-3 block text-xs text-slate-500">模型名称</label>
             <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)} className={inputCls} />
             <label className="mb-1 mt-3 block text-xs text-slate-500">上下文大小（字符，留空不截断）</label>
@@ -920,7 +872,7 @@ export default function AdminPage() {
               </div>
               <div>
                 <label className="mb-1 block text-xs text-slate-500">SMTP Password</label>
-                <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className={inputCls} />
+                <input type="password" value={mailPassword} onChange={(e) => setMailPassword(e.target.value)} className={inputCls} placeholder="留空保持已保存值" />
               </div>
               <div>
                 <label className="mb-1 block text-xs text-slate-500">发件人名称</label>
@@ -1160,36 +1112,111 @@ export default function AdminPage() {
                 </thead>
                 <tbody>
                   {users.map((user) => (
-                    <tr key={user.id} className="border-t border-slate-100">
+                    <tr key={user.id} className="border-t border-slate-100 align-top">
                       <td className="px-3 py-2">
-                        <div className="font-medium text-slate-800">{user.accountName}</div>
-                        {user.id === "user-admin" && <div className="text-[11px] text-slate-400">bootstrap admin</div>}
+                        <input
+                          value={user.accountName}
+                          disabled={user.id === "user-admin"}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, accountName: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-32 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
+                        />
+                        {user.id === "user-admin" && (
+                          <div className="mt-1 text-[11px] text-slate-400">bootstrap admin</div>
+                        )}
                       </td>
-                      <td className="px-3 py-2 text-slate-600">{user.displayName || "-"}</td>
-                      <td className="px-3 py-2 text-slate-600">{user.email || "-"}</td>
-                      <td className="px-3 py-2 text-slate-600">{user.department || "-"}</td>
                       <td className="px-3 py-2">
-                        <span
-                          className={`rounded px-2 py-0.5 text-xs ${
-                            user.status === "active" ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-500"
-                          }`}
+                        <input
+                          value={user.displayName}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, displayName: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.email}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, email: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-44 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          value={user.department}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, department: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="w-28 rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand"
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <select
+                          value={user.status}
+                          disabled={user.id === "user-admin"}
+                          onChange={(e) =>
+                            setUsers((prev) =>
+                              prev.map((item) =>
+                                item.id === user.id ? { ...item, status: e.target.value } : item
+                              )
+                            )
+                          }
+                          className="rounded border border-slate-200 px-2 py-1 text-sm outline-none focus:border-brand disabled:bg-slate-100 disabled:text-slate-500"
                         >
-                          {user.status === "active" ? "启用" : "停用"}
-                        </span>
+                          <option value="active">active</option>
+                          <option value="disabled">disabled</option>
+                        </select>
                       </td>
                       <td className="px-3 py-2">
-                        <div className="flex flex-wrap gap-1">
-                          {user.roles.map((role) => (
-                            <span key={role.id} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-                              {role.roleName}
-                            </span>
-                          ))}
+                        <div className="flex flex-wrap gap-2">
+                          {roles.map((role) => {
+                            const checked = user.roles.some((item) => item.roleKey === role.roleKey);
+                            return (
+                              <label key={role.id} className="flex items-center gap-1 rounded bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  disabled={user.id === "user-admin" && role.roleKey === "system_admin"}
+                                  onChange={() => toggleUserRole(user.id, role)}
+                                />
+                                {role.roleName}
+                              </label>
+                            );
+                          })}
                         </div>
                       </td>
                       <td className="px-3 py-2">
-                        <button onClick={() => openEditUser(user)} className="text-sky-600 hover:text-sky-800">
-                          编辑
-                        </button>
+                        <div className="flex flex-col items-start gap-2">
+                          <button onClick={() => saveUser(user)} className="text-slate-500 hover:text-slate-700">
+                            保存
+                          </button>
+                          <button
+                            onClick={() => resetUserPassword(user)}
+                            disabled={resettingUserId !== null || user.id === "user-admin" && user.status !== "active"}
+                            className="text-amber-700 hover:text-amber-900 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {resettingUserId === user.id ? "重置中..." : "重置密码"}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -1197,127 +1224,11 @@ export default function AdminPage() {
               </table>
             </div>
             <div className="mt-3">
-              <button onClick={openCreateUser} className={btnCls}>新增用户</button>
+              <button onClick={createUser} disabled={creatingUser} className={btnCls}>
+                {creatingUser ? "创建中..." : "新增用户"}
+              </button>
             </div>
           </Card>
-        )}
-
-        {userModal && userDraft && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
-            <div
-              className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-lg"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <h3 className="mb-4 text-base font-semibold text-slate-800">
-                {userModal.mode === "edit" ? "编辑用户" : "新增用户"}
-              </h3>
-              <div className="space-y-3">
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">账号</label>
-                  <input
-                    value={userDraft.accountName}
-                    disabled={userModal.mode === "edit" && userModal.user.id === "user-admin"}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, accountName: e.target.value } : prev))}
-                    className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
-                    placeholder="登录账号"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">姓名</label>
-                  <input
-                    value={userDraft.displayName}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, displayName: e.target.value } : prev))}
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">邮箱</label>
-                  <input
-                    value={userDraft.email}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, email: e.target.value } : prev))}
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">部门</label>
-                  <input
-                    value={userDraft.department}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, department: e.target.value } : prev))}
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">
-                    密码{userModal.mode === "create" ? "（初始密码，至少 8 位，首登需修改）" : "（留空则不修改；重置后需在下次登录时修改）"}
-                  </label>
-                  <input
-                    type="password"
-                    value={userDraft.password}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, password: e.target.value } : prev))}
-                    className={inputCls}
-                    placeholder={userModal.mode === "create" ? "至少 8 位" : "留空则不修改"}
-                    autoComplete="new-password"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">状态</label>
-                  <select
-                    value={userDraft.status}
-                    disabled={userModal.mode === "edit" && userModal.user.id === "user-admin"}
-                    onChange={(e) => setUserDraft((prev) => (prev ? { ...prev, status: e.target.value } : prev))}
-                    className={`${inputCls} disabled:bg-slate-100 disabled:text-slate-500`}
-                  >
-                    <option value="active">启用</option>
-                    <option value="disabled">停用</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs text-slate-500">角色</label>
-                  <div className="flex flex-wrap gap-2">
-                    {roles.map((role) => {
-                      const checked = userDraft.roleKeys.includes(role.roleKey);
-                      const isProtected =
-                        userModal.mode === "edit" &&
-                        userModal.user.id === "user-admin" &&
-                        role.roleKey === "system_admin";
-                      return (
-                        <label
-                          key={role.id}
-                          className="flex items-center gap-1 rounded bg-slate-50 px-2 py-1 text-xs text-slate-600"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            disabled={isProtected}
-                            onChange={() => toggleDraftRole(role.roleKey)}
-                          />
-                          {role.roleName}
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  onClick={closeUserModal}
-                  disabled={savingUser}
-                  className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  取消
-                </button>
-                <button onClick={submitUserModal} disabled={savingUser} className={btnCls}>
-                  {savingUser
-                    ? userModal.mode === "edit"
-                      ? "保存中..."
-                      : "创建中..."
-                    : userModal.mode === "edit"
-                      ? "保存"
-                      : "创建"}
-                </button>
-              </div>
-            </div>
-          </div>
         )}
 
         {!loading && activeTab === "audit" && (

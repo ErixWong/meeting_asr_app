@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+﻿import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -6,6 +6,8 @@ import { StringDecoder } from "node:string_decoder";
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { initializeDatabase } from "../../server/database-schema.mjs";
+import type { TranscriptSegment } from "@/types";
 import {
   escapeHtml,
   newId,
@@ -21,6 +23,7 @@ type SettingRow = {
   itemTitle: string;
   itemDescription: string;
   itemValue: string;
+  updatedAt?: string;
 };
 
 type PromptTemplateRow = {
@@ -32,6 +35,8 @@ type PromptTemplateRow = {
   description: string;
   status: string;
   isSystem: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type HotwordRow = {
@@ -40,6 +45,8 @@ type HotwordRow = {
   weight: number;
   status: string;
   note: string;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type UserRow = {
@@ -49,12 +56,62 @@ type UserRow = {
   email: string;
   department: string;
   status: string;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type RoleRow = {
   id: string;
   roleKey: string;
   roleName: string;
+  createdAt?: string;
+};
+
+type UserWithRoles = UserRow & { roles: RoleRow[] };
+
+type JsonRecord = Record<string, unknown>;
+
+type MeetingRow = {
+  id: string;
+  title: string;
+  status: string;
+  lastErrorMessage: string | null;
+  sourceType: string;
+  durationSeconds: number | null;
+  createdAt: string;
+  summary: string | null;
+};
+
+type MeetingAsrRow = {
+  id: string;
+  meetingId: string;
+  asrProvider: string;
+  asrSettingMark: string;
+  captureSessionId: string | null;
+  resultFormat: string;
+  rawPayload: string | null;
+  normalizedText: string | null;
+  asrConfigSnapshot: string | null;
+  createdAt: string;
+};
+
+type MeetingAsrSummaryRow = Omit<MeetingAsrRow, "rawPayload" | "normalizedText" | "asrConfigSnapshot"> & {
+  rawPayloadBytes: number;
+  normalizedTextLength: number;
+};
+
+type AuditLogRow = {
+  id: string;
+  actorUserId: string | null;
+  actorAccountName: string | null;
+  actorDisplayName: string | null;
+  actionType: string;
+  resourceType: string;
+  resourceId: string;
+  resourceName: string | null;
+  result: string;
+  errorMessage: string | null;
+  createdAt: string;
 };
 
 type MeetingInput = {
@@ -76,7 +133,8 @@ type MeetingInput = {
 
 type MeetingLlmResultRow = {
   id: string;
-  meetingAsrResultId: string;
+  meetingId: string;
+  inputTranscriptSnapshot: string;
   llmSettingMark: string;
   promptTemplateId: string;
   generationConfigSnapshot: string;
@@ -89,6 +147,7 @@ type MeetingLlmResultRow = {
   rawResponse: string;
   resultMarkdown: string;
   errorMessage: string | null;
+  createdAt?: string;
 };
 
 type MeetingSendRecordRow = {
@@ -96,8 +155,8 @@ type MeetingSendRecordRow = {
   meetingLlmResultId: string;
   mailTemplateType: string;
   subject: string;
-  toRecipientsJson: string;
-  ccRecipientsJson: string;
+  toRecipientsJson: string | null;
+  ccRecipientsJson: string | null;
   bodyMarkdown: string;
   bodyHtml: string;
   status: string;
@@ -107,6 +166,8 @@ type MeetingSendRecordRow = {
   providerMessageId: string | null;
   errorMessage: string | null;
   sentByUserId: string;
+  createdAt?: string;
+  sentAt?: string | null;
 };
 
 type AsrCaptureSessionRow = {
@@ -115,8 +176,12 @@ type AsrCaptureSessionRow = {
   asrProvider: string;
   asrConfigSnapshot: string;
   hotwordsJson: string;
-  rawEventsJson: string;
   status: string;
+};
+
+type AsrCaptureEventRow = {
+  eventJson: string;
+  receivedAt: string;
 };
 
 type ActorContext = {
@@ -132,14 +197,237 @@ type PasswordVerificationResult = {
   needsRehash: boolean;
 };
 
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null;
+}
+
 const PASSWORD_SCHEME = "scrypt-v1";
 const SESSION_TTL_DAYS = 7;
+const SECRET_SETTING_KEYS = new Set([
+  "asr:api_key",
+  "llm:api_key",
+  "mail:smtp_password",
+]);
+
+type SettingDefinition = {
+  itemTitle: string;
+  itemDescription: string;
+  validate: (value: string) => string;
+};
+
+function validateSettingValue(value: string, label: string, maxLength: number, required = true) {
+  if (value.length > maxLength) {
+    throw new Error(`${label} must be at most ${maxLength} characters`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`${label} contains invalid control characters`);
+  }
+  if (required && !value.trim()) {
+    throw new Error(`${label} is required`);
+  }
+  return value;
+}
+
+function textSetting(label: string, maxLength: number, required = true) {
+  return (value: string) => validateSettingValue(value, label, maxLength, required).trim();
+}
+
+function secretSetting(label: string, maxLength: number) {
+  return (value: string) => validateSettingValue(value, label, maxLength, false);
+}
+
+function urlSetting(label: string, protocols: string[]) {
+  return (value: string) => {
+    const normalized = textSetting(label, 2048)(value);
+    let parsed: URL;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      throw new Error(`${label} must be a valid URL`);
+    }
+    if (!protocols.includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error(`${label} must use an allowed protocol without embedded credentials`);
+    }
+    return normalized;
+  };
+}
+
+function integerSetting(label: string, min: number, max: number, required = false) {
+  return (value: string) => {
+    const normalized = validateSettingValue(value, label, 32, required).trim();
+    if (!normalized) return "";
+    if (!/^\d+$/.test(normalized)) {
+      throw new Error(`${label} must be an integer`);
+    }
+    const number = Number(normalized);
+    if (!Number.isSafeInteger(number) || number < min || number > max) {
+      throw new Error(`${label} must be between ${min} and ${max}`);
+    }
+    return String(number);
+  };
+}
+
+function emailSetting(label: string) {
+  return (value: string) => {
+    const normalized = textSetting(label, 320)(value);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+      throw new Error(`${label} must be a valid email address`);
+    }
+    return normalized;
+  };
+}
+
+const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
+  "asr:provider": {
+    itemTitle: "ASR Provider",
+    itemDescription: "当前 ASR 提供方",
+    validate: (value) => {
+      const normalized = textSetting("ASR provider", 32)(value);
+      if (!(["local_funasr", "dashscope"] as string[]).includes(normalized)) {
+        throw new Error("ASR provider is invalid");
+      }
+      return normalized;
+    },
+  },
+  "asr:endpoint": {
+    itemTitle: "FunASR Endpoint",
+    itemDescription: "FunASR 服务地址",
+    validate: urlSetting("ASR endpoint", ["ws:", "wss:"]),
+  },
+  "asr:api_key": {
+    itemTitle: "ASR API Key",
+    itemDescription: "DashScope API Key",
+    validate: secretSetting("ASR API key", 2048),
+  },
+  "asr:workspace_id": {
+    itemTitle: "ASR Workspace ID",
+    itemDescription: "DashScope Workspace ID",
+    validate: textSetting("ASR workspace ID", 256, false),
+  },
+  "llm:base_url": {
+    itemTitle: "LLM URL",
+    itemDescription: "OpenAI 兼容服务根地址",
+    validate: urlSetting("LLM base URL", ["http:", "https:"]),
+  },
+  "llm:api_key": {
+    itemTitle: "LLM API Key",
+    itemDescription: "LLM API Key",
+    validate: secretSetting("LLM API key", 2048),
+  },
+  "llm:model": {
+    itemTitle: "LLM Model",
+    itemDescription: "当前使用模型",
+    validate: textSetting("LLM model", 256),
+  },
+  "llm:context_size": {
+    itemTitle: "上下文大小（字符）",
+    itemDescription: "发送给 LLM 的文本截断长度，留空不截断",
+    validate: integerSetting("LLM context size", 1, 1_000_000),
+  },
+  "llm:max_tokens": {
+    itemTitle: "最大回复 Tokens",
+    itemDescription: "留空则由 LLM 自行决定回复长度",
+    validate: integerSetting("LLM max tokens", 1, 100_000),
+  },
+  "llm:timeout_ms": {
+    itemTitle: "调用超时（毫秒）",
+    itemDescription: "留空使用默认 180000",
+    validate: integerSetting("LLM timeout", 1_000, 600_000),
+  },
+  "mail:smtp_host": {
+    itemTitle: "SMTP Host",
+    itemDescription: "邮件服务主机",
+    validate: textSetting("SMTP host", 255),
+  },
+  "mail:smtp_port": {
+    itemTitle: "SMTP Port",
+    itemDescription: "邮件服务端口",
+    validate: integerSetting("SMTP port", 1, 65_535, true),
+  },
+  "mail:smtp_username": {
+    itemTitle: "SMTP Username",
+    itemDescription: "邮件服务用户名",
+    validate: textSetting("SMTP username", 320),
+  },
+  "mail:smtp_password": {
+    itemTitle: "SMTP Password",
+    itemDescription: "邮件服务密码",
+    validate: secretSetting("SMTP password", 2048),
+  },
+  "mail:from_name": {
+    itemTitle: "From Name",
+    itemDescription: "发件人名称",
+    validate: textSetting("From name", 256),
+  },
+  "mail:from_email": {
+    itemTitle: "From Email",
+    itemDescription: "发件人邮箱",
+    validate: emailSetting("From email"),
+  },
+  "mail:default_subject_template": {
+    itemTitle: "Default Subject",
+    itemDescription: "默认邮件主题模板",
+    validate: textSetting("Default subject template", 512),
+  },
+  "mail:default_signature": {
+    itemTitle: "Default Signature",
+    itemDescription: "默认邮件签名",
+    validate: textSetting("Default signature", 2_000),
+  },
+  "mail:default_cc": {
+    itemTitle: "Default CC",
+    itemDescription: "默认抄送",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Default CC", 16_384, true);
+      let recipients: unknown;
+      try {
+        recipients = JSON.parse(normalized);
+      } catch {
+        throw new Error("Default CC must be valid JSON");
+      }
+      if (!Array.isArray(recipients) || recipients.length > 100 || recipients.some((item) => typeof item !== "string")) {
+        throw new Error("Default CC must be an array of at most 100 email addresses");
+      }
+      recipients.forEach((item) => emailSetting("Default CC address")(item));
+      return JSON.stringify(recipients.map((item) => item.trim()));
+    },
+  },
+  "system:default_prompt_template_id": {
+    itemTitle: "默认纪要模板",
+    itemDescription: "自动生成首版结果时使用",
+    validate: textSetting("Default prompt template", 128),
+  },
+};
 
 const dataDir = join(process.cwd(), "data");
 const dbPath = join(dataDir, "meeting-asr-app.db");
 
 let db: DatabaseSync | null = null;
 const actorContext = new AsyncLocalStorage<ActorContext>();
+let transactionDepth = 0;
+
+function withTransaction<T>(callback: () => T): T {
+  const database = getDb();
+  if (transactionDepth > 0) return callback();
+
+  database.exec("BEGIN IMMEDIATE");
+  transactionDepth = 1;
+
+  try {
+    const result = callback();
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the original database error if rollback itself fails.
+    }
+    throw error;
+  } finally {
+    transactionDepth = 0;
+  }
+}
 
 function getDb() {
   if (db) return db;
@@ -149,176 +437,7 @@ function getDb() {
   }
 
   db = new DatabaseSync(dbPath);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS app_settings (
-      item_section TEXT NOT NULL,
-      item_mark TEXT NOT NULL,
-      item_title TEXT NOT NULL,
-      item_description TEXT NOT NULL DEFAULT '',
-      item_value TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (item_section, item_mark)
-    );
-
-    CREATE TABLE IF NOT EXISTS llm_prompt_templates (
-      id TEXT PRIMARY KEY,
-      template_key TEXT NOT NULL UNIQUE,
-      template_name TEXT NOT NULL,
-      template_type TEXT NOT NULL,
-      content TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL,
-      is_system INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS asr_hotwords (
-      id TEXT PRIMARY KEY,
-      term TEXT NOT NULL UNIQUE,
-      weight INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      note TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS meetings (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      source_file_name TEXT,
-      duration_seconds INTEGER,
-      status TEXT NOT NULL,
-      status_updated_at TEXT NOT NULL,
-      last_error_message TEXT,
-      created_by_user_id TEXT NOT NULL,
-      created_by_user_name TEXT NOT NULL,
-      created_by_user_email TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS meeting_asr_results (
-      id TEXT PRIMARY KEY,
-      meeting_id TEXT NOT NULL,
-      asr_provider TEXT NOT NULL,
-      asr_setting_mark TEXT NOT NULL,
-      asr_config_snapshot TEXT NOT NULL,
-      capture_session_id TEXT NOT NULL,
-      result_format TEXT NOT NULL,
-      raw_payload TEXT NOT NULL,
-      normalized_text TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS meeting_llm_results (
-      id TEXT PRIMARY KEY,
-      meeting_asr_result_id TEXT NOT NULL,
-      llm_setting_mark TEXT NOT NULL,
-      prompt_template_id TEXT NOT NULL,
-      generation_config_snapshot TEXT NOT NULL,
-      generation_mode TEXT NOT NULL,
-      status TEXT NOT NULL,
-      version_no INTEGER NOT NULL,
-      result_type TEXT NOT NULL,
-      result_title TEXT NOT NULL,
-      raw_prompt TEXT NOT NULL,
-      raw_response TEXT NOT NULL,
-      result_markdown TEXT NOT NULL,
-      error_message TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS meeting_send_records (
-      id TEXT PRIMARY KEY,
-      meeting_llm_result_id TEXT NOT NULL,
-      mail_template_type TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      to_recipients_json TEXT NOT NULL,
-      cc_recipients_json TEXT NOT NULL,
-      body_markdown TEXT NOT NULL,
-      body_html TEXT NOT NULL,
-      status TEXT NOT NULL,
-      mail_setting_mark TEXT NOT NULL,
-      mail_config_snapshot TEXT NOT NULL,
-      provider_type TEXT NOT NULL,
-      provider_message_id TEXT,
-      error_message TEXT,
-      sent_by_user_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      sent_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS asr_capture_sessions (
-      capture_session_id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL,
-      asr_provider TEXT NOT NULL,
-      asr_config_snapshot TEXT NOT NULL,
-      hotwords_json TEXT NOT NULL,
-      raw_events_json TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      account_name TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      email TEXT,
-      department TEXT,
-      external_user_id TEXT,
-      password_hash TEXT,
-      must_change_password INTEGER NOT NULL DEFAULT 0,
-      last_login_at TEXT,
-      status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS roles (
-      id TEXT PRIMARY KEY,
-      role_key TEXT NOT NULL UNIQUE,
-      role_name TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS user_roles (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      role_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      UNIQUE(user_id, role_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id TEXT PRIMARY KEY,
-      actor_user_id TEXT NOT NULL,
-      actor_account_name TEXT NOT NULL,
-      actor_display_name TEXT NOT NULL,
-      action_type TEXT NOT NULL,
-      resource_type TEXT NOT NULL,
-      resource_id TEXT NOT NULL,
-      resource_name TEXT,
-      request_id TEXT,
-      result TEXT NOT NULL,
-      error_message TEXT,
-      before_snapshot TEXT,
-      after_snapshot TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS auth_sessions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      last_seen_at TEXT NOT NULL
-    );
-  `);
+  initializeDatabase(db);
 
   migrateAuthSchema(db);
   seedDefaults(db);
@@ -637,6 +756,10 @@ function upsertHotword(hotword: HotwordRow) {
     );
 }
 
+function isSecretSetting(setting: Pick<SettingRow, "itemSection" | "itemMark">) {
+  return SECRET_SETTING_KEYS.has(`${setting.itemSection}:${setting.itemMark}`);
+}
+
 export function listSettings() {
   const database = getDb();
   return database
@@ -651,23 +774,97 @@ export function listSettings() {
       FROM app_settings
       ORDER BY item_section, item_mark
     `)
-    .all();
+    .all<SettingRow>();
 }
 
-export function saveSettings(settings: SettingRow[]) {
-  for (const setting of settings) {
-    upsertSetting(setting);
+export function listSettingsForAdmin() {
+  return (listSettings() as Array<SettingRow & { updatedAt?: string }>).map((setting) => ({
+    ...setting,
+    itemValue: isSecretSetting(setting) ? "" : setting.itemValue,
+    isSecret: isSecretSetting(setting),
+    hasValue: isSecretSetting(setting) ? Boolean(setting.itemValue) : undefined,
+  }));
+}
+
+export function getSettingValue(section: string, mark: string) {
+  const row = (listSettings() as Array<SettingRow>)
+    .find((setting) => setting.itemSection === section && setting.itemMark === mark);
+  return row?.itemValue ?? "";
+}
+
+function validateSettings(settings: unknown): SettingRow[] {
+  if (!Array.isArray(settings)) {
+    throw new Error("settings must be an array");
   }
-  writeAuditLog({
-    actionType: "settings.update",
-    resourceType: "settings",
-    resourceId: "app_settings",
-    afterSnapshot: settings.map((setting) => ({
-      ...setting,
-      itemValue: setting.itemMark.includes("key") || setting.itemMark.includes("password")
-        ? "***"
-        : setting.itemValue,
-    })),
+  if (settings.length > Object.keys(SETTING_DEFINITIONS).length) {
+    throw new Error("Too many settings entries");
+  }
+
+  const seen = new Set<string>();
+  let totalValueLength = 0;
+  return settings.map((candidate, index) => {
+    if (!candidate || typeof candidate !== "object") {
+      throw new Error(`settings[${index}] must be an object`);
+    }
+    const item = candidate as Record<string, unknown>;
+    if (typeof item.itemSection !== "string" || typeof item.itemMark !== "string") {
+      throw new Error(`settings[${index}] must include itemSection and itemMark`);
+    }
+    const key = `${item.itemSection}:${item.itemMark}`;
+    const definition = SETTING_DEFINITIONS[key];
+    if (!definition) {
+      throw new Error(`Unknown setting: ${key}`);
+    }
+    if (seen.has(key)) {
+      throw new Error(`Duplicate setting: ${key}`);
+    }
+    if (typeof item.itemValue !== "string") {
+      throw new Error(`Setting ${key} value must be a string`);
+    }
+
+    const itemValue = definition.validate(item.itemValue);
+    totalValueLength += itemValue.length;
+    if (totalValueLength > 32_768) {
+      throw new Error("Settings payload is too large");
+    }
+    seen.add(key);
+    return {
+      itemSection: item.itemSection,
+      itemMark: item.itemMark,
+      itemTitle: definition.itemTitle,
+      itemDescription: definition.itemDescription,
+      itemValue,
+    };
+  });
+}
+
+export function saveSettings(settings: unknown) {
+  const validatedSettings = validateSettings(settings);
+  return withTransaction(() => {
+    const existingSettings = new Map(
+      (listSettings() as SettingRow[]).map((setting) => [
+        `${setting.itemSection}:${setting.itemMark}`,
+        setting,
+      ])
+    );
+    for (const setting of validatedSettings) {
+      const existing = existingSettings.get(`${setting.itemSection}:${setting.itemMark}`);
+      const nextSetting = isSecretSetting(setting) && setting.itemValue === "" && existing?.itemValue
+        ? { ...setting, itemValue: existing.itemValue }
+        : setting;
+      upsertSetting(nextSetting);
+    }
+    writeAuditLog({
+      actionType: "settings.update",
+      resourceType: "settings",
+      resourceId: "app_settings",
+      afterSnapshot: validatedSettings.map((setting) => ({
+        ...setting,
+        itemValue: isSecretSetting(setting)
+          ? "***"
+          : setting.itemValue,
+      })),
+    });
   });
 }
 
@@ -689,59 +886,63 @@ export function listPromptTemplates() {
       FROM llm_prompt_templates
       ORDER BY created_at ASC
     `)
-    .all()
-    .map((row: any) => ({ ...row, isSystem: Boolean(row.isSystem) }));
+    .all<PromptTemplateRow>()
+    .map((row) => ({ ...row, isSystem: Boolean(row.isSystem) }));
 }
 
 export function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSystem"> & { isSystem?: boolean }) {
-  const template: PromptTemplateRow = {
-    id: newId("tpl"),
-    isSystem: input.isSystem ?? false,
-    templateKey: requireNonEmpty(input.templateKey, "Template key"),
-    templateName: requireNonEmpty(input.templateName, "Template name"),
-    templateType: requireNonEmpty(input.templateType, "Template type"),
-    content: requireNonEmpty(input.content, "Template content"),
-    description: input.description ?? "",
-    status: normalizeStatus(input.status),
-  };
-  upsertPromptTemplate(template);
-  const created = listPromptTemplates().find((item: any) => item.id === template.id);
-  writeAuditLog({
-    actionType: "prompt_template.create",
-    resourceType: "prompt_template",
-    resourceId: template.id,
-    resourceName: template.templateName,
-    afterSnapshot: created,
+  return withTransaction(() => {
+    const template: PromptTemplateRow = {
+      id: newId("tpl"),
+      isSystem: input.isSystem ?? false,
+      templateKey: requireNonEmpty(input.templateKey, "Template key"),
+      templateName: requireNonEmpty(input.templateName, "Template name"),
+      templateType: requireNonEmpty(input.templateType, "Template type"),
+      content: requireNonEmpty(input.content, "Template content"),
+      description: input.description ?? "",
+      status: normalizeStatus(input.status),
+    };
+    upsertPromptTemplate(template);
+    const created = listPromptTemplates().find((item) => item.id === template.id);
+    writeAuditLog({
+      actionType: "prompt_template.create",
+      resourceType: "prompt_template",
+      resourceId: template.id,
+      resourceName: template.templateName,
+      afterSnapshot: created,
+    });
+    return created;
   });
-  return created;
 }
 
 export function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTemplateRow, "id">>) {
-  const existing = listPromptTemplates().find((item: any) => item.id === id);
-  if (!existing) return null;
+  return withTransaction(() => {
+    const existing = listPromptTemplates().find((item) => item.id === id);
+    if (!existing) return null;
 
-  const next: PromptTemplateRow = {
-    id,
-    templateKey: patch.templateKey === undefined ? existing.templateKey : requireNonEmpty(patch.templateKey, "Template key"),
-    templateName: patch.templateName === undefined ? existing.templateName : requireNonEmpty(patch.templateName, "Template name"),
-    templateType: patch.templateType === undefined ? existing.templateType : requireNonEmpty(patch.templateType, "Template type"),
-    content: patch.content === undefined ? existing.content : requireNonEmpty(patch.content, "Template content"),
-    description: patch.description ?? existing.description,
-    status: patch.status === undefined ? existing.status : normalizeStatus(patch.status, existing.status),
-    isSystem: patch.isSystem ?? existing.isSystem,
-  };
+    const next: PromptTemplateRow = {
+      id,
+      templateKey: patch.templateKey === undefined ? existing.templateKey : requireNonEmpty(patch.templateKey, "Template key"),
+      templateName: patch.templateName === undefined ? existing.templateName : requireNonEmpty(patch.templateName, "Template name"),
+      templateType: patch.templateType === undefined ? existing.templateType : requireNonEmpty(patch.templateType, "Template type"),
+      content: patch.content === undefined ? existing.content : requireNonEmpty(patch.content, "Template content"),
+      description: patch.description ?? existing.description,
+      status: patch.status === undefined ? existing.status : normalizeStatus(patch.status, existing.status),
+      isSystem: patch.isSystem ?? existing.isSystem,
+    };
 
-  upsertPromptTemplate(next);
-  const updated = listPromptTemplates().find((item: any) => item.id === id);
-  writeAuditLog({
-    actionType: "prompt_template.update",
-    resourceType: "prompt_template",
-    resourceId: id,
-    resourceName: updated?.templateName ?? existing.templateName,
-    beforeSnapshot: existing,
-    afterSnapshot: updated,
+    upsertPromptTemplate(next);
+    const updated = listPromptTemplates().find((item) => item.id === id);
+    writeAuditLog({
+      actionType: "prompt_template.update",
+      resourceType: "prompt_template",
+      resourceId: id,
+      resourceName: updated?.templateName ?? existing.templateName,
+      beforeSnapshot: existing,
+      afterSnapshot: updated,
+    });
+    return updated;
   });
-  return updated;
 }
 
 export function listHotwords() {
@@ -759,72 +960,78 @@ export function listHotwords() {
       FROM asr_hotwords
       ORDER BY created_at ASC
     `)
-    .all();
+    .all<HotwordRow>();
 }
 
 export function createHotword(input: Omit<HotwordRow, "id">) {
-  const hotword: HotwordRow = {
-    id: newId("hw"),
-    term: requireNonEmpty(input.term, "Hotword term"),
-    weight: Number.isFinite(Number(input.weight)) ? Number(input.weight) : 10,
-    status: normalizeStatus(input.status),
-    note: input.note ?? "",
-  };
-  upsertHotword(hotword);
-  const created = listHotwords().find((item: any) => item.id === hotword.id);
-  writeAuditLog({
-    actionType: "hotword.create",
-    resourceType: "hotword",
-    resourceId: hotword.id,
-    resourceName: hotword.term,
-    afterSnapshot: created,
+  return withTransaction(() => {
+    const hotword: HotwordRow = {
+      id: newId("hw"),
+      term: requireNonEmpty(input.term, "Hotword term"),
+      weight: Number.isFinite(Number(input.weight)) ? Number(input.weight) : 10,
+      status: normalizeStatus(input.status),
+      note: input.note ?? "",
+    };
+    upsertHotword(hotword);
+    const created = listHotwords().find((item) => item.id === hotword.id);
+    writeAuditLog({
+      actionType: "hotword.create",
+      resourceType: "hotword",
+      resourceId: hotword.id,
+      resourceName: hotword.term,
+      afterSnapshot: created,
+    });
+    return created;
   });
-  return created;
 }
 
 export function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>) {
-  const existing = listHotwords().find((item: any) => item.id === id);
-  if (!existing) return null;
+  return withTransaction(() => {
+    const existing = listHotwords().find((item) => item.id === id);
+    if (!existing) return null;
 
-  const next: HotwordRow = {
-    id,
-    term: patch.term === undefined ? existing.term : requireNonEmpty(patch.term, "Hotword term"),
-    weight: patch.weight === undefined || !Number.isFinite(Number(patch.weight)) ? existing.weight : Number(patch.weight),
-    status: patch.status === undefined ? existing.status : normalizeStatus(patch.status, existing.status),
-    note: patch.note ?? existing.note,
-  };
+    const next: HotwordRow = {
+      id,
+      term: patch.term === undefined ? existing.term : requireNonEmpty(patch.term, "Hotword term"),
+      weight: patch.weight === undefined || !Number.isFinite(Number(patch.weight)) ? existing.weight : Number(patch.weight),
+      status: patch.status === undefined ? existing.status : normalizeStatus(patch.status, existing.status),
+      note: patch.note ?? existing.note,
+    };
 
-  upsertHotword(next);
-  const updated = listHotwords().find((item: any) => item.id === id);
-  writeAuditLog({
-    actionType: "hotword.update",
-    resourceType: "hotword",
-    resourceId: id,
-    resourceName: updated?.term ?? existing.term,
-    beforeSnapshot: existing,
-    afterSnapshot: updated,
+    upsertHotword(next);
+    const updated = listHotwords().find((item) => item.id === id);
+    writeAuditLog({
+      actionType: "hotword.update",
+      resourceType: "hotword",
+      resourceId: id,
+      resourceName: updated?.term ?? existing.term,
+      beforeSnapshot: existing,
+      afterSnapshot: updated,
+    });
+    return updated;
   });
-  return updated;
 }
 export function deleteHotword(id: string) {
-  const existing = listHotwords().find((item: any) => item.id === id);
-  const result = getDb().prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
-  const deleted = Number(result.changes ?? 0) > 0;
-  if (!deleted) return false;
+  return withTransaction(() => {
+    const existing = listHotwords().find((item) => item.id === id);
+    const result = getDb().prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
+    const deleted = Number(result.changes ?? 0) > 0;
+    if (!deleted) return false;
 
-  writeAuditLog({
-    actionType: "hotword.delete",
-    resourceType: "hotword",
-    resourceId: id,
-    resourceName: existing?.term ?? id,
-    beforeSnapshot: existing,
+    writeAuditLog({
+      actionType: "hotword.delete",
+      resourceType: "hotword",
+      resourceId: id,
+      resourceName: existing?.term ?? id,
+      beforeSnapshot: existing,
+    });
+    return true;
   });
-  return true;
 }
 
 export function listRoles() {
   return getDb()
-    .prepare(`
+    .prepare<RoleRow>(`
       SELECT
         id,
         role_key as roleKey,
@@ -838,7 +1045,7 @@ export function listRoles() {
 
 export function listUsers() {
   const users = getDb()
-    .prepare(`
+    .prepare<UserRow>(`
       SELECT
         id,
         account_name as accountName,
@@ -851,9 +1058,9 @@ export function listUsers() {
       FROM users
       ORDER BY created_at ASC
     `)
-    .all() as any[];
+    .all();
 
-  return users.map((user) => ({
+  return users.map<UserWithRoles>((user) => ({
     ...user,
     roles: listUserRoles(user.id),
   }));
@@ -861,7 +1068,7 @@ export function listUsers() {
 
 function listUserRoles(userId: string) {
   return getDb()
-    .prepare(`
+    .prepare<RoleRow>(`
       SELECT
         r.id,
         r.role_key as roleKey,
@@ -874,121 +1081,143 @@ function listUserRoles(userId: string) {
     .all(userId);
 }
 
-export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; password?: string }) {
-  const id = newId("user");
-  const createdAt = nowIso();
-  const accountName = requireNonEmpty(input.accountName, "Account name");
-  const displayName = requireNonEmpty(input.displayName, "Display name");
-  const passwordHash = hashOrNull(input.password);
-  if (!passwordHash) {
-    throw new Error("Password is required when creating a user");
-  }
-  getDb()
-    .prepare(`
-      INSERT INTO users (
-        id, account_name, display_name, email, department, external_user_id,
-        status, created_at, updated_at, password_hash, must_change_password
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    `)
-    .run(
-      id,
-      accountName,
-      displayName,
-      input.email,
-      input.department,
-      null,
-      normalizeStatus(input.status),
-      createdAt,
-      createdAt,
-      passwordHash
-    );
+export function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; initialPassword: string }) {
+  return withTransaction(() => {
+    const id = newId("user");
+    const createdAt = nowIso();
+    const accountName = requireNonEmpty(input.accountName, "Account name");
+    const displayName = requireNonEmpty(input.displayName, "Display name");
+    const initialPassword = validatePassword(input.initialPassword);
+    getDb()
+      .prepare(`
+        INSERT INTO users (
+          id, account_name, display_name, email, department, external_user_id,
+          password_hash, must_change_password, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        id,
+        accountName,
+        displayName,
+        input.email,
+        input.department,
+        null,
+        hashPassword(initialPassword),
+        1,
+        normalizeStatus(input.status),
+        createdAt,
+        createdAt
+      );
 
-  setUserRoleKeys(id, input.roleKeys ?? ["user"]);
-  const user = listUsers().find((item: any) => item.id === id);
-  writeAuditLog({
-    actionType: "user.create",
-    resourceType: "user",
-    resourceId: id,
-    resourceName: accountName,
-    afterSnapshot: user,
+    setUserRoleKeys(id, input.roleKeys ?? ["user"]);
+    const user = listUsers().find((item) => item.id === id);
+    writeAuditLog({
+      actionType: "user.create",
+      resourceType: "user",
+      resourceId: id,
+      resourceName: accountName,
+      afterSnapshot: user,
+    });
+    return user;
   });
-  return user;
 }
 
-export function updateUser(
-  id: string,
-  patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[]; password?: string }
-) {
-  const before = listUsers().find((item: any) => item.id === id);
-  if (!before) return null;
-  ensureUserChangeAllowed(id, patch);
+export function resetUserPassword(userId: string, nextPassword: string) {
+  return withTransaction(() => {
+    const existing = listUsers().find((item) => item.id === userId);
+    if (!existing) return null;
 
-  getDb()
-    .prepare(`
-      UPDATE users
-      SET account_name = ?, display_name = ?, email = ?, department = ?, status = ?, updated_at = ?
-      WHERE id = ?
-    `)
-    .run(
-      patch.accountName === undefined ? before.accountName : requireNonEmpty(patch.accountName, "Account name"),
-      patch.displayName === undefined ? before.displayName : requireNonEmpty(patch.displayName, "Display name"),
-      patch.email ?? before.email,
-      patch.department ?? before.department,
-      patch.status === undefined ? before.status : normalizeStatus(patch.status, before.status),
-      nowIso(),
-      id
-    );
+    const next = validatePassword(nextPassword);
+    getDb()
+      .prepare(`
+        UPDATE users
+        SET password_hash = ?, must_change_password = 1, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(hashPassword(next), nowIso(), userId);
+    getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
 
-  if (patch.roleKeys !== undefined) {
-    setUserRoleKeys(id, patch.roleKeys);
-  }
-
-  if (patch.password !== undefined) {
-    const passwordHash = hashOrNull(patch.password);
-    if (passwordHash) {
-      getDb()
-        .prepare("UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ? WHERE id = ?")
-        .run(passwordHash, nowIso(), id);
-      getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(id);
-    }
-  }
-
-  const after = listUsers().find((item: any) => item.id === id);
-  writeAuditLog({
-    actionType: "user.update",
-    resourceType: "user",
-    resourceId: id,
-    resourceName: after?.accountName ?? before.accountName,
-    beforeSnapshot: before,
-    afterSnapshot: after,
+    const updated = listUsers().find((item) => item.id === userId);
+    writeAuditLog({
+      actionType: "user.password_reset",
+      resourceType: "user",
+      resourceId: userId,
+      resourceName: updated?.accountName ?? existing.accountName,
+      afterSnapshot: {
+        userId,
+        mustChangePassword: true,
+        sessionsRevoked: true,
+      },
+    });
+    return updated;
   });
-  return after;
+}
+
+export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[] }) {
+  return withTransaction(() => {
+    const before = listUsers().find((item) => item.id === id);
+    if (!before) return null;
+    ensureUserChangeAllowed(id, patch);
+
+    getDb()
+      .prepare(`
+        UPDATE users
+        SET account_name = ?, display_name = ?, email = ?, department = ?, status = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(
+        patch.accountName === undefined ? before.accountName : requireNonEmpty(patch.accountName, "Account name"),
+        patch.displayName === undefined ? before.displayName : requireNonEmpty(patch.displayName, "Display name"),
+        patch.email ?? before.email,
+        patch.department ?? before.department,
+        patch.status === undefined ? before.status : normalizeStatus(patch.status, before.status),
+        nowIso(),
+        id
+      );
+
+    if (patch.roleKeys !== undefined) {
+      setUserRoleKeys(id, patch.roleKeys);
+    }
+
+    const after = listUsers().find((item) => item.id === id);
+    writeAuditLog({
+      actionType: "user.update",
+      resourceType: "user",
+      resourceId: id,
+      resourceName: after?.accountName ?? before.accountName,
+      beforeSnapshot: before,
+      afterSnapshot: after,
+    });
+    return after;
+  });
 }
 
 export function setUserRoleKeys(userId: string, roleKeys: string[]) {
-  ensureUserRoleChangeAllowed(userId, roleKeys);
-  const database = getDb();
-  const roles = database
-    .prepare(`SELECT id, role_key as roleKey FROM roles`)
-    .all() as Array<{ id: string; roleKey: string }>;
-  const selectedRoles = roles.filter((role) => roleKeys.includes(role.roleKey));
-  const selectedRoleKeys = new Set(selectedRoles.map((role) => role.roleKey));
-  const unknownRoleKeys = roleKeys.filter((roleKey) => !selectedRoleKeys.has(roleKey));
-  if (unknownRoleKeys.length > 0) {
-    throw new Error(`Unknown role keys: ${unknownRoleKeys.join(", ")}`);
-  }
+  return withTransaction(() => {
+    ensureUserRoleChangeAllowed(userId, roleKeys);
+    const database = getDb();
+    const roles = database
+      .prepare(`SELECT id, role_key as roleKey FROM roles`)
+      .all() as Array<{ id: string; roleKey: string }>;
+    const selectedRoles = roles.filter((role) => roleKeys.includes(role.roleKey));
+    const selectedRoleKeys = new Set(selectedRoles.map((role) => role.roleKey));
+    const unknownRoleKeys = roleKeys.filter((roleKey) => !selectedRoleKeys.has(roleKey));
+    if (unknownRoleKeys.length > 0) {
+      throw new Error(`Unknown role keys: ${unknownRoleKeys.join(", ")}`);
+    }
 
-  database.prepare("DELETE FROM user_roles WHERE user_id = ?").run(userId);
-  for (const role of selectedRoles) {
-    database
-      .prepare(`
-      INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
-        VALUES (?, ?, ?, ?)
-      `)
-      .run(newId("user-role"), userId, role.id, nowIso());
-  }
+    database.prepare("DELETE FROM user_roles WHERE user_id = ?").run(userId);
+    for (const role of selectedRoles) {
+      database
+        .prepare(`
+        INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
+          VALUES (?, ?, ?, ?)
+        `)
+        .run(newId("user-role"), userId, role.id, nowIso());
+    }
 
-  return listUsers().find((item: any) => item.id === userId) ?? null;
+    return listUsers().find((item) => item.id === userId) ?? null;
+  });
 }
 
 function ensureUserChangeAllowed(
@@ -1014,7 +1243,7 @@ function ensureUserRoleChangeAllowed(userId: string, roleKeys: string[]) {
 
 export function listAuditLogs(limit = 100) {
   return getDb()
-    .prepare(`
+          .prepare<AuditLogRow>(`
       SELECT
         id,
         actor_user_id as actorUserId,
@@ -1035,8 +1264,8 @@ export function listAuditLogs(limit = 100) {
 }
 
 export function getRuntimeConfig() {
-  const settings = listSettings() as any[];
-  const templates = listPromptTemplates() as any[];
+  const settings = listSettings();
+  const templates = listPromptTemplates();
 
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
@@ -1074,7 +1303,7 @@ export function getRuntimeConfig() {
 }
 
 export function listActiveHotwordMap() {
-  const active = (listHotwords() as any[]).filter((item) => item.status === "active");
+  const active = listHotwords().filter((item) => item.status === "active");
   return active.reduce<Record<string, number>>((acc, item) => {
     acc[item.term] = Number(item.weight);
     return acc;
@@ -1092,7 +1321,6 @@ function getAsrCaptureSession(captureSessionId: string) {
         asr_provider as asrProvider,
         asr_config_snapshot as asrConfigSnapshot,
         hotwords_json as hotwordsJson,
-        raw_events_json as rawEventsJson,
         status
       FROM asr_capture_sessions
       WHERE capture_session_id = ?
@@ -1102,14 +1330,34 @@ function getAsrCaptureSession(captureSessionId: string) {
   return row ?? null;
 }
 
-function redactAsrConfigSnapshot(snapshot: any) {
+function listAsrCaptureEvents(captureSessionId: string) {
+  const rows = getDb()
+    .prepare(`
+      SELECT
+        event_json as eventJson,
+        received_at as receivedAt
+      FROM asr_capture_events
+      WHERE capture_session_id = ?
+      ORDER BY sequence_no ASC
+    `)
+    .all(captureSessionId) as AsrCaptureEventRow[];
+
+  return rows.map((row) => ({
+    receivedAt: row.receivedAt,
+    event: parseJsonOr(row.eventJson, null),
+  }));
+}
+
+function redactAsrConfigSnapshot(snapshot: unknown) {
+  const record = isRecord(snapshot) ? snapshot : {};
+  const hotwords = record.hotwords;
   return {
-    providerType: snapshot?.providerType ?? snapshot?.provider ?? "unknown",
-    hasEndpoint: Boolean(snapshot?.endpoint),
-    hasWorkspaceId: Boolean(snapshot?.workspaceId),
-    hasApiKey: Boolean(snapshot?.hasApiKey),
-    hotwordCount: snapshot?.hotwords && typeof snapshot.hotwords === "object"
-      ? Object.keys(snapshot.hotwords).length
+    providerType: String(record.providerType ?? record.provider ?? "unknown"),
+    hasEndpoint: Boolean(record.endpoint),
+    hasWorkspaceId: Boolean(record.workspaceId),
+    hasApiKey: Boolean(record.hasApiKey),
+    hotwordCount: isRecord(hotwords)
+      ? Object.keys(hotwords).length
       : undefined,
   };
 }
@@ -1146,13 +1394,15 @@ function hashPassword(password: string) {
   return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key}`;
 }
 
-function hashOrNull(password: string | null | undefined): string | null {
+function validatePassword(password: unknown) {
   const value = String(password ?? "");
-  if (!value) return null;
   if (value.length < 8) {
     throw new Error("Password must be at least 8 characters");
   }
-  return hashPassword(value);
+  if (value.length > 128) {
+    throw new Error("Password must be at most 128 characters");
+  }
+  return value;
 }
 
 function verifyPassword(password: string, storedHash: string | null | undefined): PasswordVerificationResult {
@@ -1188,48 +1438,42 @@ function sessionExpiryIso() {
 }
 
 function seedIdentityDefaults(database: DatabaseSync) {
-  const roleCount = Number(
-    database.prepare("SELECT COUNT(*) as count FROM roles").get()?.count ?? 0
-  );
   const userCount = Number(
     database.prepare("SELECT COUNT(*) as count FROM users").get()?.count ?? 0
   );
   const bootstrapAdminAccount = getBootstrapAdminAccount();
   const bootstrapAdminPassword = getBootstrapAdminPassword();
 
-  if (roleCount === 0) {
-    const roles: RoleRow[] = [
-      { id: "role-user", roleKey: "user", roleName: "普通用户" },
-      { id: "role-system-admin", roleKey: "system_admin", roleName: "系统管理员" },
-    ];
+  const roles: RoleRow[] = [
+    { id: "role-user", roleKey: "user", roleName: "普通用户" },
+    { id: "role-system-admin", roleKey: "system_admin", roleName: "管理员" },
+  ];
 
-    for (const role of roles) {
-      database
-        .prepare(`
-          INSERT INTO roles (id, role_key, role_name, created_at)
-          VALUES (?, ?, ?, ?)
-          ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name
-        `)
-        .run(role.id, role.roleKey, role.roleName, nowIso());
-    }
+  for (const role of roles) {
+    database
+      .prepare(`
+        INSERT INTO roles (id, role_key, role_name, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name
+      `)
+      .run(role.id, role.roleKey, role.roleName, nowIso());
   }
 
+  const systemAdminRole = database
+    .prepare("SELECT id FROM roles WHERE role_key = 'system_admin'")
+    .get() as { id: string } | undefined;
   const legacyMinutesAdminRole = database
     .prepare("SELECT id FROM roles WHERE role_key = 'minutes_admin'")
     .get() as { id: string } | undefined;
-  const systemAdminRoleRow = database
-    .prepare("SELECT id FROM roles WHERE role_key = 'system_admin'")
-    .get() as { id: string } | undefined;
-  if (legacyMinutesAdminRole && systemAdminRoleRow) {
+
+  if (systemAdminRole && legacyMinutesAdminRole) {
     database
       .prepare(`
-        INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
-        SELECT 'user-role-migrated-' || ur.user_id, ur.user_id, ?, ?
-        FROM user_roles ur
-        WHERE ur.role_id = ?
+        UPDATE OR IGNORE user_roles
+        SET role_id = ?
+        WHERE role_id = ?
       `)
-      .run(systemAdminRoleRow.id, nowIso(), legacyMinutesAdminRole.id);
-    database.prepare("DELETE FROM user_roles WHERE role_id = ?").run(legacyMinutesAdminRole.id);
+      .run(systemAdminRole.id, legacyMinutesAdminRole.id);
     database.prepare("DELETE FROM roles WHERE id = ?").run(legacyMinutesAdminRole.id);
   }
 
@@ -1419,10 +1663,7 @@ export function deleteAuthSession(token: string) {
 
 export function changeUserPassword(accountName: string, currentPassword: string, nextPassword: string) {
   const normalizedAccount = requireNonEmpty(accountName, "Account name");
-  const next = String(nextPassword ?? "");
-  if (next.length < 8) {
-    throw new Error("Password must be at least 8 characters");
-  }
+  const next = validatePassword(nextPassword);
 
   const user = getDb()
     .prepare(`
@@ -1436,12 +1677,14 @@ export function changeUserPassword(accountName: string, currentPassword: string,
     throw new Error("Current password is incorrect");
   }
 
-  getDb()
-    .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
-    .run(hashPassword(next), nowIso(), user.id);
-  getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
+  return withTransaction(() => {
+    getDb()
+      .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
+      .run(hashPassword(next), nowIso(), user.id);
+    getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
 
-  return true;
+    return true;
+  });
 }
 
 export function getCurrentActorRoleKeys() {
@@ -1461,7 +1704,7 @@ export function getActorRoleKeys(userId: string, status = "active") {
       ORDER BY r.role_key ASC
     `)
     .all(userId)
-    .map((row: any) => String(row.roleKey));
+    .map((row) => row.roleKey);
 }
 
 export function currentActorHasAnyRole(roleKeys: string[]) {
@@ -1511,7 +1754,7 @@ export function createMeeting(input: MeetingInput) {
   const createdAt = nowIso();
   const meetingId = newId("meeting");
   const asrResultId = newId("asr");
-  const settings = listSettings() as any[];
+  const settings = listSettings();
   const activeHotwords = listActiveHotwordMap();
   const actor = getCurrentActor();
 
@@ -1527,7 +1770,7 @@ export function createMeeting(input: MeetingInput) {
   }
 
   const captureSession = getAsrCaptureSession(input.captureSessionId);
-  const rawEvents = parseJsonOr(captureSession?.rawEventsJson, null as unknown[] | null);
+  const rawEvents = captureSession ? listAsrCaptureEvents(input.captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
     : {
@@ -1548,58 +1791,60 @@ export function createMeeting(input: MeetingInput) {
       }
     : { segments: transcriptSegments };
 
-  database
-    .prepare(`
-      INSERT INTO meetings (
-        id, title, source_type, source_file_name, duration_seconds, status, status_updated_at,
-        last_error_message, created_by_user_id, created_by_user_name, created_by_user_email, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      meetingId,
-      title,
-      sourceType,
-      input.sourceFileName,
-      input.durationSeconds,
-      "transcribed",
-      createdAt,
-      null,
-      actor.id,
-      actor.displayName,
-      null,
-      createdAt,
-      createdAt
-    );
+  return withTransaction(() => {
+    database
+      .prepare(`
+        INSERT INTO meetings (
+          id, title, source_type, source_file_name, duration_seconds, status, status_updated_at,
+          last_error_message, created_by_user_id, created_by_user_name, created_by_user_email, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        meetingId,
+        title,
+        sourceType,
+        input.sourceFileName,
+        input.durationSeconds,
+        "transcribed",
+        createdAt,
+        null,
+        actor.id,
+        actor.displayName,
+        null,
+        createdAt,
+        createdAt
+      );
 
-  database
-    .prepare(`
-      INSERT INTO meeting_asr_results (
-        id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
-        capture_session_id, result_format, raw_payload, normalized_text, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      asrResultId,
-      meetingId,
-      captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
-      "current",
-      JSON.stringify(asrConfigSnapshot),
-      input.captureSessionId,
-      captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
-      JSON.stringify(rawPayload),
-      normalizedText,
-      createdAt
-    );
+    database
+      .prepare(`
+        INSERT INTO meeting_asr_results (
+          id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
+          capture_session_id, result_format, raw_payload, normalized_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        asrResultId,
+        meetingId,
+        captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
+        "current",
+        JSON.stringify(asrConfigSnapshot),
+        input.captureSessionId,
+        captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
+        JSON.stringify(rawPayload),
+        normalizedText,
+        createdAt
+      );
 
-  const meeting = getMeetingById(meetingId);
-  writeAuditLog({
-    actionType: "meeting.create",
-    resourceType: "meeting",
-    resourceId: meetingId,
-    resourceName: title,
-    afterSnapshot: meeting,
+    const meeting = getMeetingById(meetingId);
+    writeAuditLog({
+      actionType: "meeting.create",
+      resourceType: "meeting",
+      resourceId: meetingId,
+      resourceName: title,
+      afterSnapshot: meeting,
+    });
+    return meeting;
   });
-  return meeting;
 }
 
 export function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null) {
@@ -1612,72 +1857,57 @@ export function updateMeetingStatus(id: string, status: string, lastErrorMessage
     `)
     .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id);
 
-  return getMeetingRowById(id);
+  return getMeetingById(id);
 }
 
 export function updateMeeting(id: string, patch: { title?: string }) {
-  const existing = getMeetingById(id);
-  if (!existing) return null;
+  return withTransaction(() => {
+    const existing = getMeetingById(id);
+    if (!existing) return null;
 
-  const updatedAt = nowIso();
-  const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
-  getDb()
-    .prepare(`
-      UPDATE meetings
-      SET title = ?, updated_at = ?
-      WHERE id = ?
-    `)
-    .run(nextTitle, updatedAt, id);
+    const updatedAt = nowIso();
+    const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
+    getDb()
+      .prepare(`
+        UPDATE meetings
+        SET title = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .run(nextTitle, updatedAt, id);
 
-  const updated = getMeetingById(id);
-  writeAuditLog({
-    actionType: "meeting.update",
-    resourceType: "meeting",
-    resourceId: id,
-    resourceName: updated?.title ?? existing.title,
-    beforeSnapshot: existing,
-    afterSnapshot: updated,
+    const updated = getMeetingById(id);
+    writeAuditLog({
+      actionType: "meeting.update",
+      resourceType: "meeting",
+      resourceId: id,
+      resourceName: updated?.title ?? existing.title,
+      beforeSnapshot: existing,
+      afterSnapshot: updated,
+    });
+    return updated;
   });
-  return updated;
 }
 
 export function deleteMeeting(id: string) {
-  const database = getDb();
-  const before = getMeetingById(id);
-  if (!before) return false;
-  const asrRows = database
-    .prepare("SELECT id FROM meeting_asr_results WHERE meeting_id = ?")
-    .all(id) as Array<{ id: string }>;
-  const asrIds = asrRows.map((row) => row.id);
-
-  for (const asrId of asrIds) {
-    const llmRows = database
-      .prepare("SELECT id FROM meeting_llm_results WHERE meeting_asr_result_id = ?")
-      .all(asrId) as Array<{ id: string }>;
-
-    for (const llmRow of llmRows) {
-      database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(llmRow.id);
+  return withTransaction(() => {
+    const database = getDb();
+    const before = getMeetingById(id);
+    const result = database.prepare("DELETE FROM meetings WHERE id = ?").run(id);
+    const deleted = Number(result.changes ?? 0) > 0;
+    if (deleted) {
+      writeAuditLog({
+        actionType: "meeting.delete",
+        resourceType: "meeting",
+        resourceId: id,
+        resourceName: before?.title ?? id,
+        beforeSnapshot: before,
+      });
     }
-
-    database.prepare("DELETE FROM meeting_llm_results WHERE meeting_asr_result_id = ?").run(asrId);
-  }
-
-  database.prepare("DELETE FROM meeting_asr_results WHERE meeting_id = ?").run(id);
-  const result = database.prepare("DELETE FROM meetings WHERE id = ?").run(id);
-  const deleted = Number(result.changes ?? 0) > 0;
-  if (deleted) {
-    writeAuditLog({
-      actionType: "meeting.delete",
-      resourceType: "meeting",
-      resourceId: id,
-      resourceName: before?.title ?? id,
-      beforeSnapshot: before,
-    });
-  }
-  return deleted;
+    return deleted;
+  });
 }
 
-function mapMeetingRow(row: any) {
+function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {
   return {
     id: row.id,
     title: row.title,
@@ -1696,15 +1926,32 @@ function mapMeetingRow(row: any) {
 }
 
 export function listMeetings() {
+  const database = getDb();
   const actor = getCurrentActor();
-  const rows = getDb()
-    .prepare(MEETING_ROW_SELECT + " WHERE m.created_by_user_id = ? ORDER BY m.created_at DESC")
-    .all(actor.id) as any[];
+  const rows = database
+    .prepare(`
+      SELECT
+        m.id,
+        m.title,
+        m.status,
+        m.last_error_message as lastErrorMessage,
+        m.source_type as sourceType,
+        m.duration_seconds as durationSeconds,
+        m.created_at as createdAt,
+        (
+          SELECT result_markdown
+          FROM meeting_llm_results lr
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded'
+          ORDER BY lr.version_no DESC, lr.created_at DESC
+          LIMIT 1
+        ) as summary
+      FROM meetings m
+      WHERE m.created_by_user_id = ?
+      ORDER BY m.created_at DESC
+    `)
+    .all<MeetingRow>(actor.id);
 
-  return rows.map((row) => {
-    const payload = parseJsonOr(row.rawPayload, { segments: [] } as any);
-    return mapMeetingRow({ ...row, transcript: payload.segments ?? payload.transcriptSegments ?? [] });
-  });
+  return rows.map((row) => mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(row.id) }));
 }
 
 export function getMeetingById(id: string) {
@@ -1715,53 +1962,95 @@ export function getMeetingById(id: string) {
     .get(id) as { ownerId: string } | undefined;
   if (!owner || owner.ownerId !== actor.id) return null;
 
-  return getMeetingRowById(id);
-}
-
-const MEETING_ROW_SELECT = `
-  SELECT
-    m.id,
-    m.title,
-    m.status,
-    m.last_error_message as lastErrorMessage,
-    m.source_type as sourceType,
-    m.duration_seconds as durationSeconds,
-    m.created_at as createdAt,
-    (
-      SELECT r2.raw_payload
-      FROM meeting_asr_results r2
-      WHERE r2.meeting_id = m.id
-      ORDER BY r2.created_at DESC
-      LIMIT 1
-    ) as rawPayload,
-    (
-      SELECT lr.result_markdown
-      FROM meeting_llm_results lr
-      INNER JOIN meeting_asr_results r3 ON r3.id = lr.meeting_asr_result_id
-      WHERE r3.meeting_id = m.id AND lr.status = 'succeeded'
-      ORDER BY lr.version_no DESC, lr.created_at DESC
-      LIMIT 1
-    ) as summary
-  FROM meetings m
-`;
-
-function getMeetingRowById(id: string) {
-  const row = getDb()
-    .prepare(MEETING_ROW_SELECT + " WHERE m.id = ?")
-    .get(id) as any;
+  const row = database
+    .prepare(`
+      SELECT
+        m.id,
+        m.title,
+        m.status,
+        m.last_error_message as lastErrorMessage,
+        m.source_type as sourceType,
+        m.duration_seconds as durationSeconds,
+        m.created_at as createdAt,
+        (
+          SELECT result_markdown
+          FROM meeting_llm_results lr
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded'
+          ORDER BY lr.version_no DESC, lr.created_at DESC
+          LIMIT 1
+        ) as summary
+      FROM meetings m
+      WHERE m.id = ?
+    `)
+    .get<MeetingRow>(id);
 
   if (!row) return null;
-  const payload = parseJsonOr(row.rawPayload, { segments: [] } as any);
-  return mapMeetingRow({ ...row, transcript: payload.segments ?? payload.transcriptSegments ?? [] });
+  return mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) });
 }
 
-function listMeetingLlmResultsByAsrResultId(meetingAsrResultId: string) {
+function getMeetingAsrRows(meetingId: string) {
+  return getDb()
+    .prepare(`
+      SELECT
+        id,
+        raw_payload as rawPayload,
+        normalized_text as normalizedText,
+        created_at as createdAt
+      FROM meeting_asr_results
+      WHERE meeting_id = ?
+      ORDER BY created_at ASC, id ASC
+    `)
+    .all<Pick<MeetingAsrRow, "id" | "rawPayload" | "normalizedText" | "createdAt">>(meetingId);
+}
+
+function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.filter(isRecord).map((segment, index) => ({
+    id: String(segment.id ?? `segment-${index}`),
+    speaker: String(segment.speaker ?? ""),
+    speakerId: typeof segment.speakerId === "number" ? segment.speakerId : null,
+    text: String(segment.text ?? ""),
+    time: String(segment.time ?? ""),
+    timeSeconds: Number.isFinite(Number(segment.timeSeconds)) ? Number(segment.timeSeconds) : 0,
+    isFinal: Boolean(segment.isFinal),
+  }));
+}
+
+function getMergedMeetingTranscriptSegments(meetingId: string) {
+  return getMeetingAsrRows(meetingId).flatMap((row) => {
+    const payload = parseJsonOr<JsonRecord>(row.rawPayload, {});
+    const segments = parseTranscriptSegments(payload.transcriptSegments ?? payload.segments);
+
+    if (segments.length > 0) return segments;
+    const normalizedText = row.normalizedText ?? "";
+    if (!normalizedText.trim()) return [];
+    return [{
+      id: `${row.id}-text`,
+      speaker: "",
+      text: normalizedText,
+      time: "",
+      timeSeconds: 0,
+      isFinal: true,
+    }];
+  });
+}
+
+function getMergedMeetingTranscript(meetingId: string) {
+  return getMeetingAsrRows(meetingId)
+    .map((row) => String(row.normalizedText || "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function listMeetingLlmResultsByMeetingId(meetingId: string) {
   const database = getDb();
   return database
     .prepare(`
       SELECT
         id,
-        meeting_asr_result_id as meetingAsrResultId,
+        meeting_id as meetingId,
+        input_transcript_snapshot as inputTranscriptSnapshot,
         llm_setting_mark as llmSettingMark,
         prompt_template_id as promptTemplateId,
         generation_config_snapshot as generationConfigSnapshot,
@@ -1776,33 +2065,10 @@ function listMeetingLlmResultsByAsrResultId(meetingAsrResultId: string) {
         error_message as errorMessage,
         created_at as createdAt
       FROM meeting_llm_results
-      WHERE meeting_asr_result_id = ?
+      WHERE meeting_id = ?
       ORDER BY version_no DESC, created_at DESC
     `)
-    .all(meetingAsrResultId);
-}
-
-function getMeetingAsrResultByMeetingId(meetingId: string) {
-  const database = getDb();
-  return database
-    .prepare(`
-      SELECT
-        id,
-        meeting_id as meetingId,
-        asr_provider as asrProvider,
-        asr_setting_mark as asrSettingMark,
-        asr_config_snapshot as asrConfigSnapshot,
-        capture_session_id as captureSessionId,
-        result_format as resultFormat,
-        raw_payload as rawPayload,
-        normalized_text as normalizedText,
-        created_at as createdAt
-      FROM meeting_asr_results
-      WHERE meeting_id = ?
-      ORDER BY created_at DESC
-      LIMIT 1
-    `)
-    .get(meetingId) as any;
+    .all<MeetingLlmResultRow>(meetingId);
 }
 
 export function listMeetingAsrResults(meetingId: string) {
@@ -1822,7 +2088,7 @@ export function listMeetingAsrResults(meetingId: string) {
       WHERE meeting_id = ?
       ORDER BY created_at DESC
     `)
-    .all(meetingId);
+    .all<MeetingAsrSummaryRow>(meetingId);
 }
 
 export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
@@ -1842,21 +2108,19 @@ export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
       FROM meeting_asr_results
       WHERE meeting_id = ? AND id = ?
     `)
-    .get(meetingId, resultId) as any;
+    .get<MeetingAsrRow>(meetingId, resultId);
 
   if (!row) return null;
 
   return {
     ...row,
-    asrConfigSnapshot: redactAsrConfigSnapshot(parseJsonOr(row.asrConfigSnapshot, {})),
-    rawPayload: parseJsonOr(row.rawPayload, row.rawPayload),
+    asrConfigSnapshot: redactAsrConfigSnapshot(parseJsonOr<JsonRecord>(row.asrConfigSnapshot, {})),
+    rawPayload: parseJsonOr<unknown>(row.rawPayload, row.rawPayload),
   };
 }
 
 export function listMeetingLlmResults(meetingId: string) {
-  const asrResult = getMeetingAsrResultByMeetingId(meetingId);
-  if (!asrResult) return [];
-  return listMeetingLlmResultsByAsrResultId(asrResult.id);
+  return listMeetingLlmResultsByMeetingId(meetingId);
 }
 
 function truncateUtf16(text: string, maxLength: number): string {
@@ -1891,7 +2155,7 @@ function parseSseText(text: string): {
         if (delta?.content) content += String(delta.content);
         if (delta?.reasoning_content) reasoningChars += String(delta.reasoning_content).length;
         if (choice?.finish_reason) finishReason = choice.finish_reason;
-      } catch (e) {
+      } catch {
         // skip malformed sse block
       }
     }
@@ -1965,14 +2229,14 @@ function llmRequest(
 
 export async function createMeetingLlmResult(meetingId: string, templateId?: string) {
   updateMeetingStatus(meetingId, "llm_processing");
-  const asrResult = getMeetingAsrResultByMeetingId(meetingId);
-  if (!asrResult) {
-    updateMeetingStatus(meetingId, "llm_failed", "Meeting ASR result not found");
-    throw new Error("Meeting ASR result not found");
+  const inputTranscriptSnapshot = getMergedMeetingTranscript(meetingId);
+  if (!inputTranscriptSnapshot) {
+    updateMeetingStatus(meetingId, "llm_failed", "Meeting ASR transcript not found");
+    throw new Error("Meeting ASR transcript not found");
   }
 
-  const settings = listSettings() as any[];
-  const templates = listPromptTemplates() as any[];
+  const settings = listSettings();
+  const templates = listPromptTemplates();
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
@@ -1992,9 +2256,8 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
     throw new Error("LLM config incomplete");
   }
 
-  const existing = listMeetingLlmResultsByAsrResultId(asrResult.id) as any[];
-  const versionNo = existing.length > 0 ? Number(existing[0].versionNo) + 1 : 1;
-  const rawPrompt = String(template.content || "").replaceAll("{transcript}", asrResult.normalizedText || "");
+  const existing = listMeetingLlmResultsByMeetingId(meetingId);
+  const rawPrompt = String(template.content || "").replaceAll("{transcript}", inputTranscriptSnapshot);
   const contextSize = Number(String(get("llm", "context_size") || "").trim()) || 0;
   const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
   const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 180000;
@@ -2010,7 +2273,7 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     console.log(
-      `[LLM] generate: meeting=${meetingId} asr=${asrResult.id} model=${model} url=${baseUrl} promptChars=${prompt.length} maxTokens=${maxTokens > 0 ? maxTokens : "auto"} contextSize=${contextSize > 0 ? contextSize : "full"} timeoutMs=${timeoutMs}`
+      `[LLM] generate: meeting=${meetingId} model=${model} url=${baseUrl} promptChars=${prompt.length} maxTokens=${maxTokens > 0 ? maxTokens : "auto"} contextSize=${contextSize > 0 ? contextSize : "full"} timeoutMs=${timeoutMs}`
     );
 
     try {
@@ -2052,7 +2315,7 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
               const parsed = JSON.parse(payload);
               const delta = parsed.choices?.[0]?.delta;
               if (delta?.content || delta?.reasoning_content) streamTokenCount++;
-            } catch (e) {}
+            } catch {}
           }
           if (streamTokenCount > 0 && streamTokenCount % 50 === 0) {
             console.log(`[LLM] stream: tokens=${streamTokenCount} elapsed=${Date.now() - startedAt}ms`);
@@ -2105,91 +2368,110 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
         : "LLM generation failed";
     const errorMessage = `${baseMessage} (elapsed=${elapsedMs}ms)`;
     console.error(
-      `[LLM] failed: meeting=${meetingId} asr=${asrResult.id} error=${errorMessage}`
+      `[LLM] failed: meeting=${meetingId} error=${errorMessage}`
     );
-    insertMeetingLlmResult({
+    withTransaction(() => {
+      const versionNo = getNextLlmVersionNo(meetingId);
+      insertMeetingLlmResult({
+        id: newId("llm"),
+        meetingId,
+        inputTranscriptSnapshot,
+        llmSettingMark: "current",
+        promptTemplateId: template.id,
+        generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
+        generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
+        status: "failed",
+        versionNo,
+        resultType: template.templateType || "custom",
+        resultTitle: template.templateName,
+        rawPrompt: prompt,
+        rawResponse: rawText ? rawText.slice(0, 4000) : "",
+        resultMarkdown: "",
+        errorMessage,
+      });
+      updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      writeAuditLog({
+        actionType: existing.length > 0 ? "llm.regenerate" : "llm.generate_default",
+        resourceType: "meeting",
+        resourceId: meetingId,
+        resourceName: template.templateName,
+        result: "failed",
+        errorMessage,
+        afterSnapshot: {
+          promptTemplateId: template.id,
+          versionNo,
+          status: "failed",
+        },
+      });
+    });
+    throw error;
+  }
+  withTransaction(() => {
+    const row: MeetingLlmResultRow = {
       id: newId("llm"),
-      meetingAsrResultId: asrResult.id,
+      meetingId,
+      inputTranscriptSnapshot,
       llmSettingMark: "current",
       promptTemplateId: template.id,
       generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
       generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
-      status: "failed",
-      versionNo,
+      status: "succeeded",
+      versionNo: getNextLlmVersionNo(meetingId),
       resultType: template.templateType || "custom",
       resultTitle: template.templateName,
       rawPrompt: prompt,
-      rawResponse: rawText ? rawText.slice(0, 4000) : "",
-      resultMarkdown: "",
-      errorMessage,
-    });
-    updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      rawResponse: rawText.slice(0, 8000),
+      resultMarkdown,
+      errorMessage:
+        llmFinishReason === "length"
+          ? "结果可能不完整（finish_reason=length，输出被截断）"
+          : null,
+    };
+    insertMeetingLlmResult(row);
+    updateMeetingStatus(meetingId, "generated");
     writeAuditLog({
-      actionType: existing.length > 0 ? "llm.regenerate" : "llm.generate_default",
-      resourceType: "meeting",
-      resourceId: meetingId,
-      resourceName: template.templateName,
-      result: "failed",
-      errorMessage,
+      actionType: row.generationMode === "default_auto" ? "llm.generate_default" : "llm.regenerate",
+      resourceType: "meeting_llm_result",
+      resourceId: row.id,
+      resourceName: row.resultTitle,
       afterSnapshot: {
-        promptTemplateId: template.id,
-        versionNo,
-        status: "failed",
+        meetingId,
+        promptTemplateId: row.promptTemplateId,
+        versionNo: row.versionNo,
+        status: row.status,
       },
     });
-    throw error;
-  }
-  const row: MeetingLlmResultRow = {
-    id: newId("llm"),
-    meetingAsrResultId: asrResult.id,
-    llmSettingMark: "current",
-    promptTemplateId: template.id,
-    generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
-    generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
-    status: "succeeded",
-    versionNo,
-    resultType: template.templateType || "custom",
-    resultTitle: template.templateName,
-    rawPrompt: prompt,
-    rawResponse: rawText.slice(0, 8000),
-    resultMarkdown,
-    errorMessage:
-      llmFinishReason === "length"
-        ? "结果可能不完整（finish_reason=length，输出被截断）"
-        : null,
-  };
-
-  insertMeetingLlmResult(row);
-  updateMeetingStatus(meetingId, "generated");
-  writeAuditLog({
-    actionType: row.generationMode === "default_auto" ? "llm.generate_default" : "llm.regenerate",
-    resourceType: "meeting_llm_result",
-    resourceId: row.id,
-    resourceName: row.resultTitle,
-    afterSnapshot: {
-      meetingId,
-      promptTemplateId: row.promptTemplateId,
-      versionNo: row.versionNo,
-      status: row.status,
-    },
   });
 
-  return listMeetingLlmResultsByAsrResultId(asrResult.id)[0];
+  return listMeetingLlmResultsByMeetingId(meetingId)[0];
+}
+
+function getNextLlmVersionNo(meetingId: string) {
+  const row = getDb()
+    .prepare(`
+      SELECT COALESCE(MAX(version_no), 0) + 1 as nextVersionNo
+      FROM meeting_llm_results
+      WHERE meeting_id = ?
+    `)
+    .get(meetingId) as { nextVersionNo?: number } | undefined;
+
+  return Number(row?.nextVersionNo ?? 1);
 }
 
 function insertMeetingLlmResult(row: MeetingLlmResultRow) {
   getDb()
     .prepare(`
       INSERT INTO meeting_llm_results (
-        id, meeting_asr_result_id, llm_setting_mark, prompt_template_id,
+        id, meeting_id, input_transcript_snapshot, llm_setting_mark, prompt_template_id,
         generation_config_snapshot, generation_mode, status, version_no,
         result_type, result_title, raw_prompt, raw_response, result_markdown,
         error_message, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       row.id,
-      row.meetingAsrResultId,
+      row.meetingId,
+      row.inputTranscriptSnapshot,
       row.llmSettingMark,
       row.promptTemplateId,
       row.generationConfigSnapshot,
@@ -2207,79 +2489,83 @@ function insertMeetingLlmResult(row: MeetingLlmResultRow) {
 }
 
 export function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
-  const existing = getMeetingLlmResultById(id);
-  if (!existing) return null;
-  if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
-    throw new Error("Meeting LLM result does not belong to this meeting");
-  }
+  return withTransaction(() => {
+    const existing = getMeetingLlmResultById(id);
+    if (!existing) return null;
+    if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
+      throw new Error("Meeting LLM result does not belong to this meeting");
+    }
 
-  const database = getDb();
-  database
-    .prepare(`
-      UPDATE meeting_llm_results
-      SET result_markdown = ?, result_title = ?
-      WHERE id = ?
-    `)
-    .run(
-      patch.resultMarkdown ?? existing.resultMarkdown,
-      patch.resultTitle ?? existing.resultTitle,
-      id
-    );
+    const database = getDb();
+    database
+      .prepare(`
+        UPDATE meeting_llm_results
+        SET result_markdown = ?, result_title = ?
+        WHERE id = ?
+      `)
+      .run(
+        patch.resultMarkdown ?? existing.resultMarkdown,
+        patch.resultTitle ?? existing.resultTitle,
+        id
+      );
 
-  const updated = getMeetingLlmResultById(id);
-  writeAuditLog({
-    actionType: "llm_result.update",
-    resourceType: "meeting_llm_result",
-    resourceId: id,
-    resourceName: updated?.resultTitle ?? existing.resultTitle,
-    beforeSnapshot: {
-      resultTitle: existing.resultTitle,
-      resultMarkdown: existing.resultMarkdown,
-    },
-    afterSnapshot: {
-      meetingId,
-      resultTitle: updated?.resultTitle,
-      resultMarkdown: updated?.resultMarkdown,
-    },
-  });
-
-  return updated;
-}
-
-export function deleteMeetingLlmResult(meetingId: string, id: string) {
-  const existing = getMeetingLlmResultById(id);
-  if (!existing) return false;
-  if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
-    throw new Error("Meeting LLM result does not belong to this meeting");
-  }
-
-  const database = getDb();
-  database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
-  const result = database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
-  const deleted = Number(result.changes ?? 0) > 0;
-  if (deleted) {
+    const updated = getMeetingLlmResultById(id);
     writeAuditLog({
-      actionType: "llm_result.delete",
+      actionType: "llm_result.update",
       resourceType: "meeting_llm_result",
       resourceId: id,
-      resourceName: existing.resultTitle,
+      resourceName: updated?.resultTitle ?? existing.resultTitle,
       beforeSnapshot: {
-        meetingId,
         resultTitle: existing.resultTitle,
         resultMarkdown: existing.resultMarkdown,
       },
+      afterSnapshot: {
+        meetingId,
+        resultTitle: updated?.resultTitle,
+        resultMarkdown: updated?.resultMarkdown,
+      },
     });
-  }
-  return deleted;
+    return updated;
+  });
+}
+
+export function deleteMeetingLlmResult(meetingId: string, id: string) {
+  return withTransaction(() => {
+    const existing = getMeetingLlmResultById(id);
+    if (!existing) return false;
+    if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
+      throw new Error("Meeting LLM result does not belong to this meeting");
+    }
+
+    const database = getDb();
+    database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
+    const result = database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
+    const deleted = Number(result.changes ?? 0) > 0;
+    if (deleted) {
+      writeAuditLog({
+        actionType: "llm_result.delete",
+        resourceType: "meeting_llm_result",
+        resourceId: id,
+        resourceName: existing.resultTitle,
+        beforeSnapshot: {
+          meetingId,
+          resultTitle: existing.resultTitle,
+          resultMarkdown: existing.resultMarkdown,
+        },
+      });
+    }
+    return deleted;
+  });
 }
 
 function getMeetingLlmResultById(id: string) {
   const database = getDb();
   return database
-    .prepare(`
+    .prepare<MeetingLlmResultRow>(`
       SELECT
         id,
-        meeting_asr_result_id as meetingAsrResultId,
+        meeting_id as meetingId,
+        input_transcript_snapshot as inputTranscriptSnapshot,
         llm_setting_mark as llmSettingMark,
         prompt_template_id as promptTemplateId,
         generation_config_snapshot as generationConfigSnapshot,
@@ -2296,7 +2582,7 @@ function getMeetingLlmResultById(id: string) {
       FROM meeting_llm_results
       WHERE id = ?
     `)
-    .get(id) as any;
+    .get<MeetingLlmResultRow>(id);
 }
 
 function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string) {
@@ -2304,18 +2590,21 @@ function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string
     .prepare(`
       SELECT lr.id
       FROM meeting_llm_results lr
-      INNER JOIN meeting_asr_results ar ON ar.id = lr.meeting_asr_result_id
-      WHERE lr.id = ? AND ar.meeting_id = ?
+      WHERE lr.id = ? AND lr.meeting_id = ?
     `)
     .get(llmResultId, meetingId);
 
   return Boolean(row);
 }
 
-export function listMeetingSendRecords(meetingId: string) {
-  const asrResult = getMeetingAsrResultByMeetingId(meetingId);
-  if (!asrResult) return [];
+function parseStringArray(value: string | null | undefined): string[] {
+  const parsed = parseJsonOr<unknown>(value, []);
+  return Array.isArray(parsed)
+    ? parsed.filter((item): item is string => typeof item === "string")
+    : [];
+}
 
+export function listMeetingSendRecords(meetingId: string) {
   const database = getDb();
   return database
     .prepare(`
@@ -2337,14 +2626,14 @@ export function listMeetingSendRecords(meetingId: string) {
         sr.sent_at as sentAt
       FROM meeting_send_records sr
       INNER JOIN meeting_llm_results lr ON lr.id = sr.meeting_llm_result_id
-      WHERE lr.meeting_asr_result_id = ?
+      WHERE lr.meeting_id = ?
       ORDER BY sr.created_at DESC
     `)
-    .all(asrResult.id)
-    .map((row: any) => ({
+    .all<MeetingSendRecordRow>(meetingId)
+    .map((row) => ({
       ...row,
-      toRecipients: JSON.parse(row.toRecipientsJson || "[]"),
-      ccRecipients: JSON.parse(row.ccRecipientsJson || "[]"),
+      toRecipients: parseStringArray(row.toRecipientsJson),
+      ccRecipients: parseStringArray(row.ccRecipientsJson),
     }));
 }
 
@@ -2375,7 +2664,7 @@ export async function createMeetingSendRecord(input: {
     throw new Error("At least one recipient is required");
   }
 
-  const settings = listSettings() as any[];
+  const settings = listSettings();
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
@@ -2419,38 +2708,40 @@ export async function createMeetingSendRecord(input: {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Mail send failed";
     const failedSendRecordId = newId("send");
-    insertMeetingSendRecord({
-      id: failedSendRecordId,
-      meetingLlmResultId: input.meetingLlmResultId,
-      mailTemplateType: input.mailTemplateType ?? "formal_minutes_mail",
-      subject,
-      toRecipientsJson: JSON.stringify(toRecipients),
-      ccRecipientsJson: JSON.stringify(ccRecipients),
-      bodyMarkdown,
-      bodyHtml,
-      status: "failed",
-      mailSettingMark: "current",
-      mailConfigSnapshot: JSON.stringify({ host, port, user, fromName, fromEmail }),
-      providerType: "smtp",
-      providerMessageId: null,
-      errorMessage,
-      sentByUserId: getCurrentActor().id,
-    }, null);
-    updateMeetingStatus(input.meetingId, "send_failed", errorMessage);
-    writeAuditLog({
-      actionType: "mail.send",
-      resourceType: "meeting_send_record",
-      resourceId: failedSendRecordId,
-      resourceName: subject,
-      result: "failed",
-      errorMessage,
-      afterSnapshot: {
-        meetingId: input.meetingId,
+    withTransaction(() => {
+      insertMeetingSendRecord({
+        id: failedSendRecordId,
         meetingLlmResultId: input.meetingLlmResultId,
-        toRecipients,
-        ccRecipients,
+        mailTemplateType: input.mailTemplateType ?? "formal_minutes_mail",
+        subject,
+        toRecipientsJson: JSON.stringify(toRecipients),
+        ccRecipientsJson: JSON.stringify(ccRecipients),
+        bodyMarkdown,
+        bodyHtml,
         status: "failed",
-      },
+        mailSettingMark: "current",
+        mailConfigSnapshot: JSON.stringify({ host, port, user, fromName, fromEmail }),
+        providerType: "smtp",
+        providerMessageId: null,
+        errorMessage,
+        sentByUserId: getCurrentActor().id,
+      }, null);
+      updateMeetingStatus(input.meetingId, "send_failed", errorMessage);
+      writeAuditLog({
+        actionType: "mail.send",
+        resourceType: "meeting_send_record",
+        resourceId: failedSendRecordId,
+        resourceName: subject,
+        result: "failed",
+        errorMessage,
+        afterSnapshot: {
+          meetingId: input.meetingId,
+          meetingLlmResultId: input.meetingLlmResultId,
+          toRecipients,
+          ccRecipients,
+          status: "failed",
+        },
+      });
     });
     throw error;
   }
@@ -2473,20 +2764,22 @@ export async function createMeetingSendRecord(input: {
     sentByUserId: getCurrentActor().id,
   };
 
-  insertMeetingSendRecord(row, nowIso());
-  updateMeetingStatus(input.meetingId, "sent");
-  writeAuditLog({
-    actionType: "mail.send",
-    resourceType: "meeting_send_record",
-    resourceId: row.id,
-    resourceName: row.subject,
-    afterSnapshot: {
-      meetingId: input.meetingId,
-      meetingLlmResultId: row.meetingLlmResultId,
-      toRecipients,
-      ccRecipients,
-      status: row.status,
-    },
+  withTransaction(() => {
+    insertMeetingSendRecord(row, nowIso());
+    updateMeetingStatus(input.meetingId, "sent");
+    writeAuditLog({
+      actionType: "mail.send",
+      resourceType: "meeting_send_record",
+      resourceId: row.id,
+      resourceName: row.subject,
+      afterSnapshot: {
+        meetingId: input.meetingId,
+        meetingLlmResultId: row.meetingLlmResultId,
+        toRecipients,
+        ccRecipients,
+        status: row.status,
+      },
+    });
   });
 
   return listMeetingSendRecords(input.meetingId)[0];

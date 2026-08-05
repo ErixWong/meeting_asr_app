@@ -27,7 +27,7 @@ flowchart LR
     end
 
     subgraph Server["服务端 (Node.js)"]
-        GW["ASR Gateway<br/>server/asr-gateway.mjs<br/>ws://localhost:8123"]
+        GW["ASR Gateway 模块<br/>server/asr-gateway.mjs<br/>ws://localhost:3123/asr"]
         API["Next.js API Routes<br/>/api/meetings /api/admin /api/auth"]
         STORE["admin-store.ts<br/>SQLite + 认证 + RBAC"]
     end
@@ -77,7 +77,7 @@ npm run dev
 ```
 
 `npm run dev` 会同时启动：
-- ASR Gateway: `server/asr-gateway.mjs` (WebSocket, port 8123)
+- ASR Gateway: `server/asr-gateway.mjs`（挂载在 `/asr` 的 WebSocket 模块）
 - Next.js: dev server (port 3123)
 
 访问 http://localhost:3123 即可使用。
@@ -160,11 +160,13 @@ data/meeting-asr-app.db
 
 ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一代理层：
 
-- 接收浏览器 WebSocket 连接（port 8123）
+- 在同一应用服务的 `/asr` 路径接收浏览器 WebSocket 连接
 - 根据 `app_settings.asr.provider` 配置自动选择 provider 适配器
 - 支持 **Local FunASR**（2pass WebSocket 协议）和 **DashScope FunASR**（阿里云云端）
 - 将所有 ASR 原始事件记录到 `asr_capture_sessions` 表，用于后续审计和排查
 - 支持 Origin 白名单校验（默认 `localhost:3123`）
+- WebSocket 握手必须携带有效登录 session Cookie；生产环境拒绝未认证、已过期、强制改密或无业务角色的连接
+- 开发模式可使用 `DEV_ACTOR_ACCOUNT` 复用 HTTP API 的开发身份回退，不影响生产认证
 - 音频流缓冲：在 ASR session 就绪前暂存 PCM 数据
 
 ### RBAC 角色
@@ -172,8 +174,7 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | 角色 | 权限 |
 |:---|:---|
 | `user` | 创建/查看会议、生成纪要、发送邮件 |
-| `minutes_admin` | 上述权限 + 管理提示词模板、热词 |
-| `system_admin` | 所有权限 + 管理 ASR/LLM/邮件配置、用户与角色、审计日志、连接测试 |
+| `system_admin` | 所有权限 + 管理提示词模板、热词、ASR/LLM/邮件配置、用户与角色、审计日志、连接测试 |
 
 ### 声纹聚类
 
@@ -189,8 +190,9 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 
 | 变量 | 说明 | 默认 |
 |:---|:---|:---|
-| `ASR_GATEWAY_PORT` | ASR Gateway 监听端口 | `8123` |
-| `ASR_GATEWAY_HOST` | ASR Gateway 监听地址 | `127.0.0.1` |
+| `PORT` | 统一应用服务监听端口 | `3123` |
+| `APP_HOST` | 统一应用服务监听地址 | `0.0.0.0` |
+| `ASR_GATEWAY_PATH` | ASR Gateway WebSocket 路径 | `/asr` |
 | `ASR_GATEWAY_ALLOWED_ORIGINS` | 允许的 WebSocket 来源（逗号分隔） | `http://localhost:3123,...` |
 | `BOOTSTRAP_ADMIN_ACCOUNT` | 引导管理员账号 | `admin` |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 引导管理员密码 | `admin123`（仅开发） |
@@ -200,10 +202,9 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 
 | 命令 | 说明 |
 |:---|:---|
-| `npm run dev` | 同时启动 ASR Gateway + Next.js 开发服务 |
-| `npm run asr-gateway` | 单独启动 ASR Gateway |
+| `npm run dev` | 启动统一的 Next.js + ASR 开发服务 |
 | `npm run build` | 生产构建 |
-| `npm start` | 生产启动（port 3123） |
+| `npm start` | 启动统一的生产服务（port 3123） |
 | `npm run lint` | 代码检查 |
 | `npm run probe:service` | 检测 ASR 服务连通性（TCP/HTTP/WS） |
 

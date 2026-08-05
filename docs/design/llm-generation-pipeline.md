@@ -6,7 +6,7 @@
 
 ```
 前端 POST /api/meetings/:id/llm-results
-  → route.ts（角色校验 CONTENT_MANAGER_ROLES）
+  → route.ts（角色校验 BUSINESS_ROLES）
   → admin-store.ts createMeetingLlmResult
       - 读设置：llm/base_url, api_key, model, context_size, max_tokens, timeout_ms
       - 构建 prompt（模板 {transcript} 替换），context_size 超长按 UTF-16 安全截断

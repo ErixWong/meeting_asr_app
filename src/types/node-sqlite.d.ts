@@ -1,11 +1,13 @@
 declare module "node:sqlite" {
+  type SqliteRow = Record<string, unknown>;
+
   export class DatabaseSync {
     constructor(path: string);
     exec(sql: string): void;
-    prepare(sql: string): {
-      run: (...params: any[]) => any;
-      get: (...params: any[]) => any;
-      all: (...params: any[]) => any[];
+    prepare<T = SqliteRow>(sql: string): {
+      run: (...params: unknown[]) => { changes?: number; lastInsertRowid?: number };
+      get: <U = T>(...params: unknown[]) => U | undefined;
+      all: <U = T>(...params: unknown[]) => U[];
     };
   }
 }

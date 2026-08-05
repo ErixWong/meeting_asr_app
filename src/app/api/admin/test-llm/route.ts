@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { ADMIN_ROLES, withRequiredRoles } from "@/lib/api-auth";
+import { getSettingValue } from "@/lib/admin-store";
 
 export async function POST(req: NextRequest) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
   try {
       const body = await req.json();
       const baseUrl = String(body.baseUrl || "").replace(/\/$/, "");
-      const apiKey = String(body.apiKey || "");
+      const apiKey = String(body.apiKey || getSettingValue("llm", "api_key"));
       const model = String(body.model || "");
 
       if (!baseUrl || !model) {

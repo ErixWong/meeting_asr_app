@@ -27,7 +27,7 @@ flowchart LR
     end
 
     subgraph Server["Server (Node.js)"]
-        GW["ASR Gateway<br/>server/asr-gateway.mjs<br/>ws://localhost:8123"]
+        GW["ASR Gateway module<br/>server/asr-gateway.mjs<br/>ws://localhost:3123/asr"]
         API["Next.js API Routes<br/>/api/meetings /api/admin /api/auth"]
         STORE["admin-store.ts<br/>SQLite + Auth + RBAC"]
     end
@@ -77,7 +77,7 @@ npm run dev
 ```
 
 `npm run dev` starts both:
-- ASR Gateway: `server/asr-gateway.mjs` (WebSocket, port 8123)
+- ASR Gateway: `server/asr-gateway.mjs` (WebSocket module mounted at `/asr`)
 - Next.js: dev server (port 3123)
 
 Open http://localhost:3123 to use the app.
@@ -160,11 +160,13 @@ Recording/Upload → ASR Gateway → FunASR Transcription → LLM Minutes → Em
 
 The ASR Gateway (`server/asr-gateway.mjs`) is the unified proxy layer between browser and ASR services:
 
-- Accepts browser WebSocket connections (port 8123)
+- Accepts browser WebSocket connections at the same server's `/asr` path
 - Auto-selects provider adapter based on `app_settings.asr.provider` setting
 - Supports **Local FunASR** (2pass WebSocket protocol) and **DashScope FunASR** (Alibaba Cloud)
 - Records all raw ASR events to `asr_capture_sessions` for audit and debugging
 - Enforces Origin whitelist (default: `localhost:3123`)
+- Requires a valid login session cookie during the WebSocket handshake in production; expired, password-change-required, or non-business-role sessions are rejected
+- Development mode may use `DEV_ACTOR_ACCOUNT`, matching the HTTP API development fallback
 - Buffers PCM audio until ASR session is ready
 
 ### RBAC Roles
@@ -172,8 +174,7 @@ The ASR Gateway (`server/asr-gateway.mjs`) is the unified proxy layer between br
 | Role | Permissions |
 |:---|:---|
 | `user` | Create/view meetings, generate minutes, send emails |
-| `minutes_admin` | Above + manage prompt templates, hotwords |
-| `system_admin` | All + manage ASR/LLM/mail config, users & roles, audit logs, connection tests |
+| `system_admin` | All + manage prompt templates, hotwords, ASR/LLM/mail config, users & roles, audit logs, connection tests |
 
 ### Voiceprint Clustering
 
@@ -189,8 +190,9 @@ Browser-side `voiceprint.ts` performs speaker clustering:
 
 | Variable | Description | Default |
 |:---|:---|:---|
-| `ASR_GATEWAY_PORT` | ASR Gateway listen port | `8123` |
-| `ASR_GATEWAY_HOST` | ASR Gateway listen address | `127.0.0.1` |
+| `PORT` | Unified application server port | `3123` |
+| `APP_HOST` | Unified application server listen address | `0.0.0.0` |
+| `ASR_GATEWAY_PATH` | ASR Gateway WebSocket path | `/asr` |
 | `ASR_GATEWAY_ALLOWED_ORIGINS` | Allowed WebSocket origins (comma-separated) | `http://localhost:3123,...` |
 | `BOOTSTRAP_ADMIN_ACCOUNT` | Bootstrap admin account name | `admin` |
 | `BOOTSTRAP_ADMIN_PASSWORD` | Bootstrap admin password | `admin123` (dev only) |
@@ -200,10 +202,9 @@ Browser-side `voiceprint.ts` performs speaker clustering:
 
 | Command | Description |
 |:---|:---|
-| `npm run dev` | Start ASR Gateway + Next.js dev server |
-| `npm run asr-gateway` | Start ASR Gateway only |
+| `npm run dev` | Start the unified Next.js + ASR server in development |
 | `npm run build` | Production build |
-| `npm start` | Production start (port 3123) |
+| `npm start` | Start the unified production server (port 3123) |
 | `npm run lint` | Lint check |
 | `npm run probe:service` | Probe ASR service connectivity (TCP/HTTP/WS) |
 

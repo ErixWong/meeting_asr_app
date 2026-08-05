@@ -1,11 +1,17 @@
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { initializeDatabase } from "./database-schema.mjs";
 
 const dataDir = join(process.cwd(), "data");
 const dbPath = join(dataDir, "meeting-asr-app.db");
 
 let db = null;
+const MAX_CAPTURE_EVENTS = 10000;
+const MAX_CAPTURE_EVENT_CHARS = 512 * 1024;
+const MAX_CAPTURE_EVENT_CHARS_TOTAL = 8 * 1024 * 1024;
+const ASR_GATEWAY_ROLE_KEYS = new Set(["user", "system_admin"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -19,40 +25,7 @@ function getDb() {
   }
 
   db = new DatabaseSync(dbPath);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS app_settings (
-      item_section TEXT NOT NULL,
-      item_mark TEXT NOT NULL,
-      item_title TEXT NOT NULL,
-      item_description TEXT NOT NULL DEFAULT '',
-      item_value TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (item_section, item_mark)
-    );
-
-    CREATE TABLE IF NOT EXISTS asr_hotwords (
-      id TEXT PRIMARY KEY,
-      term TEXT NOT NULL UNIQUE,
-      weight INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      note TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS asr_capture_sessions (
-      capture_session_id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL,
-      asr_provider TEXT NOT NULL,
-      asr_config_snapshot TEXT NOT NULL,
-      hotwords_json TEXT NOT NULL,
-      raw_events_json TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-  `);
+  initializeDatabase(db);
 
   seedAsrDefaults();
   return db;
@@ -77,6 +50,84 @@ function seedAsrDefaults() {
 
 function settingValue(settings, section, mark) {
   return settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
+}
+
+function hashSessionToken(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export function authorizeAsrGatewaySession(sessionToken, devAccountName = "") {
+  const normalizedToken = String(sessionToken || "").trim();
+  const normalizedDevAccount = String(devAccountName || "").trim();
+  if (!normalizedToken && !normalizedDevAccount) {
+    return { ok: false, status: 401, error: "Authentication required" };
+  }
+
+  const database = getDb();
+  const session = normalizedToken
+    ? database
+      .prepare(`
+        SELECT
+          s.user_id as userId,
+          u.account_name as accountName,
+          u.display_name as displayName,
+          u.status,
+          u.must_change_password as mustChangePassword
+        FROM auth_sessions s
+        INNER JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = ? AND s.expires_at > ?
+      `)
+      .get(hashSessionToken(normalizedToken), nowIso())
+    : database
+      .prepare(`
+        SELECT
+          id as userId,
+          account_name as accountName,
+          display_name as displayName,
+          status,
+          must_change_password as mustChangePassword
+        FROM users
+        WHERE account_name = ?
+      `)
+      .get(normalizedDevAccount);
+
+  if (!session || session.status !== "active") {
+    return { ok: false, status: 401, error: "Authentication required" };
+  }
+
+  if (Boolean(session.mustChangePassword)) {
+    return { ok: false, status: 403, error: "Password change required" };
+  }
+
+  const roleKeys = database
+    .prepare(`
+      SELECT r.role_key as roleKey
+      FROM user_roles ur
+      INNER JOIN roles r ON r.id = ur.role_id
+      WHERE ur.user_id = ?
+    `)
+    .all(session.userId)
+    .map((row) => String(row.roleKey));
+
+  if (!roleKeys.some((roleKey) => ASR_GATEWAY_ROLE_KEYS.has(roleKey))) {
+    return { ok: false, status: 403, error: "ASR access is not allowed for this role" };
+  }
+
+  if (normalizedToken) {
+    database
+      .prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?")
+      .run(nowIso(), hashSessionToken(normalizedToken));
+  }
+
+  return {
+    ok: true,
+    actor: {
+      id: session.userId,
+      accountName: session.accountName,
+      displayName: session.displayName,
+      roles: roleKeys,
+    },
+  };
 }
 
 function normalizeFunasrUrl(rawUrl) {
@@ -150,14 +201,13 @@ export function createCaptureSession(input) {
     .prepare(`
       INSERT INTO asr_capture_sessions (
         capture_session_id, task_id, asr_provider, asr_config_snapshot,
-        hotwords_json, raw_events_json, status, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        hotwords_json, status, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(capture_session_id) DO UPDATE SET
         task_id = excluded.task_id,
         asr_provider = excluded.asr_provider,
         asr_config_snapshot = excluded.asr_config_snapshot,
         hotwords_json = excluded.hotwords_json,
-        raw_events_json = excluded.raw_events_json,
         status = excluded.status,
         updated_at = excluded.updated_at,
         expires_at = excluded.expires_at
@@ -168,7 +218,6 @@ export function createCaptureSession(input) {
       input.asrProvider,
       JSON.stringify(input.asrConfigSnapshot),
       JSON.stringify(input.hotwords),
-      "[]",
       "capturing",
       createdAt,
       createdAt,
@@ -178,31 +227,68 @@ export function createCaptureSession(input) {
 
 export function appendCaptureEvent(captureSessionId, event) {
   const database = getDb();
-  const row = database
-    .prepare("SELECT raw_events_json as rawEventsJson FROM asr_capture_sessions WHERE capture_session_id = ?")
-    .get(captureSessionId);
+  const eventJson = JSON.stringify(event);
+  if (typeof eventJson !== "string" || eventJson.length > MAX_CAPTURE_EVENT_CHARS) return false;
 
-  if (!row) return;
-
-  let events = [];
+  database.exec("BEGIN IMMEDIATE");
   try {
-    events = JSON.parse(row.rawEventsJson || "[]");
-  } catch {
-    events = [];
+    const session = database
+      .prepare("SELECT expires_at as expiresAt FROM asr_capture_sessions WHERE capture_session_id = ?")
+      .get(captureSessionId);
+    if (!session || String(session.expiresAt) < nowIso()) {
+      database.exec("ROLLBACK");
+      return false;
+    }
+
+    const limits = database
+      .prepare(`
+        SELECT
+          COUNT(*) as eventCount,
+          COALESCE(SUM(length(event_json)), 0) as eventChars
+        FROM asr_capture_events
+        WHERE capture_session_id = ?
+      `)
+      .get(captureSessionId);
+    if (Number(limits.eventCount) >= MAX_CAPTURE_EVENTS) {
+      database.exec("ROLLBACK");
+      return false;
+    }
+    if (Number(limits.eventChars) + eventJson.length > MAX_CAPTURE_EVENT_CHARS_TOTAL) {
+      database.exec("ROLLBACK");
+      return false;
+    }
+
+    const nextSequence = Number(
+      database
+        .prepare("SELECT COALESCE(MAX(sequence_no), 0) + 1 as nextSequence FROM asr_capture_events WHERE capture_session_id = ?")
+        .get(captureSessionId)?.nextSequence ?? 1
+    );
+    const receivedAt = nowIso();
+    database
+      .prepare(`
+        INSERT INTO asr_capture_events (
+          id, capture_session_id, sequence_no, event_json, received_at
+        ) VALUES (?, ?, ?, ?, ?)
+      `)
+      .run(`${captureSessionId}-${nextSequence}`, captureSessionId, nextSequence, eventJson, receivedAt);
+
+    database
+      .prepare(`
+        UPDATE asr_capture_sessions
+        SET updated_at = ?
+        WHERE capture_session_id = ?
+      `)
+      .run(receivedAt, captureSessionId);
+    database.exec("COMMIT");
+    return true;
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      // Preserve the original database error if rollback itself fails.
+    }
+    throw error;
   }
-
-  events.push({
-    receivedAt: nowIso(),
-    event,
-  });
-
-  database
-    .prepare(`
-      UPDATE asr_capture_sessions
-      SET raw_events_json = ?, updated_at = ?
-      WHERE capture_session_id = ?
-    `)
-    .run(JSON.stringify(events), nowIso(), captureSessionId);
 }
 
 export function finishCaptureSession(captureSessionId, status = "completed") {
