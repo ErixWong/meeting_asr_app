@@ -45,6 +45,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
     const segSpeakerId = seg.speakerId ?? null;
 
     if (
+      segSpeakerId !== null &&
       current &&
       current.speakerId === segSpeakerId &&
       current.isFinal
