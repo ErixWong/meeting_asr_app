@@ -8,7 +8,7 @@ services:
     image: node:24-slim
     working_dir: /app
     command: >
-      sh -c "test -d node_modules || npm ci --no-audit --no-fund;
+      sh -c "test -f node_modules/next/package.json || npm ci --no-audit --no-fund;
       test -f .next/BUILD_ID || npm run build;
       exec node server/app-server.mjs"
     environment:
@@ -16,6 +16,8 @@ services:
       APP_HOST: 0.0.0.0
       # 线上通过域名/IP 访问时，必须把实际 Origin 加进来，否则 WebSocket 握手被拒
       ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-http://localhost:3123}
+      # 直接通过 HTTP 访问时必须为 false；HTTPS 反向代理部署时设为 true
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       BOOTSTRAP_ADMIN_ACCOUNT: ${BOOTSTRAP_ADMIN_ACCOUNT:-admin}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
     ports:
