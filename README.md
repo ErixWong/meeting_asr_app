@@ -217,6 +217,18 @@ Browser-side `voiceprint.ts` performs speaker clustering:
 | `/change-password` | Change password page |
 | `/admin` | Admin panel: ASR/LLM/Mail config, prompts, hotwords, users & roles, audit logs |
 
+## Docs
+
+| Doc | Description |
+|:---|:---|
+| [Deployment Guide](./docs/deployment-guide.md) | Production deployment of this app (compose + .env + backup) |
+| [FunASR Deployment Guide](./docs/funasr-deployment.md) | Self-hosted FunASR online service setup & integration |
+| [FunASR Migration](./docs/funasr-migration.md) | DashScope → local FunASR adaptation notes |
+| [Technical Design](./docs/technical-design.md) | Architecture & module design |
+| [UI Interaction Design](./docs/ui-interaction-design.md) | Pages & interaction design |
+| [Auth Productization](./docs/auth-productization.md) | Auth & permission productization |
+| [Design Docs](./docs/design/) | ADRs: data flow, tenant isolation, perf & storage |
+
 ---
 
 ✌Bazinga！

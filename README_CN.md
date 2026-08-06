@@ -217,6 +217,18 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | `/change-password` | 修改密码页 |
 | `/admin` | 管理后台：ASR/LLM/邮件配置、提示词模板、热词、用户与角色、审计日志 |
 
+## 文档
+
+| 文档 | 说明 |
+|:---|:---|
+| [容器部署指南](./docs/deployment-guide.md) | 本应用的生产部署（compose + .env + 数据备份） |
+| [FunASR 本地部署指南](./docs/funasr-deployment.md) | 自建 FunASR 在线服务部署与接入 |
+| [FunASR 迁移记录](./docs/funasr-migration.md) | DashScope 迁移至本地 FunASR 的适配说明 |
+| [技术设计](./docs/technical-design.md) | 架构与模块设计 |
+| [UI 交互设计](./docs/ui-interaction-design.md) | 页面与交互设计 |
+| [认证产品化](./docs/auth-productization.md) | 认证与权限产品化方案 |
+| [设计决策](./docs/design/) | ADR：数据流、权限隔离、性能与存储等 |
+
 ---
 
 ✌Bazinga！
