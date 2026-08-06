@@ -10,7 +10,7 @@ interface Props {
 
 export default function DeviceSelector({ devices, value, onChange }: Props) {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2">
       <span className="text-sm text-slate-500">声卡</span>
       <select
         value={value}
@@ -23,6 +23,11 @@ export default function DeviceSelector({ devices, value, onChange }: Props) {
           </option>
         ))}
       </select>
+      {value === "speaker" && (
+        <span className="text-xs text-amber-600">
+          开始录音时会弹出共享窗口，请选择「整个屏幕」（可采到所有应用的声音）并确认共享声音
+        </span>
+      )}
     </div>
   );
 }
