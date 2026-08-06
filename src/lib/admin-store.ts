@@ -2218,6 +2218,8 @@ function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
     id: String(segment.id ?? `segment-${index}`),
     speaker: String(segment.speaker ?? ""),
     speakerId: typeof segment.speakerId === "number" ? segment.speakerId : null,
+    source: segment.source === "speaker" ? "speaker" : segment.source === "mic" ? "mic" : undefined,
+    deviceId: typeof segment.deviceId === "string" && segment.deviceId ? segment.deviceId : undefined,
     text: String(segment.text ?? ""),
     time: String(segment.time ?? ""),
     timeSeconds: Number.isFinite(Number(segment.timeSeconds)) ? Number(segment.timeSeconds) : 0,

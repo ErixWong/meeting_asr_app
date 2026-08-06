@@ -64,7 +64,7 @@ class ApiRequestError extends Error {
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
-  const [device, setDevice] = useState("default");
+  const [selectedDevices, setSelectedDevices] = useState<string[]>([]);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -90,15 +90,15 @@ export default function MeetingPage() {
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const asrClientRef = useRef<FunASRClient | null>(null);
+  const asrClientsRef = useRef<Map<string, FunASRClient>>(new Map());
   const segmentsRef = useRef<TranscriptSegment[]>([]);
   const elapsedRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectedMeetingIdRef = useRef<string | null>(null);
   const summaryGeneratingRef = useRef(false);
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
-  const voiceprintFeaturesRef = useRef<VoiceprintFeature[]>([]);
-  const speakerIdsRef = useRef<number[]>([]);
+  const voiceprintFeaturesRef = useRef<Map<string, VoiceprintFeature[]>>(new Map());
+  const speakerIdsRef = useRef<Map<string, number[]>>(new Map());
   const partialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPartialRef = useRef<PendingPartial | null>(null);
   const transcriptGenerationRef = useRef(0);
@@ -236,7 +236,7 @@ export default function MeetingPage() {
   const saveAsrCheckpoint = useCallback(async (segments: TranscriptSegment[], errorMessage: string) => {
     if (segments.length === 0 || !segments.some((segment) => segment.text.trim())) return;
 
-    const captureSessionId = asrClientRef.current?.getCaptureSessionId() || `capture-${Date.now()}`;
+    const captureSessionId = asrClientsRef.current.values().next().value?.getCaptureSessionId() || `capture-${Date.now()}`;
     let meetingId = persistedMeetingIdRef.current;
 
     if (!meetingId) {
@@ -371,7 +371,7 @@ export default function MeetingPage() {
         mapped.push({ deviceId: "default", label: "默认麦克风" });
       }
       setDevices(mapped);
-      if (mapped.length > 0) setDevice(mapped[0].deviceId);
+      setSelectedDevices((prev) => prev.length > 0 ? prev : mapped.map((d) => d.deviceId));
     });
 
     loadRuntimeConfig().catch(console.error);
@@ -396,7 +396,10 @@ export default function MeetingPage() {
       });
 
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
     };
   }, [loadRuntimeConfig, requestJson, showNotice]);
 
@@ -417,6 +420,14 @@ export default function MeetingPage() {
       return;
     }
 
+    const activeDevices = selectedDevices.length > 0
+      ? selectedDevices
+      : devices.map((d) => d.deviceId);
+    if (activeDevices.length === 0) {
+      showNotice("error", "请至少勾选一个采集来源");
+      return;
+    }
+
     setStatus("connecting");
     setAsrErrorMessage(null);
     resetTranscriptScheduler();
@@ -428,88 +439,114 @@ export default function MeetingPage() {
       setLiveSegments([]);
       selectedMeetingIdRef.current = null;
       setSelected(null);
-      voiceprintFeaturesRef.current = [];
-      speakerIdsRef.current = [];
+      voiceprintFeaturesRef.current = new Map();
+      speakerIdsRef.current = new Map();
     }
 
+    const clients = new Map<string, FunASRClient>();
+    asrClientsRef.current = clients;
+    const started: FunASRClient[] = [];
+
     try {
-      const client = new FunASRClient();
-      asrClientRef.current = client;
+      for (const deviceId of activeDevices) {
+        const client = new FunASRClient();
+        clients.set(deviceId, client);
+        const source: "mic" | "speaker" = deviceId === "speaker" ? "speaker" : "mic";
+        const channelKey = deviceId;
 
-      await client.startRecording(
-        {
-          onResult: (text, isFinal, speakerId, audioData) => {
-            if (recordingSession !== transcriptSessionRef.current) return;
+        await client.startRecording(
+          {
+            onResult: (text, isFinal, speakerId, audioData) => {
+              if (recordingSession !== transcriptSessionRef.current) return;
 
-            let clusterSpeakerId = speakerId;
+              let clusterSpeakerId = speakerId;
 
-            if (isFinal && audioData && audioData.length > 1000) {
-              try {
-                const features = extractFeatures(audioData, 16000);
-                voiceprintFeaturesRef.current.push(features);
+              if (isFinal && audioData && audioData.length > 1000) {
+                try {
+                  const features = extractFeatures(audioData, 16000);
+                  const channelFeatures = voiceprintFeaturesRef.current.get(channelKey) ?? [];
+                  channelFeatures.push(features);
+                  voiceprintFeaturesRef.current.set(channelKey, channelFeatures);
 
-                if (voiceprintFeaturesRef.current.length >= 2) {
-                  const ids = clusterSpeakers(voiceprintFeaturesRef.current, 0.6);
-                  speakerIdsRef.current = ids;
-                  clusterSpeakerId = ids[ids.length - 1];
-                } else {
-                  speakerIdsRef.current = [0];
-                  clusterSpeakerId = 0;
-                }
-              } catch (e) {
-                console.warn("[Voiceprint] Feature extraction failed:", e);
-              }
-            }
-
-            handleTranscriptResult({
-              text,
-              isFinal,
-              speakerId: clusterSpeakerId,
-              time: formatTime(elapsedRef.current),
-              timeSeconds: elapsedRef.current,
-            });
-          },
-          onError: (error) => {
-            console.error("FunASR error:", error);
-            if (timerRef.current) clearInterval(timerRef.current);
-            const checkpointSegments = materializeCheckpointTranscript();
-            resetTranscriptScheduler();
-            asrRecoveryRef.current = true;
-            setAsrErrorMessage(error.message);
-            setStatus("paused");
-            showNotice("error", `ASR 连接失败，录音已暂停: ${error.message}`);
-
-            if (!checkpointPromiseRef.current) {
-              const checkpointPromise = saveAsrCheckpoint(checkpointSegments, error.message);
-              checkpointPromiseRef.current = checkpointPromise;
-              void checkpointPromise
-                .catch((checkpointError) => {
-                  const message = checkpointError instanceof Error ? checkpointError.message : String(checkpointError);
-                  setAsrErrorMessage(`${error.message}（自动保存失败：${message}）`);
-                  showNotice("error", `ASR 已暂停，但自动保存失败: ${message}`);
-                })
-                .finally(() => {
-                  if (checkpointPromiseRef.current === checkpointPromise) {
-                    checkpointPromiseRef.current = null;
+                  if (channelFeatures.length >= 2) {
+                    const ids = clusterSpeakers(channelFeatures, 0.6);
+                    speakerIdsRef.current.set(channelKey, ids);
+                    clusterSpeakerId = ids[ids.length - 1];
+                  } else {
+                    speakerIdsRef.current.set(channelKey, [0]);
+                    clusterSpeakerId = 0;
                   }
-                });
-            }
+                } catch (e) {
+                  console.warn("[Voiceprint] Feature extraction failed:", e);
+                }
+              }
+
+              handleTranscriptResult({
+                text,
+                isFinal,
+                speakerId: clusterSpeakerId,
+                source,
+                deviceId: source === "mic" ? deviceId : undefined,
+                time: formatTime(elapsedRef.current),
+                timeSeconds: elapsedRef.current,
+              });
+            },
+            onError: (error) => {
+              console.error("FunASR error:", error);
+              for (const activeClient of asrClientsRef.current.values()) {
+                activeClient.stopRecording().catch((e) => console.warn("Failed to stop ASR session:", e));
+              }
+              asrClientsRef.current = new Map();
+              if (timerRef.current) {
+                clearInterval(timerRef.current);
+                timerRef.current = null;
+              }
+              const checkpointSegments = materializeCheckpointTranscript();
+              resetTranscriptScheduler();
+              asrRecoveryRef.current = true;
+              setAsrErrorMessage(error.message);
+              setStatus("paused");
+              showNotice("error", `ASR 连接失败，录音已暂停: ${error.message}`);
+
+              if (!checkpointPromiseRef.current) {
+                const checkpointPromise = saveAsrCheckpoint(checkpointSegments, error.message);
+                checkpointPromiseRef.current = checkpointPromise;
+                void checkpointPromise
+                  .catch((checkpointError) => {
+                    const message = checkpointError instanceof Error ? checkpointError.message : String(checkpointError);
+                    setAsrErrorMessage(`${error.message}（自动保存失败：${message}）`);
+                    showNotice("error", `ASR 已暂停，但自动保存失败: ${message}`);
+                  })
+                  .finally(() => {
+                    if (checkpointPromiseRef.current === checkpointPromise) {
+                      checkpointPromiseRef.current = null;
+                    }
+                  });
+              }
+            },
+            onStatusChange: (s) => {
+              if (s === "recording") {
+                setStatus("recording");
+                if (timerRef.current === null) {
+                  if (!preserveTranscript) setElapsed(0);
+                  timerRef.current = setInterval(
+                    () => setElapsed((e) => e + 1),
+                    1000
+                  );
+                }
+              }
+            },
           },
-          onStatusChange: (s) => {
-            if (s === "recording") {
-              setStatus("recording");
-              if (!preserveTranscript) setElapsed(0);
-              timerRef.current = setInterval(
-                () => setElapsed((e) => e + 1),
-                1000
-              );
-            }
-          },
-        },
-        device
-      );
+          deviceId
+        );
+        started.push(client);
+      }
     } catch (error) {
       console.error("Failed to start recording:", error);
+      for (const activeClient of started) {
+        activeClient.stopRecording().catch((e) => console.warn("Failed to clean up ASR session:", e));
+      }
+      asrClientsRef.current = new Map();
       resetTranscriptScheduler();
       if (preserveTranscript) {
         asrRecoveryRef.current = true;
@@ -525,7 +562,8 @@ export default function MeetingPage() {
     }
   }, [
     asrReady,
-    device,
+    devices,
+    selectedDevices,
     handleTranscriptResult,
     loadRuntimeConfig,
     materializeCheckpointTranscript,
@@ -535,12 +573,16 @@ export default function MeetingPage() {
   ]);
 
   const pauseRecording = useCallback(() => {
-    if (asrClientRef.current) {
-      asrRecoveryRef.current = false;
-      setAsrErrorMessage(null);
-      asrClientRef.current.pause();
-      setStatus("paused");
-      if (timerRef.current) clearInterval(timerRef.current);
+    if (asrClientsRef.current.size === 0) return;
+    asrRecoveryRef.current = false;
+    setAsrErrorMessage(null);
+    for (const activeClient of asrClientsRef.current.values()) {
+      activeClient.pause();
+    }
+    setStatus("paused");
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
     }
   }, []);
 
@@ -552,22 +594,22 @@ export default function MeetingPage() {
         });
       }
 
-      const failedClient = asrClientRef.current;
-      asrClientRef.current = null;
-
-      if (failedClient) {
-        await failedClient.stopRecording().catch((error) => {
+      for (const activeClient of asrClientsRef.current.values()) {
+        await activeClient.stopRecording().catch((error) => {
           console.warn("Failed to clean up failed ASR session:", error);
         });
       }
+      asrClientsRef.current = new Map();
 
       await startRecording(true);
       return;
     }
 
-    if (asrClientRef.current) {
+    if (asrClientsRef.current.size > 0) {
       setAsrErrorMessage(null);
-      asrClientRef.current.resume();
+      for (const activeClient of asrClientsRef.current.values()) {
+        activeClient.resume();
+      }
       setStatus("recording");
       timerRef.current = setInterval(
         () => setElapsed((e) => e + 1),
@@ -583,15 +625,20 @@ export default function MeetingPage() {
       });
     }
 
-    if (timerRef.current) clearInterval(timerRef.current);
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
     setStatus("generating");
 
     let recordingCaptureSessionId = "";
-    if (asrClientRef.current) {
-      const currentClient = asrClientRef.current;
-      await currentClient.stopRecording();
-      recordingCaptureSessionId = currentClient.getCaptureSessionId();
-      asrClientRef.current = null;
+    if (asrClientsRef.current.size > 0) {
+      const firstClient = asrClientsRef.current.values().next().value;
+      for (const activeClient of asrClientsRef.current.values()) {
+        await activeClient.stopRecording();
+      }
+      recordingCaptureSessionId = firstClient?.getCaptureSessionId() ?? "";
+      asrClientsRef.current = new Map();
     }
 
     resetTranscriptScheduler();
@@ -826,7 +873,7 @@ export default function MeetingPage() {
     setSelected(null);
 
     const client = new FunASRClient();
-    asrClientRef.current = client;
+    asrClientsRef.current = new Map([["upload", client]]);
 
     const allSegments: TranscriptSegment[] = [];
 
@@ -903,7 +950,11 @@ export default function MeetingPage() {
       setStatus("idle");
     } catch (err) {
       console.error("Upload transcribe failed:", err);
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      asrClientsRef.current = new Map();
       flushPendingPartial();
       resetTranscriptScheduler();
       showNotice("error", `音频识别失败: ${(err as Error).message}`);
@@ -1067,7 +1118,10 @@ export default function MeetingPage() {
   }, [loadLlmResults, requestJson, selected, selectedLlmResultId, showNotice, summaryText]);
 
   const selectedDeviceLabel =
-    devices.find((d) => d.deviceId === device)?.label ?? "";
+    devices
+      .filter((d) => selectedDevices.includes(d.deviceId))
+      .map((d) => d.label)
+      .join("、") || "未选择";
   const selectedStatusMeta = selected ? getMeetingStatusMeta(selected.status) : null;
   const noticeClassName =
     notice?.type === "success"
@@ -1498,8 +1552,9 @@ export default function MeetingPage() {
                   <div className="flex flex-wrap items-center gap-3">
                     <DeviceSelector
                       devices={devices}
-                      value={device}
-                      onChange={setDevice}
+                      selected={selectedDevices}
+                      onChange={setSelectedDevices}
+                      disabled={status === "recording" || status === "paused" || status === "connecting"}
                     />
                     {status === "recording" && (
                       <div className="flex items-center gap-1 text-xs text-slate-400">

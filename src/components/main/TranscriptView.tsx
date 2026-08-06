@@ -13,6 +13,8 @@ interface MergedParagraph {
   time: string;
   timeSeconds: number;
   speakerId: number | null;
+  source: "mic" | "speaker" | undefined;
+  deviceId?: string;
   text: string;
   isFinal: boolean;
 }
@@ -43,10 +45,13 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
 
   for (const seg of segments) {
     const segSpeakerId = seg.speakerId ?? null;
+    const segSource = seg.source ?? undefined;
 
     if (
-      segSpeakerId !== null &&
       current &&
+      segSource === current.source &&
+      seg.deviceId === current.deviceId &&
+      segSpeakerId !== null &&
       current.speakerId === segSpeakerId &&
       current.isFinal
     ) {
@@ -61,6 +66,8 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
         time: seg.time,
         timeSeconds: seg.timeSeconds,
         speakerId: segSpeakerId,
+        source: segSource,
+        deviceId: seg.deviceId,
         text: seg.text,
         isFinal: seg.isFinal,
       };
@@ -116,11 +123,27 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
               {para.time}
             </div>
             <div className="min-w-0 flex-1">
-              {para.speakerId !== null && (
-                <div className={`mb-0.5 text-xs font-medium ${SPEAKER_COLORS[para.speakerId % SPEAKER_COLORS.length]}`}>
-                  {getSpeakerLabel(para.speakerId)}
-                </div>
-              )}
+              <div className="mb-0.5 flex flex-wrap items-center gap-2 text-xs">
+                {para.source !== undefined && (
+                  <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium ${
+                    para.source === "speaker"
+                      ? "bg-violet-50 text-violet-600"
+                      : "bg-sky-50 text-sky-600"
+                  }`}>
+                    {para.source === "speaker" ? "🔊 系统声音" : "🎤 麦克风"}
+                  </span>
+                )}
+                {para.speakerId !== null && (
+                  <span className={`font-medium ${SPEAKER_COLORS[para.speakerId % SPEAKER_COLORS.length]}`}>
+                    {getSpeakerLabel(para.speakerId)}
+                  </span>
+                )}
+                {para.deviceId && (
+                  <span className="text-slate-400" title={para.deviceId}>
+                    {para.deviceId.length > 16 ? `${para.deviceId.slice(0, 16)}…` : para.deviceId}
+                  </span>
+                )}
+              </div>
               <div className="text-[15px] leading-relaxed text-slate-700">
                 {para.text}
                 {!para.isFinal && (
