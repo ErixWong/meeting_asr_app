@@ -1598,14 +1598,26 @@ export default function MeetingPage() {
                     </button>
                   </div>
                  </div>
-                {speakerEnabled && (status === "idle" || status === "done") && (
+                {(status === "idle" || status === "done") && (
                   <div className="border-b border-slate-100 bg-amber-50 px-4 py-2 text-xs text-amber-600">
-                    <div className="font-medium">系统声音开启：</div>
-                    <ol className="ml-4 list-decimal">
-                      <li>开始录音时会弹出共享窗口</li>
-                      <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
-                      <li>并确认共享声音</li>
-                    </ol>
+                    <div className="font-medium">采集说明：</div>
+                    <ul className="ml-4 list-disc">
+                      <li>🎤 麦克风：录制本地声音（你自己的发言）</li>
+                      <li>
+                        🔊 系统声音：录制扬声器播放的声音。网络会议中对方说话的声音在扬声器里，
+                        要采集对方的声音，请选择录制系统声音
+                      </li>
+                    </ul>
+                    {speakerEnabled && (
+                      <>
+                        <div className="mt-1 font-medium">系统声音开启：</div>
+                        <ol className="ml-4 list-decimal">
+                          <li>开始录音时会弹出共享窗口</li>
+                          <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
+                          <li>并确认共享声音</li>
+                        </ol>
+                      </>
+                    )}
                   </div>
                 )}
                 {status === "recording" || status === "paused" || status === "connecting" ? (
