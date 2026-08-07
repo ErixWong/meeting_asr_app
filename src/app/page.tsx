@@ -65,7 +65,7 @@ export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
-  const [speakerEnabled, setSpeakerEnabled] = useState(true);
+  const [speakerEnabled, setSpeakerEnabled] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
