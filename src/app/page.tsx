@@ -64,7 +64,8 @@ class ApiRequestError extends Error {
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
-  const [selectedDevices, setSelectedDevices] = useState<string[]>([]);
+  const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
+  const [speakerEnabled, setSpeakerEnabled] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -371,7 +372,10 @@ export default function MeetingPage() {
         mapped.push({ deviceId: "default", label: "默认麦克风" });
       }
       setDevices(mapped);
-      setSelectedDevices((prev) => prev.length > 0 ? prev : mapped.map((d) => d.deviceId));
+      setMicDeviceId((prev) => {
+        if (prev !== null && mapped.some((d) => d.deviceId === prev)) return prev;
+        return mapped.find((d) => d.deviceId !== "speaker")?.deviceId ?? null;
+      });
     });
 
     loadRuntimeConfig().catch(console.error);
@@ -420,11 +424,11 @@ export default function MeetingPage() {
       return;
     }
 
-    const activeDevices = selectedDevices.length > 0
-      ? selectedDevices
-      : devices.map((d) => d.deviceId);
+    const activeDevices: string[] = [];
+    if (micDeviceId) activeDevices.push(micDeviceId);
+    if (speakerEnabled) activeDevices.push("speaker");
     if (activeDevices.length === 0) {
-      showNotice("error", "请至少勾选一个采集来源");
+      showNotice("error", "请至少选择一个采集来源");
       return;
     }
 
@@ -562,8 +566,8 @@ export default function MeetingPage() {
     }
   }, [
     asrReady,
-    devices,
-    selectedDevices,
+    micDeviceId,
+    speakerEnabled,
     handleTranscriptResult,
     loadRuntimeConfig,
     materializeCheckpointTranscript,
@@ -1117,11 +1121,15 @@ export default function MeetingPage() {
     }
   }, [loadLlmResults, requestJson, selected, selectedLlmResultId, showNotice, summaryText]);
 
-  const selectedDeviceLabel =
-    devices
-      .filter((d) => selectedDevices.includes(d.deviceId))
-      .map((d) => d.label)
-      .join("、") || "未选择";
+  const selectedDeviceLabel = (() => {
+    const parts: string[] = [];
+    if (micDeviceId) {
+      const label = devices.find((d) => d.deviceId === micDeviceId)?.label ?? micDeviceId;
+      parts.push(`🎤 ${label}`);
+    }
+    if (speakerEnabled) parts.push("🔊 系统声音");
+    return parts.join("、") || "未选择";
+  })();
   const selectedStatusMeta = selected ? getMeetingStatusMeta(selected.status) : null;
   const noticeClassName =
     notice?.type === "success"
@@ -1552,8 +1560,10 @@ export default function MeetingPage() {
                   <div className="flex flex-wrap items-center gap-3">
                     <DeviceSelector
                       devices={devices}
-                      selected={selectedDevices}
-                      onChange={setSelectedDevices}
+                      micDeviceId={micDeviceId}
+                      onMicChange={setMicDeviceId}
+                      speakerEnabled={speakerEnabled}
+                      onSpeakerChange={setSpeakerEnabled}
                       disabled={status === "recording" || status === "paused" || status === "connecting"}
                     />
                     {status === "recording" && (
