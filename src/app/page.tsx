@@ -1290,13 +1290,15 @@ export default function MeetingPage() {
   }, [selected?.status, translationGenerating]);
 
   useEffect(() => {
-    const succeeded = llmResults.filter((item) => item.resultType === "translation" && item.status === "succeeded");
-    if (succeeded.length === 0) {
+    const done = llmResults.filter(
+      (item) => item.resultType === "translation" && (item.status === "succeeded" || item.status === "failed")
+    );
+    if (done.length === 0) {
       setSelectedTranslationId(null);
       return;
     }
-    const latest = succeeded[succeeded.length - 1];
-    setSelectedTranslationId((prev) => (prev && succeeded.some((item) => item.id === prev) ? prev : latest.id));
+    const latest = done[done.length - 1];
+    setSelectedTranslationId((prev) => (prev && done.some((item) => item.id === prev) ? prev : latest.id));
   }, [llmResults]);
 
   const sendSummary = useCallback(async () => {
@@ -1360,6 +1362,7 @@ export default function MeetingPage() {
   const selectedTranslation =
     translationVersions.find((item) => item.id === selectedTranslationId) ??
     translationVersions.filter((item) => item.status === "succeeded").slice(-1)[0] ??
+    translationVersions.slice(-1)[0] ??
     null;
   const selectedPromptTemplate =
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
