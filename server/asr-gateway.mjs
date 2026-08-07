@@ -75,8 +75,13 @@ function sendAppMessage(clientWs, type, payload = {}) {
   clientWs.send(JSON.stringify({ type, ...payload }));
 }
 
-function extractSpeakerId(message) {
-  if (typeof message?.speaker_id === "number") return message.speaker_id;
+// FunASR SenseVoice 输出以 <|lang|><|emotion|><|event|> 前缀标记语言/情感/事件，
+// 属模型控制 token 而非说话内容；转发给前端前剥离，原始消息已由 capture events 保留
+function stripSenseVoiceTokens(text) {
+  return String(text).replace(/<\|[^|]*\|>/g, "").trim();
+}
+
+function extractSpeakerId(message) {  if (typeof message?.speaker_id === "number") return message.speaker_id;
   if (typeof message?.spk === "number") return message.spk;
   if (Array.isArray(message?.stamp_sents)) {
     const segment = message.stamp_sents.find((item) => typeof item?.spk === "number");
@@ -179,13 +184,14 @@ function buildDashScopeFinishMessage(sessionId) {
 function parseLocalFunasrTranscript(message) {
   const mode = typeof message?.mode === "string" ? message.mode.toLowerCase() : "";
   const isFinal = Boolean(message?.is_final) || Boolean(message?.is_eof) || mode.includes("offline");
-  const text = typeof message?.text === "string"
+  const rawText = typeof message?.text === "string"
     ? message.text
     : typeof message?.text_2pass === "string"
       ? message.text_2pass
       : typeof message?.asr_result === "string"
         ? message.asr_result
         : "";
+  const text = stripSenseVoiceTokens(rawText);
 
   if (!text) return { transcript: null, isFinal };
 

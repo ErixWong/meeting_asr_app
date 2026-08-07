@@ -31,6 +31,10 @@ const SPEAKER_COLORS = [
 ];
 const AUTO_SCROLL_THRESHOLD_PX = 48;
 
+function stripSenseVoiceTokens(text: string): string {
+  return text.replace(/<\|[^|]*\|>/g, "").trim();
+}
+
 function getSpeakerLabel(speakerId: number | null): string {
   if (speakerId === null || speakerId === undefined) return "";
   const labels = "ABCDEFGH";
@@ -55,7 +59,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
       current.speakerId === segSpeakerId &&
       current.isFinal
     ) {
-      current.text += seg.text;
+      current.text += stripSenseVoiceTokens(seg.text);
       current.isFinal = seg.isFinal;
     } else {
       if (current) {
@@ -68,7 +72,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
         speakerId: segSpeakerId,
         source: segSource,
         deviceId: seg.deviceId,
-        text: seg.text,
+        text: stripSenseVoiceTokens(seg.text),
         isFinal: seg.isFinal,
       };
     }
