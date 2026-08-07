@@ -15,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body className="min-h-screen bg-slate-50">
-        <div className="flex min-h-screen flex-col">
+        <div className="flex h-screen flex-col">
           <AppHeader />
           {children}
         </div>

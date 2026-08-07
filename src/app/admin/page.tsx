@@ -999,7 +999,7 @@ export default function AdminPage() {
   }
 
   return (
-    <div className="flex-1 bg-slate-50">
+    <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50">
       <div className="mx-auto max-w-6xl space-y-5 p-6">
         <SectionTabs value={activeTab} onChange={setActiveTab} />
 
