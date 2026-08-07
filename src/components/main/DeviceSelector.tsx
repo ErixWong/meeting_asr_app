@@ -51,7 +51,6 @@ export default function DeviceSelector({
 }: Props) {
   const mics = devices.filter((d) => d.deviceId !== "speaker");
   const sameAsSource = asrLang !== "auto" && asrLang === targetLang;
-
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
       <span className="text-sm text-slate-500">采集</span>
@@ -98,19 +97,19 @@ export default function DeviceSelector({
           ))}
         </select>
       </label>
-      <label className="flex items-center gap-1 text-sm text-slate-600" title={sameAsSource ? "目标语言与识别语种相同，翻译不可用" : undefined}>
+      <label className="flex items-center gap-1 text-sm text-slate-600" title={sameAsSource ? "目标语言与识别语种相同，勾选后将自动切换" : undefined}>
         <input
           type="checkbox"
-          checked={translationEnabled && !sameAsSource}
+          checked={translationEnabled}
           onChange={(e) => onTranslationChange(e.target.checked)}
-          disabled={disabled || sameAsSource}
+          disabled={disabled}
           className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand disabled:opacity-60"
         />
         自动翻译
         <select
           value={targetLang}
           onChange={(e) => onTargetLangChange(e.target.value)}
-          disabled={disabled || sameAsSource}
+          disabled={disabled}
           className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
         >
           {TRANSLATE_LANGUAGES.map((lang) => (

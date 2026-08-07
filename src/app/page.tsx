@@ -137,33 +137,52 @@ export default function MeetingPage() {
     setNotice({ type, message });
   }, []);
 
-  const handleTranslationChange = useCallback((enabled: boolean) => {
-    translationEnabledRef.current = enabled;
-    setTranslationEnabled(enabled);
-    if (!enabled) {
-      resetTranslateRef.current();
-    }
-  }, []);
+  const pickFallbackTargetLang = useCallback((lang: string) => (lang === "en" ? "zh" : "en"), []);
 
-  const handleTargetLangChange = useCallback((lang: string) => {
-    targetLangRef.current = lang;
-    setTargetLang(lang);
-    if (asrLangRef.current !== "auto" && lang === asrLangRef.current && translationEnabledRef.current) {
-      translationEnabledRef.current = false;
-      setTranslationEnabled(false);
-      resetTranslateRef.current();
-    }
-  }, []);
+  const handleTranslationChange = useCallback(
+    (enabled: boolean) => {
+      if (enabled && asrLangRef.current !== "auto" && asrLangRef.current === targetLangRef.current) {
+        const next = pickFallbackTargetLang(asrLangRef.current);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言与识别语种相同，已自动切换");
+      }
+      translationEnabledRef.current = enabled;
+      setTranslationEnabled(enabled);
+      if (!enabled) {
+        resetTranslateRef.current();
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
 
-  const handleAsrLangChange = useCallback((lang: string) => {
-    asrLangRef.current = lang;
-    setAsrLang(lang);
-    if (lang !== "auto" && lang === targetLangRef.current && translationEnabledRef.current) {
-      translationEnabledRef.current = false;
-      setTranslationEnabled(false);
-      resetTranslateRef.current();
-    }
-  }, []);
+  const handleTargetLangChange = useCallback(
+    (lang: string) => {
+      targetLangRef.current = lang;
+      setTargetLang(lang);
+      if (asrLangRef.current !== "auto" && lang === asrLangRef.current) {
+        const next = pickFallbackTargetLang(lang);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言不能与识别语种相同，已自动切换");
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
+
+  const handleAsrLangChange = useCallback(
+    (lang: string) => {
+      asrLangRef.current = lang;
+      setAsrLang(lang);
+      if (lang !== "auto" && lang === targetLangRef.current && translationEnabledRef.current) {
+        const next = pickFallbackTargetLang(lang);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言与识别语种相同，已自动切换");
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
 
   const updateSummaryGenerating = useCallback((value: boolean, meetingId?: string | null) => {
     summaryGeneratingRef.current = value;
