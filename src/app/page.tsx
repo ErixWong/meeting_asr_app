@@ -87,6 +87,7 @@ export default function MeetingPage() {
   const [targetLang, setTargetLang] = useState<string>("en");
   const [translations, setTranslations] = useState<TranslationBlock[]>([]);
   const [llmQueueInfo, setLlmQueueInfo] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
+  const [lastTranslateElapsedMs, setLastTranslateElapsedMs] = useState<number | null>(null);
   const [historyTranslateLang, setHistoryTranslateLang] = useState("en");
   const [selectedTranslationId, setSelectedTranslationId] = useState<string | null>(null);
   const [translationGenerating, setTranslationGenerating] = useState(false);
@@ -298,11 +299,14 @@ export default function MeetingPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sentences: batch.map((item) => item.text), targetLang: targetLangCode }),
         });
-        const data = (await res.json().catch(() => ({}))) as { error?: unknown; text?: unknown };
+        const data = (await res.json().catch(() => ({}))) as { error?: unknown; text?: unknown; elapsedMs?: unknown };
         if (!res.ok) throw new Error(String(data.error ?? `HTTP ${res.status}`));
         const text = String(data.text ?? "").trim();
         if (!text) throw new Error("Empty translation response");
         if (generation !== translateGenerationRef.current) return;
+        if (typeof data.elapsedMs === "number" && Number.isFinite(data.elapsedMs)) {
+          setLastTranslateElapsedMs(data.elapsedMs);
+        }
         setTranslations((prev) => [
           ...prev,
           {
@@ -2076,6 +2080,9 @@ export default function MeetingPage() {
                               }`}
                             >
                               队列 {llmQueueInfo.queued} · 处理中 {llmQueueInfo.inFlight}
+                              {lastTranslateElapsedMs !== null && (
+                                <span className="ml-1">· 最近 {(lastTranslateElapsedMs / 1000).toFixed(1)}s</span>
+                              )}
                             </span>
                           )}
                         </span>

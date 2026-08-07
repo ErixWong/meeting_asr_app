@@ -840,7 +840,12 @@ const TRANSLATE_TARGET_LABELS: Record<string, string> = {
   ko: "韩语",
 };
 
-export async function translateSentences(sentences: string[], targetLang: string): Promise<string> {
+export interface TranslateResult {
+  text: string;
+  elapsedMs: number;
+}
+
+export async function translateSentences(sentences: string[], targetLang: string): Promise<TranslateResult> {
   const baseUrl = getSettingValue("llm", "base_url");
   const apiKey = getSettingValue("llm", "api_key");
   const model = getSettingValue("llm", "model");
@@ -852,6 +857,7 @@ export async function translateSentences(sentences: string[], targetLang: string
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
+  const requestStartedAt = Date.now();
   try {
     const { status, text } = await llmRequest(endpoint, {
       method: "POST",
@@ -879,7 +885,7 @@ export async function translateSentences(sentences: string[], targetLang: string
     const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
     const translated = String(parsed.choices?.[0]?.message?.content ?? "").trim();
     if (!translated) throw new Error("LLM returned empty translation");
-    return translated;
+    return { text: translated, elapsedMs: Date.now() - requestStartedAt };
   } finally {
     clearTimeout(timer);
   }
@@ -2631,7 +2637,7 @@ async function translateMeetingFlow(
     // 嵌套入队会在多任务并发时因槽位被外层占用导致 30s 排队超时，任务必失败）
     const translations: string[] = [];
     for (const batch of batches) {
-      translations.push(await translateSentences(batch, lang));
+      translations.push((await translateSentences(batch, lang)).text);
     }
     const resultMarkdown = translations.join("\n\n");
     if (!resultMarkdown.trim()) {
