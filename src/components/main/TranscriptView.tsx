@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useMemo } from "react";
+import { useLayoutEffect, useRef, useMemo } from "react";
 import { TranscriptSegment } from "@/types";
 
 interface Props {
@@ -31,6 +31,10 @@ const SPEAKER_COLORS = [
 ];
 const AUTO_SCROLL_THRESHOLD_PX = 48;
 
+function stripSenseVoiceTokens(text: string): string {
+  return text.replace(/<\|[^|]*\|>/g, "").trim();
+}
+
 function getSpeakerLabel(speakerId: number | null): string {
   if (speakerId === null || speakerId === undefined) return "";
   const labels = "ABCDEFGH";
@@ -44,6 +48,8 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
   let current: MergedParagraph | null = null;
 
   for (const seg of segments) {
+    const cleanText = stripSenseVoiceTokens(seg.text);
+    if (!cleanText) continue;
     const segSpeakerId = seg.speakerId ?? null;
     const segSource = seg.source ?? undefined;
 
@@ -55,7 +61,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
       current.speakerId === segSpeakerId &&
       current.isFinal
     ) {
-      current.text += seg.text;
+      current.text += cleanText;
       current.isFinal = seg.isFinal;
     } else {
       if (current) {
@@ -68,7 +74,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
         speakerId: segSpeakerId,
         source: segSource,
         deviceId: seg.deviceId,
-        text: seg.text,
+        text: cleanText,
         isFinal: seg.isFinal,
       };
     }
@@ -87,7 +93,7 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
 
   const paragraphs = useMemo(() => mergeSegments(segments), [segments]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (segments.length === 0) {
       shouldAutoScrollRef.current = true;
       return;

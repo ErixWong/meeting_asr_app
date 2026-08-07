@@ -56,7 +56,7 @@ export default function LoginPage() {
   };
 
   return (
-    <main className="min-h-screen bg-[#eef3f8] p-3 text-slate-900 sm:p-5 lg:p-8">
+    <main className="min-h-screen overflow-y-auto bg-[#eef3f8] p-3 text-slate-900 sm:p-5 lg:p-8">
       <div className="mx-auto grid min-h-[calc(100vh-1.5rem)] max-w-6xl overflow-hidden rounded-[2rem] bg-white shadow-[0_24px_80px_-32px_rgba(15,23,42,0.45)] sm:min-h-[calc(100vh-2.5rem)] lg:grid-cols-[1.08fr_0.92fr]">
         <section className="relative hidden overflow-hidden bg-[#10253f] p-10 text-white lg:flex lg:flex-col lg:justify-between xl:p-14">
           <div className="absolute -right-24 -top-24 h-80 w-80 rounded-full bg-cyan-400/10 blur-3xl" />

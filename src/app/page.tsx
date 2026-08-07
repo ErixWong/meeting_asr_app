@@ -24,6 +24,7 @@ import DeviceSelector from "@/components/main/DeviceSelector";
 import MarkdownPreview from "@/components/main/MarkdownPreview";
 import RecordingControls from "@/components/main/RecordingControls";
 import TranscriptView from "@/components/main/TranscriptView";
+import TranslationView, { TranslationBlock } from "@/components/main/TranslationView";
 import HistoryList from "@/components/main/HistoryList";
 import AsrResultDetailView from "@/components/main/AsrResultDetailView";
 import { formatTime } from "@/components/main/RecordingControls";
@@ -31,6 +32,15 @@ import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
+const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
+const TRANSLATE_BUFFER_CHARS_MAX = 2000;
+const SYSTEM_TRANSLATE_TEMPLATE_ID = "tpl-translate";
+const HISTORY_TRANSLATE_LANGS = [
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英文" },
+  { value: "ja", label: "日语" },
+  { value: "ko", label: "韩语" },
+];
 
 function formatAsrCreatedAt(value?: string) {
   if (!value) return "-";
@@ -51,6 +61,12 @@ type PendingPartial = TranscriptResult & {
   generation: number;
 };
 
+type PendingTranslation = {
+  text: string;
+  time: string;
+  timeSeconds: number;
+};
+
 class ApiRequestError extends Error {
   status: number;
 
@@ -67,6 +83,13 @@ export default function MeetingPage() {
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
   const [speakerEnabled, setSpeakerEnabled] = useState(false);
   const [asrLang, setAsrLang] = useState<string>("auto");
+  const [translationEnabled, setTranslationEnabled] = useState(false);
+  const [targetLang, setTargetLang] = useState<string>("en");
+  const [translations, setTranslations] = useState<TranslationBlock[]>([]);
+  const [llmQueueInfo, setLlmQueueInfo] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
+  const [historyTranslateLang, setHistoryTranslateLang] = useState("en");
+  const [selectedTranslationId, setSelectedTranslationId] = useState<string | null>(null);
+  const [translationGenerating, setTranslationGenerating] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -110,10 +133,70 @@ export default function MeetingPage() {
   const persistedMeetingIdRef = useRef<string | null>(null);
   const persistedSegmentCountRef = useRef(0);
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
+  const translationEnabledRef = useRef(false);
+  const targetLangRef = useRef("en");
+  const asrLangRef = useRef("auto");
+  const pendingTranslateRef = useRef<PendingTranslation[]>([]);
+  const translateInFlightRef = useRef(false);
+  const translateGenerationRef = useRef(0);
+  const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const translateScheduledRef = useRef(false);
+  const lastTranslateAtRef = useRef(0);
+  const translateTriggerSentencesRef = useRef(3);
+  const translationIdCounterRef = useRef(0);
+  const translationsRef = useRef<TranslationBlock[]>([]);
+  translationsRef.current = translations;
 
   const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
     setNotice({ type, message });
   }, []);
+
+  const pickFallbackTargetLang = useCallback((lang: string) => (lang === "en" ? "zh" : "en"), []);
+
+  const handleTranslationChange = useCallback(
+    (enabled: boolean) => {
+      if (enabled && asrLangRef.current !== "auto" && asrLangRef.current === targetLangRef.current) {
+        const next = pickFallbackTargetLang(asrLangRef.current);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言与识别语种相同，已自动切换");
+      }
+      translationEnabledRef.current = enabled;
+      setTranslationEnabled(enabled);
+      if (!enabled) {
+        resetTranslateRef.current();
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
+
+  const handleTargetLangChange = useCallback(
+    (lang: string) => {
+      targetLangRef.current = lang;
+      setTargetLang(lang);
+      if (asrLangRef.current !== "auto" && lang === asrLangRef.current) {
+        const next = pickFallbackTargetLang(lang);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言不能与识别语种相同，已自动切换");
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
+
+  const handleAsrLangChange = useCallback(
+    (lang: string) => {
+      asrLangRef.current = lang;
+      setAsrLang(lang);
+      if (lang !== "auto" && lang === targetLangRef.current && translationEnabledRef.current) {
+        const next = pickFallbackTargetLang(lang);
+        targetLangRef.current = next;
+        setTargetLang(next);
+        showNotice("info", "目标语言与识别语种相同，已自动切换");
+      }
+    },
+    [pickFallbackTargetLang, showNotice]
+  );
 
   const updateSummaryGenerating = useCallback((value: boolean, meetingId?: string | null) => {
     summaryGeneratingRef.current = value;
@@ -177,14 +260,124 @@ export default function MeetingPage() {
     [flushPendingPartial]
   );
 
+  function scheduleTranslateTimer() {
+    if (translateScheduledRef.current) return;
+    if (pendingTranslateRef.current.length === 0) return;
+    translateScheduledRef.current = true;
+    translateTimerRef.current = setTimeout(() => {
+      translateTimerRef.current = null;
+      translateScheduledRef.current = false;
+      processTranslateBuffer();
+    }, TRANSLATE_TRIGGER_INTERVAL_MS);
+  }
+
+  function processTranslateBuffer(force = false) {
+    if (!translationEnabledRef.current) return;
+    const pending = pendingTranslateRef.current;
+    if (pending.length === 0) return;
+    if (translateInFlightRef.current) {
+      scheduleTranslateTimer();
+      return;
+    }
+    const totalChars = pending.reduce((sum, item) => sum + item.text.length, 0);
+    const due = Date.now() - lastTranslateAtRef.current >= TRANSLATE_TRIGGER_INTERVAL_MS;
+    if (!force && pending.length < translateTriggerSentencesRef.current && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
+      scheduleTranslateTimer();
+      return;
+    }
+
+    translateInFlightRef.current = true;
+    const generation = translateGenerationRef.current;
+    const batch = pending;
+    pendingTranslateRef.current = [];
+    const targetLangCode = targetLangRef.current;
+    void (async () => {
+      try {
+        const res = await fetch("/api/translate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sentences: batch.map((item) => item.text), targetLang: targetLangCode }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { error?: unknown; text?: unknown };
+        if (!res.ok) throw new Error(String(data.error ?? `HTTP ${res.status}`));
+        const text = String(data.text ?? "").trim();
+        if (!text) throw new Error("Empty translation response");
+        if (generation !== translateGenerationRef.current) return;
+        setTranslations((prev) => [
+          ...prev,
+          {
+            id: ++translationIdCounterRef.current,
+            text,
+            time: batch[0].time,
+            timeSeconds: batch[0].timeSeconds,
+          },
+        ]);
+      } catch (error) {
+        if (generation !== translateGenerationRef.current) return;
+        console.warn("Translation failed, buffer retained for retry:", error);
+        const merged = [...batch, ...pendingTranslateRef.current];
+        while (
+          merged.length > 0 &&
+          merged.reduce((sum, item) => sum + item.text.length, 0) > TRANSLATE_BUFFER_CHARS_MAX
+        ) {
+          merged.shift();
+        }
+        pendingTranslateRef.current = merged;
+      } finally {
+        if (generation === translateGenerationRef.current) {
+          translateInFlightRef.current = false;
+          lastTranslateAtRef.current = Date.now();
+          scheduleTranslateTimer();
+        }
+      }
+    })();
+  }
+
+  const processTranslateRef = useRef<() => void>(() => {});
+  processTranslateRef.current = processTranslateBuffer;
+
+  const feedTranslationBuffer = useCallback((result: TranscriptResult) => {
+    if (!translationEnabledRef.current) return;
+    if (asrLangRef.current !== "auto" && asrLangRef.current === targetLangRef.current) return;
+    const text = result.text.trim();
+    if (!text) return;
+    pendingTranslateRef.current.push({ text, time: result.time, timeSeconds: result.timeSeconds });
+    processTranslateRef.current();
+  }, []);
+
+  function resetTranslationScheduler() {
+    if (translateTimerRef.current !== null) {
+      clearTimeout(translateTimerRef.current);
+      translateTimerRef.current = null;
+    }
+    translateScheduledRef.current = false;
+    pendingTranslateRef.current = [];
+    translateInFlightRef.current = false;
+    translateGenerationRef.current += 1;
+    lastTranslateAtRef.current = 0;
+    setTranslations([]);
+  }
+
+  function flushTranslationBuffer() {
+    if (pendingTranslateRef.current.length === 0 || translateInFlightRef.current) return;
+    processTranslateBuffer(true);
+  }
+
+  const flushTranslateRef = useRef<() => void>(() => {});
+  flushTranslateRef.current = flushTranslationBuffer;
+
+  const resetTranslateRef = useRef<() => void>(() => {});
+  resetTranslateRef.current = resetTranslationScheduler;
+
   const commitFinalResult = useCallback(
     (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
       transcriptGenerationRef.current += 1;
       clearPendingPartial();
       lastPartialRenderAtRef.current = 0;
       commitTranscriptResult(result, onCommitted);
+      feedTranslationBuffer(result);
     },
-    [clearPendingPartial, commitTranscriptResult]
+    [clearPendingPartial, commitTranscriptResult, feedTranslationBuffer]
   );
 
   const handleTranscriptResult = useCallback(
@@ -199,7 +392,10 @@ export default function MeetingPage() {
   );
 
   useEffect(() => {
-    return () => resetTranscriptScheduler();
+    return () => {
+      resetTranscriptScheduler();
+      resetTranslateRef.current();
+    };
   }, [resetTranscriptScheduler]);
 
   const requestJson = useCallback(async <T = unknown,>(input: RequestInfo | URL, init?: RequestInit) => {
@@ -213,6 +409,16 @@ export default function MeetingPage() {
     }
     return data as T;
   }, []);
+
+  const persistLiveTranslations = useCallback(async (meetingId: string) => {
+    const blocks = translationsRef.current;
+    if (blocks.length === 0) return;
+    await requestJson(`/api/meetings/${meetingId}/live-translation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetLang: targetLangRef.current, blocks }),
+    });
+  }, [requestJson]);
 
   const materializeCheckpointTranscript = useCallback(() => {
     if (partialTimerRef.current !== null) {
@@ -352,9 +558,40 @@ export default function MeetingPage() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    if (!translationEnabled || (status !== "recording" && status !== "paused" && status !== "connecting")) {
+      setLlmQueueInfo(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await requestJson<{ inFlight?: number; queued?: number; dropped?: number }>("/api/llm-queue-status");
+        if (cancelled) return;
+        setLlmQueueInfo({
+          inFlight: Number(data.inFlight ?? 0),
+          queued: Number(data.queued ?? 0),
+          dropped: Number(data.dropped ?? 0),
+        });
+      } catch {
+        if (!cancelled) setLlmQueueInfo(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [translationEnabled, status, requestJson]);
+
   const loadRuntimeConfig = useCallback(async () => {
-    const data = await requestJson<{ asr?: { isConfigured?: boolean } }>("/api/config");
+    const data = await requestJson<{ asr?: { isConfigured?: boolean }; llm?: { translateTriggerSentences?: number } }>("/api/config");
     const nextAsrReady = Boolean(data.asr?.isConfigured);
+    const nextTriggerSentences = Number(data.llm?.translateTriggerSentences);
+    if (Number.isFinite(nextTriggerSentences) && nextTriggerSentences > 0) {
+      translateTriggerSentencesRef.current = nextTriggerSentences;
+    }
 
     setAsrReady(nextAsrReady);
 
@@ -409,6 +646,9 @@ export default function MeetingPage() {
   }, [loadRuntimeConfig, requestJson, showNotice]);
 
   const startRecording = useCallback(async (preserveTranscript = false) => {
+    if (!preserveTranscript) {
+      resetTranslationScheduler();
+    }
     let nextAsrReady = asrReady;
 
     if (!nextAsrReady) {
@@ -626,6 +866,7 @@ export default function MeetingPage() {
   }, [startRecording]);
 
   const stopRecording = useCallback(async () => {
+    flushTranslateRef.current();
     if (checkpointPromiseRef.current) {
       await checkpointPromiseRef.current.catch((error) => {
         console.warn("ASR checkpoint did not complete before stop:", error);
@@ -709,6 +950,9 @@ export default function MeetingPage() {
         setAsrResults([]);
         setSelectedAsrResult(null);
         primeMeetingAsyncState(meeting.id).catch(console.error);
+        void persistLiveTranslations(meeting.id).catch((error) => {
+          console.warn("Failed to persist live translation:", error);
+        });
       }
       persistedMeetingIdRef.current = null;
       persistedSegmentCountRef.current = 0;
@@ -723,10 +967,11 @@ export default function MeetingPage() {
     } finally {
       setSavingMeeting(false);
     }
-  }, [primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
+  }, [persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
     resetTranscriptScheduler();
+    resetTranslateRef.current();
     asrRecoveryRef.current = false;
     persistedMeetingIdRef.current = null;
     persistedSegmentCountRef.current = 0;
@@ -972,6 +1217,7 @@ export default function MeetingPage() {
     }
   }, [
     asrReady,
+    asrLang,
     flushPendingPartial,
     handleTranscriptResult,
     loadRuntimeConfig,
@@ -1009,6 +1255,51 @@ export default function MeetingPage() {
       }
     }
   }, [isActiveMeeting, refreshMeeting, requestJson, selected, showNotice, updateSummaryGenerating]);
+
+  const generateHistoryTranslation = useCallback(async () => {
+    if (!selected || translationGenerating) return;
+    const meetingId = selected.id;
+    setTranslationGenerating(true);
+    try {
+      await requestJson(`/api/meetings/${meetingId}/llm-results`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ promptTemplateId: SYSTEM_TRANSLATE_TEMPLATE_ID, targetLang: historyTranslateLang }),
+      });
+      if (!isActiveMeeting(meetingId)) return;
+      setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, status: "llm_processing" } : prev));
+      showNotice("info", "翻译已开始，完成后自动显示");
+    } catch (err) {
+      console.error("Generate translation failed:", err);
+      if (!isActiveMeeting(meetingId)) return;
+      await refreshMeeting(meetingId).catch(console.error);
+      if (err instanceof ApiRequestError && err.status === 409) {
+        showNotice("info", "翻译正在生成中，请稍候");
+      } else {
+        showNotice("error", `翻译触发失败: ${(err as Error).message}`);
+      }
+      setTranslationGenerating(false);
+    }
+  }, [historyTranslateLang, isActiveMeeting, refreshMeeting, requestJson, selected, showNotice, translationGenerating]);
+
+  useEffect(() => {
+    if (!translationGenerating) return;
+    if (selected?.status && selected.status !== "llm_processing") {
+      setTranslationGenerating(false);
+    }
+  }, [selected?.status, translationGenerating]);
+
+  useEffect(() => {
+    const done = llmResults.filter(
+      (item) => item.resultType === "translation" && (item.status === "succeeded" || item.status === "failed")
+    );
+    if (done.length === 0) {
+      setSelectedTranslationId(null);
+      return;
+    }
+    const latest = done[done.length - 1];
+    setSelectedTranslationId((prev) => (prev && done.some((item) => item.id === prev) ? prev : latest.id));
+  }, [llmResults]);
 
   const sendSummary = useCallback(async () => {
     if (!selected || !selected.summary) return;
@@ -1065,7 +1356,14 @@ export default function MeetingPage() {
   }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedLlmResultId, showNotice]);
 
   const activePromptTemplates = promptTemplates.filter((template) => template.status === "active");
-  const currentLlmResult = llmResults.find((item) => item.id === selectedLlmResultId) ?? llmResults[0] ?? null;
+  const summaryResults = llmResults.filter((item) => item.resultType !== "translation");
+  const currentLlmResult = summaryResults.find((item) => item.id === selectedLlmResultId) ?? summaryResults[0] ?? null;
+  const translationVersions = llmResults.filter((item) => item.resultType === "translation");
+  const selectedTranslation =
+    translationVersions.find((item) => item.id === selectedTranslationId) ??
+    translationVersions.filter((item) => item.status === "succeeded").slice(-1)[0] ??
+    translationVersions.slice(-1)[0] ??
+    null;
   const selectedPromptTemplate =
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
 
@@ -1079,10 +1377,15 @@ export default function MeetingPage() {
   }, [llmResults]);
 
   const deleteLlmResult = useCallback(
-    async (resultId: string) => {
+    async (resultId: string, kind: "summary" | "translation" = "summary") => {
       if (!selected) return;
       const meetingId = selected.id;
-      if (!window.confirm("确定删除该纪要版本？关联的发送记录也会一并删除。")) return;
+      const label = kind === "translation" ? "翻译" : "纪要";
+      const confirmText =
+        kind === "translation"
+          ? "确定删除该翻译版本？"
+          : "确定删除该纪要版本？关联的发送记录也会一并删除。";
+      if (!window.confirm(confirmText)) return;
       try {
         await requestJson(`/api/meetings/${meetingId}/llm-results?resultId=${encodeURIComponent(resultId)}`, {
           method: "DELETE",
@@ -1090,7 +1393,7 @@ export default function MeetingPage() {
         if (!isActiveMeeting(meetingId)) return;
         await loadLlmResults(meetingId);
         await refreshMeeting(meetingId);
-        showNotice("success", "纪要版本已删除");
+        showNotice("success", `${label}版本已删除`);
       } catch (error) {
         console.error("Delete llm result failed:", error);
         if (!isActiveMeeting(meetingId)) return;
@@ -1294,7 +1597,98 @@ export default function MeetingPage() {
                 </div>
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
-                    <TranscriptView segments={selected.transcript} />
+                    <div className="flex min-h-0 flex-1 flex-col gap-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <label className="flex items-center gap-1 text-xs text-slate-500">
+                          翻译为
+                          <select
+                            value={historyTranslateLang}
+                            onChange={(e) => setHistoryTranslateLang(e.target.value)}
+                            disabled={translationGenerating}
+                            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm text-slate-700 outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+                          >
+                            {HISTORY_TRANSLATE_LANGS.map((lang) => (
+                              <option key={lang.value} value={lang.value}>
+                                {lang.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          onClick={() => generateHistoryTranslation()}
+                          disabled={translationGenerating || selected?.status === "llm_processing"}
+                          className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {translationGenerating || selected?.status === "llm_processing"
+                            ? selected?.status === "llm_processing" && !translationGenerating
+                              ? "处理中..."
+                              : "翻译中..."
+                            : "翻译"}
+                        </button>
+                        {translationVersions.length > 0 && (
+                          <div className="flex items-center gap-1">
+                            <span className="text-xs text-slate-400">版本</span>
+                            {translationVersions.map((version) => (
+                              <button
+                                key={version.id}
+                                onClick={() => setSelectedTranslationId(version.id)}
+                                title={
+                                  version.status === "failed"
+                                    ? (version.errorMessage ?? "翻译失败")
+                                    : version.status === "succeeded"
+                                      ? "查看译文"
+                                      : "生成中"
+                                }
+                                className={`rounded px-2 py-1 text-xs font-medium ${
+                                  version.id === selectedTranslation?.id
+                                    ? "bg-brand text-white"
+                                    : version.status === "failed"
+                                      ? "border border-red-200 bg-red-50 text-red-500 hover:bg-red-100"
+                                      : version.status === "succeeded"
+                                        ? "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                                        : "border border-amber-200 bg-amber-50 text-amber-600"
+                                }`}
+                              >
+                                V{version.versionNo}
+                              </button>
+                            ))}
+                            {selectedTranslation && (
+                              <button
+                                onClick={() => deleteLlmResult(selectedTranslation.id, "translation")}
+                                title="删除该翻译版本"
+                                className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-400 hover:border-red-200 hover:bg-red-50 hover:text-red-500"
+                              >
+                                ✕ 删除
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-h-0 flex-1">
+                        <TranscriptView segments={selected.transcript} />
+                      </div>
+                      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto border-t border-slate-100 px-2 pt-2">
+                        {translationGenerating ? (
+                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                            <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                            <p className="text-sm">正在翻译...</p>
+                          </div>
+                        ) : selectedTranslation?.status === "succeeded" ? (
+                          <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
+                            {selectedTranslation.resultMarkdown}
+                          </div>
+                        ) : selectedTranslation?.status === "failed" ? (
+                          <div className="text-sm text-red-500">
+                            {selectedTranslation.errorMessage ?? "翻译失败"}
+                          </div>
+                        ) : (
+                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                            <div className="text-2xl">🌐</div>
+                            <p className="mt-2 text-sm">尚未翻译，选择目标语言后点击「翻译」</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   ) : viewTab === "asrRaw" ? (
                     asrResults.length === 0 ? (
                       <div className="flex h-full flex-col items-center justify-center text-slate-400">
@@ -1377,9 +1771,9 @@ export default function MeetingPage() {
                         </div>
                       </div>
 
-                      {llmResults.length > 0 && (
+                      {summaryResults.length > 0 && (
                         <div className="flex gap-2 overflow-x-auto pb-1">
-                          {llmResults.map((result) => (
+                          {summaryResults.map((result) => (
                             <button
                               key={result.id}
                               onClick={() => selectLlmResult(result.id)}
@@ -1569,7 +1963,11 @@ export default function MeetingPage() {
                       speakerEnabled={speakerEnabled}
                       onSpeakerChange={setSpeakerEnabled}
                       asrLang={asrLang}
-                      onLangChange={setAsrLang}
+                      onLangChange={handleAsrLangChange}
+                      translationEnabled={translationEnabled}
+                      onTranslationChange={handleTranslationChange}
+                      targetLang={targetLang}
+                      onTargetLangChange={handleTargetLangChange}
                       disabled={status === "recording" || status === "paused" || status === "connecting"}
                     />
                     {status === "recording" && (
@@ -1660,8 +2058,33 @@ export default function MeetingPage() {
                     </span>
                   </div>
                 ) : null}
-                <div className="flex-1 overflow-auto">
-                  <TranscriptView segments={liveSegments} />
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <div className="min-h-0 flex-1">
+                    <TranscriptView segments={liveSegments} />
+                  </div>
+                  {translationEnabled && (
+                    <>
+                      <div className="flex shrink-0 items-center justify-between border-t border-slate-100 bg-slate-50/60 px-2 py-1 text-xs text-slate-400">
+                        <span className="flex items-center gap-2">
+                          🌐 译文
+                          {llmQueueInfo && (
+                            <span
+                              className={`rounded px-1.5 py-0.5 ${
+                                llmQueueInfo.queued > 0 || llmQueueInfo.inFlight > 0
+                                  ? "bg-amber-100 text-amber-700"
+                                  : "bg-emerald-100 text-emerald-700"
+                              }`}
+                            >
+                              队列 {llmQueueInfo.queued} · 处理中 {llmQueueInfo.inFlight}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="min-h-0 flex-1">
+                        <TranslationView translations={translations} />
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             )}

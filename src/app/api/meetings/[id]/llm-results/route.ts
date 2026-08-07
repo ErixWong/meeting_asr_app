@@ -31,7 +31,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         return NextResponse.json({ error: claim.error }, { status: claim.status });
       }
 
-      void createMeetingLlmResult(id, body.promptTemplateId, { skipClaim: true }).catch((error) => {
+      void createMeetingLlmResult(id, body.promptTemplateId, { skipClaim: true, targetLang: body.targetLang }).catch((error) => {
         console.error("Failed to generate LLM result:", error);
       });
 
