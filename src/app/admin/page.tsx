@@ -214,6 +214,9 @@ export default function AdminPage() {
   const [llmContextSize, setLlmContextSize] = useState("");
   const [llmMaxTokens, setLlmMaxTokens] = useState("");
   const [llmTimeoutMs, setLlmTimeoutMs] = useState("");
+  const [llmConcurrency, setLlmConcurrency] = useState("2");
+  const [llmQueueCapacity, setLlmQueueCapacity] = useState("10");
+  const [llmQueueStatus, setLlmQueueStatus] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
   const [llmStatus, setLlmStatus] = useState<"ok" | "fail" | "idle">("idle");
 
   const [mailHost, setMailHost] = useState("smtp.example.com");
@@ -319,6 +322,20 @@ export default function AdminPage() {
         itemValue: llmTimeoutMs,
       },
       {
+        itemSection: "llm",
+        itemMark: "max_concurrency",
+        itemTitle: "LLM 并发数",
+        itemDescription: "全局队列同时执行的 LLM 请求数",
+        itemValue: llmConcurrency,
+      },
+      {
+        itemSection: "llm",
+        itemMark: "queue_capacity",
+        itemTitle: "LLM 排队长度",
+        itemDescription: "全局队列最多排队等待的请求数，超出直接拒绝",
+        itemValue: llmQueueCapacity,
+      },
+      {
         itemSection: "mail",
         itemMark: "smtp_host",
         itemTitle: "SMTP Host",
@@ -380,6 +397,8 @@ export default function AdminPage() {
       llmContextSize,
       llmMaxTokens,
       llmTimeoutMs,
+      llmConcurrency,
+      llmQueueCapacity,
       mailFromEmail,
       mailFromName,
       mailHost,
@@ -445,6 +464,8 @@ export default function AdminPage() {
         setLlmContextSize(get("llm", "context_size", ""));
         setLlmMaxTokens(get("llm", "max_tokens", ""));
         setLlmTimeoutMs(get("llm", "timeout_ms", ""));
+        setLlmConcurrency(get("llm", "max_concurrency", "2"));
+        setLlmQueueCapacity(get("llm", "queue_capacity", "10"));
 
         setMailHost(get("mail", "smtp_host", "smtp.example.com"));
         setMailPort(get("mail", "smtp_port", "465"));
@@ -472,6 +493,31 @@ export default function AdminPage() {
 
     loadAdminData().catch(console.error);
   }, [authLoading, currentUser]);
+
+  useEffect(() => {
+    if (loading || activeTab !== "llm" || !currentUser?.roles.includes("system_admin")) return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await requestJson("/api/admin/llm-queue-status");
+        if (cancelled) return;
+        setLlmQueueStatus({
+          inFlight: Number(data.inFlight ?? 0),
+          queued: Number(data.queued ?? 0),
+          dropped: Number(data.dropped ?? 0),
+        });
+      } catch {
+        if (!cancelled) setLlmQueueStatus(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [loading, activeTab, currentUser]);
 
   const saveSettings = async () => {
     setSavingSettings(true);
@@ -1071,6 +1117,21 @@ export default function AdminPage() {
             <input type="number" min="1" step="1" value={llmMaxTokens} onChange={(e) => setLlmMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 由 LLM 决定" />
             <label className="mb-1 mt-3 block text-xs text-slate-500">调用超时（毫秒，留空默认 180000）</label>
             <input type="number" min="1" step="1" value={llmTimeoutMs} onChange={(e) => setLlmTimeoutMs(e.target.value)} className={inputCls} placeholder="留空 = 180000" />
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs text-slate-500">LLM 并发数（默认 2）</label>
+                <input type="number" min="1" step="1" value={llmConcurrency} onChange={(e) => setLlmConcurrency(e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-slate-500">LLM 排队长度（默认 10）</label>
+                <input type="number" min="1" step="1" value={llmQueueCapacity} onChange={(e) => setLlmQueueCapacity(e.target.value)} className={inputCls} />
+              </div>
+            </div>
+            {llmQueueStatus && (
+              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                队列状态：进行中 {llmQueueStatus.inFlight} · 排队 {llmQueueStatus.queued} · 累计拒绝 {llmQueueStatus.dropped}
+              </div>
+            )}
             <div className="mt-3 flex items-center justify-between">
               <StatusBadge status={llmStatus} />
               <button onClick={testLlm} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">

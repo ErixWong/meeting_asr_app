@@ -20,6 +20,7 @@ import {
   parseJsonOr,
   requireNonEmpty,
 } from "@/lib/store-utils";
+import { llmQueue, setLlmQueueConfigReader } from "@/lib/llm-queue";
 
 type SettingRow = {
   itemSection: string;
@@ -335,6 +336,16 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "留空使用默认 180000",
     validate: integerSetting("LLM timeout", 1_000, 600_000),
   },
+  "llm:max_concurrency": {
+    itemTitle: "LLM 并发数",
+    itemDescription: "全局队列同时执行的 LLM 请求数，默认 2",
+    validate: integerSetting("LLM concurrency", 1, 20),
+  },
+  "llm:queue_capacity": {
+    itemTitle: "LLM 排队长度",
+    itemDescription: "全局队列最多排队等待的请求数，超出直接拒绝，默认 10",
+    validate: integerSetting("LLM queue capacity", 1, 200),
+  },
   "mail:smtp_host": {
     itemTitle: "SMTP Host",
     itemDescription: "邮件服务主机",
@@ -529,6 +540,20 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "调用超时（毫秒）",
         itemDescription: "留空使用默认 180000",
         itemValue: "",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "max_concurrency",
+        itemTitle: "LLM 并发数",
+        itemDescription: "全局队列同时执行的 LLM 请求数",
+        itemValue: "2",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "queue_capacity",
+        itemTitle: "LLM 排队长度",
+        itemDescription: "全局队列最多排队等待的请求数，超出直接拒绝",
+        itemValue: "10",
       },
       {
         itemSection: "mail",
@@ -784,6 +809,67 @@ export function getSettingValue(section: string, mark: string) {
     .find((setting) => setting.itemSection === section && setting.itemMark === mark);
   return row?.itemValue ?? "";
 }
+
+const TRANSLATE_TARGET_LABELS: Record<string, string> = {
+  zh: "中文",
+  en: "英文",
+  ja: "日语",
+  ko: "韩语",
+};
+
+export async function translateSentences(sentences: string[], targetLang: string): Promise<string> {
+  const baseUrl = getSettingValue("llm", "base_url");
+  const apiKey = getSettingValue("llm", "api_key");
+  const model = getSettingValue("llm", "model");
+  if (!baseUrl || !model) throw new Error("LLM config incomplete");
+
+  const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
+  const targetLabel = TRANSLATE_TARGET_LABELS[targetLang] || targetLang || "英文";
+  const content = sentences.join("\n");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const { status, text } = await llmRequest(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "system",
+            content: `你是实时会议翻译助手。把用户发来的会议记录逐行翻译成${targetLabel}。只输出译文，每行对应原文一行，不要编号、不要解释。`,
+          },
+          { role: "user", content },
+        ],
+        temperature: 0.3,
+      }),
+      signal: controller.signal,
+    });
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`LLM API error: ${status} ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
+    const translated = String(parsed.choices?.[0]?.message?.content ?? "").trim();
+    if (!translated) throw new Error("LLM returned empty translation");
+    return translated;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+setLlmQueueConfigReader(() => {
+  const concurrency = Number(String(getSettingValue("llm", "max_concurrency") || "").trim());
+  const capacity = Number(String(getSettingValue("llm", "queue_capacity") || "").trim());
+  return {
+    maxConcurrency: Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 2,
+    capacity: Number.isFinite(capacity) && capacity > 0 ? capacity : 10,
+  };
+});
 
 function validateSettings(settings: unknown): SettingRow[] {
   if (!Array.isArray(settings)) {
@@ -2462,6 +2548,21 @@ export function claimMeetingLlmGeneration(meetingId: string):
 }
 
 export async function createMeetingLlmResult(meetingId: string, templateId?: string, options?: { skipClaim?: boolean }) {
+  try {
+    return await llmQueue.enqueue("summary", () => createMeetingLlmResultInner(meetingId, templateId, options));
+  } catch (error) {
+    if (
+      options?.skipClaim &&
+      error instanceof Error &&
+      error.message.includes("LLM queue")
+    ) {
+      updateMeetingStatus(meetingId, "llm_failed", `LLM queue busy: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+async function createMeetingLlmResultInner(meetingId: string, templateId?: string, options?: { skipClaim?: boolean }) {
   if (!ensureMeetingOwned(meetingId)) throw new Error("Meeting not found");
 
   if (!options?.skipClaim) {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useMemo } from "react";
+import { useLayoutEffect, useRef, useMemo } from "react";
 import { TranscriptSegment } from "@/types";
 
 interface Props {
@@ -87,7 +87,7 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
 
   const paragraphs = useMemo(() => mergeSegments(segments), [segments]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (segments.length === 0) {
       shouldAutoScrollRef.current = true;
       return;

@@ -10,6 +10,10 @@ interface Props {
   onSpeakerChange: (enabled: boolean) => void;
   asrLang: string;
   onLangChange: (lang: string) => void;
+  translationEnabled: boolean;
+  onTranslationChange: (enabled: boolean) => void;
+  targetLang: string;
+  onTargetLangChange: (lang: string) => void;
   disabled?: boolean;
 }
 
@@ -24,6 +28,13 @@ const ASR_LANGUAGES = [
   { value: "yue", label: "粤语" },
 ];
 
+const TRANSLATE_LANGUAGES = [
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英文" },
+  { value: "ja", label: "日语" },
+  { value: "ko", label: "韩语" },
+];
+
 export default function DeviceSelector({
   devices,
   micDeviceId,
@@ -32,9 +43,14 @@ export default function DeviceSelector({
   onSpeakerChange,
   asrLang,
   onLangChange,
+  translationEnabled,
+  onTranslationChange,
+  targetLang,
+  onTargetLangChange,
   disabled = false,
 }: Props) {
   const mics = devices.filter((d) => d.deviceId !== "speaker");
+  const sameAsSource = asrLang !== "auto" && asrLang === targetLang;
 
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -76,6 +92,28 @@ export default function DeviceSelector({
           className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
         >
           {ASR_LANGUAGES.map((lang) => (
+            <option key={lang.value} value={lang.value}>
+              {lang.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="flex items-center gap-1 text-sm text-slate-600" title={sameAsSource ? "目标语言与识别语种相同，翻译不可用" : undefined}>
+        <input
+          type="checkbox"
+          checked={translationEnabled && !sameAsSource}
+          onChange={(e) => onTranslationChange(e.target.checked)}
+          disabled={disabled || sameAsSource}
+          className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand disabled:opacity-60"
+        />
+        自动翻译
+        <select
+          value={targetLang}
+          onChange={(e) => onTargetLangChange(e.target.value)}
+          disabled={disabled || sameAsSource}
+          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+        >
+          {TRANSLATE_LANGUAGES.map((lang) => (
             <option key={lang.value} value={lang.value}>
               {lang.label}
             </option>

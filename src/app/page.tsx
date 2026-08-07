@@ -24,6 +24,7 @@ import DeviceSelector from "@/components/main/DeviceSelector";
 import MarkdownPreview from "@/components/main/MarkdownPreview";
 import RecordingControls from "@/components/main/RecordingControls";
 import TranscriptView from "@/components/main/TranscriptView";
+import TranslationView, { TranslationBlock } from "@/components/main/TranslationView";
 import HistoryList from "@/components/main/HistoryList";
 import AsrResultDetailView from "@/components/main/AsrResultDetailView";
 import { formatTime } from "@/components/main/RecordingControls";
@@ -31,6 +32,9 @@ import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
+const TRANSLATE_TRIGGER_SENTENCES = 3;
+const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
+const TRANSLATE_BUFFER_CHARS_MAX = 2000;
 
 function formatAsrCreatedAt(value?: string) {
   if (!value) return "-";
@@ -51,6 +55,12 @@ type PendingPartial = TranscriptResult & {
   generation: number;
 };
 
+type PendingTranslation = {
+  text: string;
+  time: string;
+  timeSeconds: number;
+};
+
 class ApiRequestError extends Error {
   status: number;
 
@@ -67,6 +77,9 @@ export default function MeetingPage() {
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
   const [speakerEnabled, setSpeakerEnabled] = useState(false);
   const [asrLang, setAsrLang] = useState<string>("auto");
+  const [translationEnabled, setTranslationEnabled] = useState(false);
+  const [targetLang, setTargetLang] = useState<string>("en");
+  const [translations, setTranslations] = useState<TranslationBlock[]>([]);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -110,9 +123,30 @@ export default function MeetingPage() {
   const persistedMeetingIdRef = useRef<string | null>(null);
   const persistedSegmentCountRef = useRef(0);
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
+  const translationEnabledRef = useRef(false);
+  const targetLangRef = useRef("en");
+  const pendingTranslateRef = useRef<PendingTranslation[]>([]);
+  const translateInFlightRef = useRef(false);
+  const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const translateScheduledRef = useRef(false);
+  const lastTranslateAtRef = useRef(0);
+  const translationIdCounterRef = useRef(0);
 
   const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
     setNotice({ type, message });
+  }, []);
+
+  const handleTranslationChange = useCallback((enabled: boolean) => {
+    translationEnabledRef.current = enabled;
+    setTranslationEnabled(enabled);
+    if (!enabled) {
+      resetTranslationScheduler();
+    }
+  }, []);
+
+  const handleTargetLangChange = useCallback((lang: string) => {
+    targetLangRef.current = lang;
+    setTargetLang(lang);
   }, []);
 
   const updateSummaryGenerating = useCallback((value: boolean, meetingId?: string | null) => {
@@ -177,14 +211,113 @@ export default function MeetingPage() {
     [flushPendingPartial]
   );
 
+  function scheduleTranslateTimer() {
+    if (translateScheduledRef.current) return;
+    if (pendingTranslateRef.current.length === 0) return;
+    translateScheduledRef.current = true;
+    translateTimerRef.current = setTimeout(() => {
+      translateTimerRef.current = null;
+      translateScheduledRef.current = false;
+      processTranslateBuffer();
+    }, TRANSLATE_TRIGGER_INTERVAL_MS);
+  }
+
+  function processTranslateBuffer() {
+    if (!translationEnabledRef.current) return;
+    const pending = pendingTranslateRef.current;
+    if (pending.length === 0) return;
+    if (translateInFlightRef.current) {
+      scheduleTranslateTimer();
+      return;
+    }
+    const totalChars = pending.reduce((sum, item) => sum + item.text.length, 0);
+    const due = Date.now() - lastTranslateAtRef.current >= TRANSLATE_TRIGGER_INTERVAL_MS;
+    if (pending.length < TRANSLATE_TRIGGER_SENTENCES && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
+      scheduleTranslateTimer();
+      return;
+    }
+
+    translateInFlightRef.current = true;
+    const batch = pending;
+    pendingTranslateRef.current = [];
+    const targetLangCode = targetLangRef.current;
+    void (async () => {
+      try {
+        const res = await fetch("/api/translate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sentences: batch.map((item) => item.text), targetLang: targetLangCode }),
+        });
+        const data = (await res.json().catch(() => ({}))) as { error?: unknown; text?: unknown };
+        if (!res.ok) throw new Error(String(data.error ?? `HTTP ${res.status}`));
+        const text = String(data.text ?? "").trim();
+        if (!text) throw new Error("Empty translation response");
+        setTranslations((prev) => [
+          ...prev,
+          {
+            id: ++translationIdCounterRef.current,
+            text,
+            time: batch[0].time,
+            timeSeconds: batch[0].timeSeconds,
+          },
+        ]);
+      } catch (error) {
+        console.warn("Translation failed, buffer retained for retry:", error);
+        const merged = [...batch, ...pendingTranslateRef.current];
+        while (
+          merged.length > 0 &&
+          merged.reduce((sum, item) => sum + item.text.length, 0) > TRANSLATE_BUFFER_CHARS_MAX
+        ) {
+          merged.shift();
+        }
+        pendingTranslateRef.current = merged;
+      } finally {
+        translateInFlightRef.current = false;
+        lastTranslateAtRef.current = Date.now();
+        scheduleTranslateTimer();
+      }
+    })();
+  }
+
+  const processTranslateRef = useRef<() => void>(() => {});
+  processTranslateRef.current = processTranslateBuffer;
+
+  const feedTranslationBuffer = useCallback((result: TranscriptResult) => {
+    if (!translationEnabledRef.current) return;
+    const text = result.text.trim();
+    if (!text) return;
+    pendingTranslateRef.current.push({ text, time: result.time, timeSeconds: result.timeSeconds });
+    processTranslateRef.current();
+  }, []);
+
+  function resetTranslationScheduler() {
+    if (translateTimerRef.current !== null) {
+      clearTimeout(translateTimerRef.current);
+      translateTimerRef.current = null;
+    }
+    translateScheduledRef.current = false;
+    pendingTranslateRef.current = [];
+    translateInFlightRef.current = false;
+    lastTranslateAtRef.current = 0;
+  }
+
+  function flushTranslationBuffer() {
+    if (pendingTranslateRef.current.length === 0 || translateInFlightRef.current) return;
+    processTranslateBuffer();
+  }
+
+  const flushTranslateRef = useRef<() => void>(() => {});
+  flushTranslateRef.current = flushTranslationBuffer;
+
   const commitFinalResult = useCallback(
     (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
       transcriptGenerationRef.current += 1;
       clearPendingPartial();
       lastPartialRenderAtRef.current = 0;
       commitTranscriptResult(result, onCommitted);
+      feedTranslationBuffer(result);
     },
-    [clearPendingPartial, commitTranscriptResult]
+    [clearPendingPartial, commitTranscriptResult, feedTranslationBuffer]
   );
 
   const handleTranscriptResult = useCallback(
@@ -409,6 +542,9 @@ export default function MeetingPage() {
   }, [loadRuntimeConfig, requestJson, showNotice]);
 
   const startRecording = useCallback(async (preserveTranscript = false) => {
+    if (!preserveTranscript) {
+      resetTranslationScheduler();
+    }
     let nextAsrReady = asrReady;
 
     if (!nextAsrReady) {
@@ -626,6 +762,7 @@ export default function MeetingPage() {
   }, [startRecording]);
 
   const stopRecording = useCallback(async () => {
+    flushTranslateRef.current();
     if (checkpointPromiseRef.current) {
       await checkpointPromiseRef.current.catch((error) => {
         console.warn("ASR checkpoint did not complete before stop:", error);
@@ -972,6 +1109,7 @@ export default function MeetingPage() {
     }
   }, [
     asrReady,
+    asrLang,
     flushPendingPartial,
     handleTranscriptResult,
     loadRuntimeConfig,
@@ -1570,6 +1708,10 @@ export default function MeetingPage() {
                       onSpeakerChange={setSpeakerEnabled}
                       asrLang={asrLang}
                       onLangChange={setAsrLang}
+                      translationEnabled={translationEnabled}
+                      onTranslationChange={handleTranslationChange}
+                      targetLang={targetLang}
+                      onTargetLangChange={handleTargetLangChange}
                       disabled={status === "recording" || status === "paused" || status === "connecting"}
                     />
                     {status === "recording" && (
@@ -1660,8 +1802,20 @@ export default function MeetingPage() {
                     </span>
                   </div>
                 ) : null}
-                <div className="flex-1 overflow-auto">
-                  <TranscriptView segments={liveSegments} />
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <div className="min-h-0 flex-1">
+                    <TranscriptView segments={liveSegments} />
+                  </div>
+                  {translationEnabled && (
+                    <>
+                      <div className="flex shrink-0 items-center justify-between border-t border-slate-100 bg-slate-50/60 px-2 py-1 text-xs text-slate-400">
+                        <span>🌐 译文</span>
+                      </div>
+                      <div className="min-h-0 flex-1">
+                        <TranslationView translations={translations} />
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             )}
