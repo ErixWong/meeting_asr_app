@@ -1552,16 +1552,6 @@ export default function MeetingPage() {
               </div>
             ) : (
               <div className="flex h-full w-full flex-col rounded-xl border border-slate-200 bg-white">
-                {speakerEnabled && (status === "idle" || status === "done") && (
-                  <div className="bg-amber-50 px-4 py-2 text-xs text-amber-600">
-                    <div className="font-medium">系统声音开启：</div>
-                    <ol className="ml-4 list-decimal">
-                      <li>开始录音时会弹出共享窗口</li>
-                      <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
-                      <li>并确认共享声音</li>
-                    </ol>
-                  </div>
-                )}
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-4 py-3">
                   <div>
                     <h2 className="text-xl font-semibold text-slate-800">新增录音</h2>
@@ -1605,8 +1595,18 @@ export default function MeetingPage() {
                       onResume={resumeRecording}
                       onStop={stopRecording}
                     />
+                   </div>
+                 </div>
+                {speakerEnabled && (status === "idle" || status === "done") && (
+                  <div className="border-b border-slate-100 bg-amber-50 px-4 py-2 text-xs text-amber-600">
+                    <div className="font-medium">系统声音开启：</div>
+                    <ol className="ml-4 list-decimal">
+                      <li>开始录音时会弹出共享窗口</li>
+                      <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
+                      <li>并确认共享声音</li>
+                    </ol>
                   </div>
-                </div>
+                )}
                 {status === "recording" || status === "paused" || status === "connecting" ? (
                    <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-2 text-sm">
                      <span
