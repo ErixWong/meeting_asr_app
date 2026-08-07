@@ -34,6 +34,13 @@ let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
 const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
 const TRANSLATE_BUFFER_CHARS_MAX = 2000;
+const SYSTEM_TRANSLATE_TEMPLATE_ID = "tpl-translate";
+const HISTORY_TRANSLATE_LANGS = [
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英文" },
+  { value: "ja", label: "日语" },
+  { value: "ko", label: "韩语" },
+];
 
 function formatAsrCreatedAt(value?: string) {
   if (!value) return "-";
@@ -80,6 +87,9 @@ export default function MeetingPage() {
   const [targetLang, setTargetLang] = useState<string>("en");
   const [translations, setTranslations] = useState<TranslationBlock[]>([]);
   const [llmQueueInfo, setLlmQueueInfo] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
+  const [historyTranslateLang, setHistoryTranslateLang] = useState("en");
+  const [selectedTranslationId, setSelectedTranslationId] = useState<string | null>(null);
+  const [translationGenerating, setTranslationGenerating] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -134,6 +144,8 @@ export default function MeetingPage() {
   const lastTranslateAtRef = useRef(0);
   const translateTriggerSentencesRef = useRef(3);
   const translationIdCounterRef = useRef(0);
+  const translationsRef = useRef<TranslationBlock[]>([]);
+  translationsRef.current = translations;
 
   const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
     setNotice({ type, message });
@@ -397,6 +409,16 @@ export default function MeetingPage() {
     }
     return data as T;
   }, []);
+
+  const persistLiveTranslations = useCallback(async (meetingId: string) => {
+    const blocks = translationsRef.current;
+    if (blocks.length === 0) return;
+    await requestJson(`/api/meetings/${meetingId}/live-translation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetLang: targetLangRef.current, blocks }),
+    });
+  }, [requestJson]);
 
   const materializeCheckpointTranscript = useCallback(() => {
     if (partialTimerRef.current !== null) {
@@ -928,6 +950,9 @@ export default function MeetingPage() {
         setAsrResults([]);
         setSelectedAsrResult(null);
         primeMeetingAsyncState(meeting.id).catch(console.error);
+        void persistLiveTranslations(meeting.id).catch((error) => {
+          console.warn("Failed to persist live translation:", error);
+        });
       }
       persistedMeetingIdRef.current = null;
       persistedSegmentCountRef.current = 0;
@@ -942,7 +967,7 @@ export default function MeetingPage() {
     } finally {
       setSavingMeeting(false);
     }
-  }, [primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
+  }, [persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
     resetTranscriptScheduler();
@@ -1231,6 +1256,49 @@ export default function MeetingPage() {
     }
   }, [isActiveMeeting, refreshMeeting, requestJson, selected, showNotice, updateSummaryGenerating]);
 
+  const generateHistoryTranslation = useCallback(async () => {
+    if (!selected || translationGenerating) return;
+    const meetingId = selected.id;
+    setTranslationGenerating(true);
+    try {
+      await requestJson(`/api/meetings/${meetingId}/llm-results`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ promptTemplateId: SYSTEM_TRANSLATE_TEMPLATE_ID, targetLang: historyTranslateLang }),
+      });
+      if (!isActiveMeeting(meetingId)) return;
+      setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, status: "llm_processing" } : prev));
+      showNotice("info", "翻译已开始，完成后自动显示");
+    } catch (err) {
+      console.error("Generate translation failed:", err);
+      if (!isActiveMeeting(meetingId)) return;
+      await refreshMeeting(meetingId).catch(console.error);
+      if (err instanceof ApiRequestError && err.status === 409) {
+        showNotice("info", "翻译正在生成中，请稍候");
+      } else {
+        showNotice("error", `翻译触发失败: ${(err as Error).message}`);
+      }
+      setTranslationGenerating(false);
+    }
+  }, [historyTranslateLang, isActiveMeeting, refreshMeeting, requestJson, selected, showNotice, translationGenerating]);
+
+  useEffect(() => {
+    if (!translationGenerating) return;
+    if (selected?.status && selected.status !== "llm_processing") {
+      setTranslationGenerating(false);
+    }
+  }, [selected?.status, translationGenerating]);
+
+  useEffect(() => {
+    const succeeded = llmResults.filter((item) => item.resultType === "translation" && item.status === "succeeded");
+    if (succeeded.length === 0) {
+      setSelectedTranslationId(null);
+      return;
+    }
+    const latest = succeeded[succeeded.length - 1];
+    setSelectedTranslationId((prev) => (prev && succeeded.some((item) => item.id === prev) ? prev : latest.id));
+  }, [llmResults]);
+
   const sendSummary = useCallback(async () => {
     if (!selected || !selected.summary) return;
     const meetingId = selected.id;
@@ -1286,7 +1354,13 @@ export default function MeetingPage() {
   }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedLlmResultId, showNotice]);
 
   const activePromptTemplates = promptTemplates.filter((template) => template.status === "active");
-  const currentLlmResult = llmResults.find((item) => item.id === selectedLlmResultId) ?? llmResults[0] ?? null;
+  const summaryResults = llmResults.filter((item) => item.resultType !== "translation");
+  const currentLlmResult = summaryResults.find((item) => item.id === selectedLlmResultId) ?? summaryResults[0] ?? null;
+  const translationVersions = llmResults.filter((item) => item.resultType === "translation");
+  const selectedTranslation =
+    translationVersions.find((item) => item.id === selectedTranslationId) ??
+    translationVersions.filter((item) => item.status === "succeeded").slice(-1)[0] ??
+    null;
   const selectedPromptTemplate =
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
 
@@ -1515,7 +1589,85 @@ export default function MeetingPage() {
                 </div>
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
-                    <TranscriptView segments={selected.transcript} />
+                    <div className="flex min-h-0 flex-1 flex-col gap-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <label className="flex items-center gap-1 text-xs text-slate-500">
+                          翻译为
+                          <select
+                            value={historyTranslateLang}
+                            onChange={(e) => setHistoryTranslateLang(e.target.value)}
+                            disabled={translationGenerating}
+                            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm text-slate-700 outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+                          >
+                            {HISTORY_TRANSLATE_LANGS.map((lang) => (
+                              <option key={lang.value} value={lang.value}>
+                                {lang.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          onClick={() => generateHistoryTranslation()}
+                          disabled={translationGenerating}
+                          className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {translationGenerating ? "翻译中..." : "翻译"}
+                        </button>
+                        {translationVersions.length > 0 && (
+                          <div className="flex items-center gap-1">
+                            <span className="text-xs text-slate-400">版本</span>
+                            {translationVersions.map((version) => (
+                              <button
+                                key={version.id}
+                                onClick={() => setSelectedTranslationId(version.id)}
+                                title={
+                                  version.status === "failed"
+                                    ? (version.errorMessage ?? "翻译失败")
+                                    : version.status === "succeeded"
+                                      ? "查看译文"
+                                      : "生成中"
+                                }
+                                className={`rounded px-2 py-1 text-xs font-medium ${
+                                  version.id === selectedTranslation?.id
+                                    ? "bg-brand text-white"
+                                    : version.status === "failed"
+                                      ? "border border-red-200 bg-red-50 text-red-500 hover:bg-red-100"
+                                      : version.status === "succeeded"
+                                        ? "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                                        : "border border-amber-200 bg-amber-50 text-amber-600"
+                                }`}
+                              >
+                                V{version.versionNo}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-h-0 flex-1">
+                        <TranscriptView segments={selected.transcript} />
+                      </div>
+                      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto border-t border-slate-100 px-2 pt-2">
+                        {translationGenerating ? (
+                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                            <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                            <p className="text-sm">正在翻译...</p>
+                          </div>
+                        ) : selectedTranslation?.status === "succeeded" ? (
+                          <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
+                            {selectedTranslation.resultMarkdown}
+                          </div>
+                        ) : selectedTranslation?.status === "failed" ? (
+                          <div className="text-sm text-red-500">
+                            {selectedTranslation.errorMessage ?? "翻译失败"}
+                          </div>
+                        ) : (
+                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
+                            <div className="text-2xl">🌐</div>
+                            <p className="mt-2 text-sm">尚未翻译，选择目标语言后点击「翻译」</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   ) : viewTab === "asrRaw" ? (
                     asrResults.length === 0 ? (
                       <div className="flex h-full flex-col items-center justify-center text-slate-400">
@@ -1598,9 +1750,9 @@ export default function MeetingPage() {
                         </div>
                       </div>
 
-                      {llmResults.length > 0 && (
+                      {summaryResults.length > 0 && (
                         <div className="flex gap-2 overflow-x-auto pb-1">
-                          {llmResults.map((result) => (
+                          {summaryResults.map((result) => (
                             <button
                               key={result.id}
                               onClick={() => selectLlmResult(result.id)}

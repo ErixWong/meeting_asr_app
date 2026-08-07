@@ -684,6 +684,17 @@ function seedDefaults(database: DatabaseSync) {
       upsertHotword(hotword);
     }
   }
+
+  upsertPromptTemplate({
+    id: "tpl-translate",
+    templateKey: "system_translate",
+    templateName: "会议翻译",
+    templateType: "translation",
+    content: "你是实时会议翻译助手。将用户发来的会议记录逐行翻译成目标语言，只输出译文，不要解释、不要编号。",
+    description: "系统内置翻译模板，按句分批调用 LLM",
+    status: "active",
+    isSystem: true,
+  });
 }
 
 function insertMissingSetting(database: DatabaseSync, setting: SettingRow) {
@@ -2560,7 +2571,7 @@ export function claimMeetingLlmGeneration(meetingId: string):
   return { ok: true };
 }
 
-export async function createMeetingLlmResult(meetingId: string, templateId?: string, options?: { skipClaim?: boolean }) {
+export async function createMeetingLlmResult(meetingId: string, templateId?: string, options?: { skipClaim?: boolean; targetLang?: string }) {
   try {
     return await llmQueue.enqueue("summary", () => createMeetingLlmResultInner(meetingId, templateId, options));
   } catch (error) {
@@ -2575,7 +2586,194 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
   }
 }
 
-async function createMeetingLlmResultInner(meetingId: string, templateId?: string, options?: { skipClaim?: boolean }) {
+const TRANSLATE_BATCH_MAX_SENTENCES = 5;
+const TRANSLATE_BATCH_MAX_CHARS = 1000;
+
+async function translateMeetingFlow(
+  meetingId: string,
+  template: PromptTemplateRow,
+  inputTranscriptSnapshot: string,
+  targetLang: string | undefined
+) {
+  const lang = targetLang || "en";
+  const segments = getMergedMeetingTranscriptSegments(meetingId)
+    .filter((segment) => segment.isFinal && Boolean(segment.text.trim()))
+    .map((segment) => segment.text.trim());
+  const existing = listMeetingLlmResultsByMeetingId(meetingId);
+  const startedAt = Date.now();
+  const snapshot = JSON.stringify({
+    targetLang: lang,
+    source: "manual",
+    batchMaxSentences: TRANSLATE_BATCH_MAX_SENTENCES,
+    batchMaxChars: TRANSLATE_BATCH_MAX_CHARS,
+  });
+
+  try {
+    if (segments.length === 0) {
+      throw new Error("Meeting has no final transcript segments to translate");
+    }
+
+    const batches: string[][] = [];
+    let current: string[] = [];
+    let currentChars = 0;
+    for (const text of segments) {
+      if (current.length >= TRANSLATE_BATCH_MAX_SENTENCES || currentChars + text.length > TRANSLATE_BATCH_MAX_CHARS) {
+        batches.push(current);
+        current = [];
+        currentChars = 0;
+      }
+      current.push(text);
+      currentChars += text.length;
+    }
+    if (current.length > 0) batches.push(current);
+
+    const translations = await Promise.all(
+      batches.map((batch) => llmQueue.enqueue("translate", () => translateSentences(batch, lang)))
+    );
+    const resultMarkdown = translations.join("\n\n");
+    if (!resultMarkdown.trim()) {
+      throw new Error("LLM returned empty translation result");
+    }
+
+    withTransaction(() => {
+      const row: MeetingLlmResultRow = {
+        id: newId("llm"),
+        meetingId,
+        inputTranscriptSnapshot,
+        llmSettingMark: "current",
+        promptTemplateId: template.id,
+        generationConfigSnapshot: snapshot,
+        generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
+        status: "succeeded",
+        versionNo: getNextLlmVersionNo(meetingId),
+        resultType: "translation",
+        resultTitle: template.templateName,
+        rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
+        rawResponse: resultMarkdown,
+        resultMarkdown,
+        errorMessage: null,
+      };
+      insertMeetingLlmResult(row);
+      updateMeetingStatus(meetingId, "generated");
+      writeAuditLog({
+        actionType: "llm.translate",
+        resourceType: "meeting_llm_result",
+        resourceId: row.id,
+        resourceName: row.resultTitle,
+        afterSnapshot: {
+          meetingId,
+          promptTemplateId: row.promptTemplateId,
+          versionNo: row.versionNo,
+          status: row.status,
+          targetLang: lang,
+        },
+      });
+    });
+    console.log(
+      `[LLM] translate: meeting=${meetingId} lang=${lang} segments=${segments.length} batches=${batches.length} elapsed=${Date.now() - startedAt}ms`
+    );
+    return resultMarkdown;
+  } catch (error) {
+    const elapsedMs = Date.now() - startedAt;
+    const errorMessage = `Translation failed: ${error instanceof Error ? error.message : String(error)} (elapsed=${elapsedMs}ms)`;
+    console.error(`[LLM] translate failed: meeting=${meetingId} error=${errorMessage}`);
+    withTransaction(() => {
+      const row: MeetingLlmResultRow = {
+        id: newId("llm"),
+        meetingId,
+        inputTranscriptSnapshot,
+        llmSettingMark: "current",
+        promptTemplateId: template.id,
+        generationConfigSnapshot: snapshot,
+        generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
+        status: "failed",
+        versionNo: getNextLlmVersionNo(meetingId),
+        resultType: "translation",
+        resultTitle: template.templateName,
+        rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
+        rawResponse: "",
+        resultMarkdown: "",
+        errorMessage,
+      };
+      insertMeetingLlmResult(row);
+      updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      writeAuditLog({
+        actionType: "llm.translate",
+        resourceType: "meeting_llm_result",
+        resourceId: row.id,
+        resourceName: row.resultTitle,
+        result: "failed",
+        errorMessage,
+        afterSnapshot: {
+          meetingId,
+          promptTemplateId: row.promptTemplateId,
+          versionNo: row.versionNo,
+          status: row.status,
+          targetLang: lang,
+        },
+      });
+    });
+    throw error;
+  }
+}
+
+export function persistLiveTranslation(
+  meetingId: string,
+  targetLang: string,
+  blocks: Array<{ time: string; timeSeconds: number; text: string }>
+) {
+  const textBlocks = blocks
+    .map((block) => String(block.text ?? "").trim())
+    .filter(Boolean);
+  if (textBlocks.length === 0) return null;
+  if (!ensureMeetingOwned(meetingId)) return null;
+
+  const segments = getMergedMeetingTranscriptSegments(meetingId)
+    .filter((segment) => segment.isFinal && Boolean(segment.text.trim()))
+    .map((segment) => segment.text.trim())
+    .join("\n");
+
+  return withTransaction(() => {
+    const existing = listMeetingLlmResultsByMeetingId(meetingId);
+    const resultMarkdown = textBlocks.join("\n\n");
+    const row: MeetingLlmResultRow = {
+      id: newId("llm"),
+      meetingId,
+      inputTranscriptSnapshot: segments,
+      llmSettingMark: "current",
+      promptTemplateId: "tpl-translate",
+      generationConfigSnapshot: JSON.stringify({ targetLang: targetLang || "en", source: "live" }),
+      generationMode: "default_auto",
+      status: "succeeded",
+      versionNo: getNextLlmVersionNo(meetingId),
+      resultType: "translation",
+      resultTitle: "会议翻译",
+      rawPrompt: "",
+      rawResponse: resultMarkdown,
+      resultMarkdown,
+      errorMessage: null,
+    };
+    insertMeetingLlmResult(row);
+    writeAuditLog({
+      actionType: "llm.translate",
+      resourceType: "meeting_llm_result",
+      resourceId: row.id,
+      resourceName: row.resultTitle,
+      afterSnapshot: {
+        meetingId,
+        versionNo: row.versionNo,
+        status: row.status,
+        source: "live",
+        targetLang: targetLang || "en",
+        blockCount: textBlocks.length,
+        existingResults: existing.length,
+      },
+    });
+    return row;
+  });
+}
+
+async function createMeetingLlmResultInner(meetingId: string, templateId?: string, options?: { skipClaim?: boolean; targetLang?: string }) {
   if (!ensureMeetingOwned(meetingId)) throw new Error("Meeting not found");
 
   if (!options?.skipClaim) {
@@ -2599,6 +2797,10 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
   if (!template) {
     updateMeetingStatus(meetingId, "llm_failed", "Prompt template not found");
     throw new Error("Prompt template not found");
+  }
+
+  if (template.templateType === "translation") {
+    return translateMeetingFlow(meetingId, template, inputTranscriptSnapshot, options?.targetLang);
   }
 
   const baseUrl = get("llm", "base_url");
