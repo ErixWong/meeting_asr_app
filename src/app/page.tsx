@@ -1897,7 +1897,7 @@ export default function MeetingPage() {
                           {llmQueueInfo && (
                             <span
                               className={`rounded px-1.5 py-0.5 ${
-                                llmQueueInfo.queued > 0
+                                llmQueueInfo.queued > 0 || llmQueueInfo.inFlight > 0
                                   ? "bg-amber-100 text-amber-700"
                                   : "bg-emerald-100 text-emerald-700"
                               }`}
