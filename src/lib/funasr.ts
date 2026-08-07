@@ -6,6 +6,7 @@
 
 export interface FunASROptions {
   hotWords?: string[];
+  lang?: string;
   onResult: (text: string, isFinal: boolean, speakerId?: number | null, audioData?: Float32Array) => void;
   onError: (error: Error) => void;
   onStatusChange?: (status: string) => void;
@@ -43,7 +44,8 @@ export class FunASRClient {
   async transcribeFile(
     file: File,
     onResult: (text: string, isFinal: boolean, speakerId?: number | null) => void,
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    lang?: string
   ): Promise<void> {
     const arrayBuffer = await file.arrayBuffer();
     const ctx = new AudioContext({ sampleRate: 16000 });
@@ -76,6 +78,7 @@ export class FunASRClient {
             format: "pcm",
             sampleRate: 16000,
           },
+          svsLang: lang ?? "auto",
         }));
       };
 
@@ -229,6 +232,7 @@ export class FunASRClient {
             sampleRate: 16000,
           },
           hotWords: this.options?.hotWords ?? [],
+          svsLang: this.options?.lang ?? "auto",
         }));
         this.sessionStartedResolve = () => { clearTimeout(timeout); resolve(); };
         this.sessionStartedReject = (err) => { clearTimeout(timeout); reject(err); };

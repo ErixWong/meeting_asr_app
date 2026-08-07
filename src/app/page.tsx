@@ -66,6 +66,7 @@ export default function MeetingPage() {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
   const [speakerEnabled, setSpeakerEnabled] = useState(false);
+  const [asrLang, setAsrLang] = useState<string>("auto");
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -540,6 +541,7 @@ export default function MeetingPage() {
                 }
               }
             },
+            lang: asrLang,
           },
           deviceId
         );
@@ -566,6 +568,7 @@ export default function MeetingPage() {
     }
   }, [
     asrReady,
+    asrLang,
     micDeviceId,
     speakerEnabled,
     handleTranscriptResult,
@@ -910,7 +913,8 @@ export default function MeetingPage() {
         },
         (progress) => {
           console.log("[Upload] progress:", progress + "%");
-        }
+        },
+        asrLang
       );
 
       if (allSegments.length > 0) {
@@ -1564,6 +1568,8 @@ export default function MeetingPage() {
                       onMicChange={setMicDeviceId}
                       speakerEnabled={speakerEnabled}
                       onSpeakerChange={setSpeakerEnabled}
+                      asrLang={asrLang}
+                      onLangChange={setAsrLang}
                       disabled={status === "recording" || status === "paused" || status === "connecting"}
                     />
                     {status === "recording" && (
