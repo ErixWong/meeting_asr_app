@@ -2,18 +2,21 @@
 
 > 部署自建 FunASR 在线服务（2pass WebSocket），供本系统 ASR Gateway 使用。
 > 应用本身的部署参见 [deployment-guide.md](./deployment-guide.md)。
+> **模型选型与语种能力说明参见 [funasr-models.md](./funasr-models.md)**——不同模型（中文 Paraformer / SenseVoiceSmall 等）的差异、适用场景及对应部署命令均以该文档为准。
 
 ## 1. 部署模型
 
 ```text
 宿主机 (Linux)
 └── <模型目录>/               # 模型下载/存放目录，挂载到容器 /workspace/models
-    └── damo/                # FunASR 模型（首次启动自动下载）
+    ├── damo/                # FunASR 模型（首次启动自动下载）
+    └── thuduj12/            # ITN 模型（可选，--itn-dir 指定时下载）
 ```
 
 - 镜像：阿里云容器镜像仓库官方镜像 `funasr-runtime-sdk-online-cpu`（CPU 在线 2pass 版本）
 - 服务：`funasr-wss-server-2pass`，监听 `10095` 端口，WebSocket 路径 `/ws`
 - 模型：首次启动自动下载到挂载目录；如需固定具体模型，使用注释中的带参命令
+- 模型选择：默认不指定参数时加载镜像内置默认模型组（中文 Paraformer 2pass）；**换模型（如 SenseVoiceSmall 多语种）请按 [funasr-models.md](./funasr-models.md) 第 4 节的命令调整**
 
 ## 2. 前置条件
 
@@ -39,7 +42,7 @@ services:
     environment:
       DOWNLOAD_MODEL_DIR: /workspace/models
     command: "/workspace/FunASR/runtime/websocket/build/bin/funasr-wss-server-2pass --download-model-dir /workspace/models --certfile 0 --port 10095"
-    # 如需固定具体模型（VAD/离线/在线/标点），改用以下命令：
+    # 如需固定具体模型（VAD/离线/在线/标点/ITN），改用以下命令：
     #command: >
     #  /workspace/FunASR/runtime/websocket/build/bin/funasr-wss-server-2pass
     #  --download-model-dir /workspace/models
@@ -47,8 +50,10 @@ services:
     #  --model-dir damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-onnx
     #  --online-model-dir damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx
     #  --punc-dir damo/punc_ct-transformer_cn-en-common-vocab471067-large-onnx
+    #  --itn-dir thuduj12/fst_itn_zh
     #  --certfile 0
     #  --port 10095
+    # 其他模型部署命令（如 SenseVoiceSmall 多语种）见 docs/funasr-models.md 第 4 节
     healthcheck:
       test: ["CMD-SHELL", "sh -c 'nc -z 127.0.0.1 10095'"]
       interval: 10s

@@ -102,6 +102,7 @@ function extractTiming(message) {
 function buildLocalFunasrStartMessage(session, hotwords) {
   const sampleRate = Number(session.audio?.sampleRate || 16000);
   const hotwordsJson = Object.keys(hotwords).length > 0 ? JSON.stringify(hotwords) : "";
+  const svsLang = typeof session.svsLang === "string" && session.svsLang ? session.svsLang : "auto";
 
   return JSON.stringify({
     mode: "2pass",
@@ -115,7 +116,7 @@ function buildLocalFunasrStartMessage(session, hotwords) {
     is_speaking: true,
     itn: true,
     hotwords: hotwordsJson,
-    svs_lang: "auto",
+    svs_lang: svsLang,
     svs_itn: true,
   });
 }
