@@ -32,7 +32,6 @@ import { useAuthSession } from "@/lib/use-auth-session";
 
 let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
-const TRANSLATE_TRIGGER_SENTENCES = 3;
 const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
 const TRANSLATE_BUFFER_CHARS_MAX = 2000;
 
@@ -80,6 +79,7 @@ export default function MeetingPage() {
   const [translationEnabled, setTranslationEnabled] = useState(false);
   const [targetLang, setTargetLang] = useState<string>("en");
   const [translations, setTranslations] = useState<TranslationBlock[]>([]);
+  const [llmQueueInfo, setLlmQueueInfo] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
   const [selected, setSelected] = useState<MeetingRecord | null>(null);
@@ -132,6 +132,7 @@ export default function MeetingPage() {
   const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const translateScheduledRef = useRef(false);
   const lastTranslateAtRef = useRef(0);
+  const translateTriggerSentencesRef = useRef(3);
   const translationIdCounterRef = useRef(0);
 
   const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
@@ -268,7 +269,7 @@ export default function MeetingPage() {
     }
     const totalChars = pending.reduce((sum, item) => sum + item.text.length, 0);
     const due = Date.now() - lastTranslateAtRef.current >= TRANSLATE_TRIGGER_INTERVAL_MS;
-    if (!force && pending.length < TRANSLATE_TRIGGER_SENTENCES && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
+    if (!force && pending.length < translateTriggerSentencesRef.current && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
       scheduleTranslateTimer();
       return;
     }
@@ -535,9 +536,40 @@ export default function MeetingPage() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    if (!translationEnabled || (status !== "recording" && status !== "paused" && status !== "connecting")) {
+      setLlmQueueInfo(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const data = await requestJson<{ inFlight?: number; queued?: number; dropped?: number }>("/api/llm-queue-status");
+        if (cancelled) return;
+        setLlmQueueInfo({
+          inFlight: Number(data.inFlight ?? 0),
+          queued: Number(data.queued ?? 0),
+          dropped: Number(data.dropped ?? 0),
+        });
+      } catch {
+        if (!cancelled) setLlmQueueInfo(null);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [translationEnabled, status, requestJson]);
+
   const loadRuntimeConfig = useCallback(async () => {
-    const data = await requestJson<{ asr?: { isConfigured?: boolean } }>("/api/config");
+    const data = await requestJson<{ asr?: { isConfigured?: boolean }; llm?: { translateTriggerSentences?: number } }>("/api/config");
     const nextAsrReady = Boolean(data.asr?.isConfigured);
+    const nextTriggerSentences = Number(data.llm?.translateTriggerSentences);
+    if (Number.isFinite(nextTriggerSentences) && nextTriggerSentences > 0) {
+      translateTriggerSentencesRef.current = nextTriggerSentences;
+    }
 
     setAsrReady(nextAsrReady);
 
@@ -1860,7 +1892,20 @@ export default function MeetingPage() {
                   {translationEnabled && (
                     <>
                       <div className="flex shrink-0 items-center justify-between border-t border-slate-100 bg-slate-50/60 px-2 py-1 text-xs text-slate-400">
-                        <span>🌐 译文</span>
+                        <span className="flex items-center gap-2">
+                          🌐 译文
+                          {llmQueueInfo && (
+                            <span
+                              className={`rounded px-1.5 py-0.5 ${
+                                llmQueueInfo.queued > 0
+                                  ? "bg-amber-100 text-amber-700"
+                                  : "bg-emerald-100 text-emerald-700"
+                              }`}
+                            >
+                              队列 {llmQueueInfo.queued} · 处理中 {llmQueueInfo.inFlight}
+                            </span>
+                          )}
+                        </span>
                       </div>
                       <div className="min-h-0 flex-1">
                         <TranslationView translations={translations} />

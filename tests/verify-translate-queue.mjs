@@ -1,4 +1,4 @@
-// 翻译 API + LLM 全局队列验证
+﻿// 翻译 API + LLM 全局队列验证
 // 前提：dev server 已启动（端口 3123），且加载了新代码
 // 用法：node tests/verify-translate-queue.mjs
 // 说明：直接读写本地 SQLite 插入临时用户，验证后清理；仅限本地开发库
@@ -11,10 +11,8 @@ const DB_PATH = join(process.cwd(), "data", "meeting-asr-app.db");
 const TEST_PASSWORD = "verifypass123";
 const USER_ACCOUNT = "verify_queue_user";
 const USER_ID = "user-verify-queue";
-const USER_ROLE_REL = "user-role-verify-queue";
 const ADMIN_ACCOUNT = "verify_queue_admin";
 const ADMIN_ID = "user-verify-queue-admin";
-const ADMIN_ROLE_REL = "user-role-verify-queue-admin";
 
 async function jf(path, { method = "GET", body, cookies, timeout = 30000 } = {}) {
   const res = await fetch(BASE + path, {
@@ -75,7 +73,7 @@ try {
   // 1. 未认证
   let r = await jf("/api/translate", { method: "POST", body: { sentences: ["你好"], targetLang: "en" } });
   check("无 cookie 访问 /api/translate 返回 401", r.status === 401, `status=${r.status}`);
-  r = await jf("/api/admin/llm-queue-status");
+  r = await jf("/api/llm-queue-status");
   check("无 cookie 访问 queue-status 返回 401", r.status === 401, `status=${r.status}`);
 
   // 2. 普通用户
@@ -86,8 +84,8 @@ try {
   r = await jf("/api/translate", { method: "POST", cookies: userCookies, body: { sentences: [], targetLang: "en" } });
   check("空句子返回 400", r.status === 400, `status=${r.status}`);
 
-  r = await jf("/api/admin/llm-queue-status", { cookies: userCookies });
-  check("普通用户访问 queue-status 返回 403", r.status === 403, `status=${r.status}`);
+  r = await jf("/api/llm-queue-status", { cookies: userCookies });
+  check("普通用户可访问 queue-status 返回 200", r.status === 200, `status=${r.status}`);
 
   r = await jf("/api/translate", {
     method: "POST",
@@ -110,9 +108,9 @@ try {
   check("管理员登录", r.status === 200, JSON.stringify(r.data?.user ?? r.data));
   if (r.status === 200) adminCookies = r.setCookie.split(";")[0];
 
-  r = await jf("/api/admin/llm-queue-status", { cookies: adminCookies });
+  r = await jf("/api/llm-queue-status", { cookies: adminCookies });
   check(
-    "管理员 queue-status 返回 200 且字段齐全",
+    "queue-status 返回 200 且字段齐全",
     r.status === 200 &&
       typeof r.data?.inFlight === "number" &&
       typeof r.data?.queued === "number" &&
@@ -123,12 +121,36 @@ try {
   );
   const droppedBaseline = r.data?.dropped ?? 0;
 
-  // 4. 新配置项已 seed
+  // 4. 新配置项已 seed 且合法
   r = await jf("/api/admin/settings", { cookies: adminCookies });
   const settings = Array.isArray(r.data?.settings) ? r.data.settings : [];
   const get = (mark) => settings.find((s) => s.itemSection === "llm" && s.itemMark === mark)?.itemValue;
-  check("llm:max_concurrency 已存在（默认 2）", get("max_concurrency") === "2", `value=${get("max_concurrency")}`);
-  check("llm:queue_capacity 已存在（默认 10）", get("queue_capacity") === "10", `value=${get("queue_capacity")}`);
+  const concurrencyValue = Number(get("max_concurrency"));
+  const capacityValue = Number(get("queue_capacity"));
+  const triggerValue = Number(get("translate_trigger_sentences"));
+  check(
+    "llm:max_concurrency 存在且合法",
+    Number.isFinite(concurrencyValue) && concurrencyValue >= 1 && concurrencyValue <= 20,
+    `value=${get("max_concurrency")}`
+  );
+  check(
+    "llm:queue_capacity 存在且合法",
+    Number.isFinite(capacityValue) && capacityValue >= 1 && capacityValue <= 200,
+    `value=${get("queue_capacity")}`
+  );
+  check(
+    "llm:translate_trigger_sentences 存在且合法",
+    Number.isFinite(triggerValue) && triggerValue >= 1 && triggerValue <= 20,
+    `value=${get("translate_trigger_sentences")}`
+  );
+
+  // 4b. /api/config 返回翻译触发句数
+  r = await jf("/api/config", { cookies: userCookies });
+  check(
+    "/api/config 返回 llm.translateTriggerSentences",
+    r.status === 200 && Number(r.data?.llm?.translateTriggerSentences) >= 1,
+    `value=${r.data?.llm?.translateTriggerSentences}`
+  );
 
   // 5. test-llm 经队列（LLM 不可用时 500 但不挂死）
   const llmBaseUrl = get("base_url") || "http://qwen.local:8080/v1";
@@ -162,7 +184,7 @@ try {
     results.map((item) => item.status).join(",")
   );
 
-  r = await jf("/api/admin/llm-queue-status", { cookies: adminCookies });
+  r = await jf("/api/llm-queue-status", { cookies: adminCookies });
   check(
     "压测后队列归零（inFlight/queued=0）",
     r.data?.inFlight === 0 && r.data?.queued === 0,

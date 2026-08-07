@@ -216,6 +216,7 @@ export default function AdminPage() {
   const [llmTimeoutMs, setLlmTimeoutMs] = useState("");
   const [llmConcurrency, setLlmConcurrency] = useState("2");
   const [llmQueueCapacity, setLlmQueueCapacity] = useState("10");
+  const [llmTranslateTriggerSentences, setLlmTranslateTriggerSentences] = useState("3");
   const [llmQueueStatus, setLlmQueueStatus] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
   const [llmStatus, setLlmStatus] = useState<"ok" | "fail" | "idle">("idle");
 
@@ -336,6 +337,13 @@ export default function AdminPage() {
         itemValue: llmQueueCapacity,
       },
       {
+        itemSection: "llm",
+        itemMark: "translate_trigger_sentences",
+        itemTitle: "翻译触发句数",
+        itemDescription: "实时翻译攒够多少句 final 触发一次，越小越实时",
+        itemValue: llmTranslateTriggerSentences,
+      },
+      {
         itemSection: "mail",
         itemMark: "smtp_host",
         itemTitle: "SMTP Host",
@@ -399,6 +407,7 @@ export default function AdminPage() {
       llmTimeoutMs,
       llmConcurrency,
       llmQueueCapacity,
+      llmTranslateTriggerSentences,
       mailFromEmail,
       mailFromName,
       mailHost,
@@ -466,6 +475,7 @@ export default function AdminPage() {
         setLlmTimeoutMs(get("llm", "timeout_ms", ""));
         setLlmConcurrency(get("llm", "max_concurrency", "2"));
         setLlmQueueCapacity(get("llm", "queue_capacity", "10"));
+        setLlmTranslateTriggerSentences(get("llm", "translate_trigger_sentences", "3"));
 
         setMailHost(get("mail", "smtp_host", "smtp.example.com"));
         setMailPort(get("mail", "smtp_port", "465"));
@@ -500,7 +510,7 @@ export default function AdminPage() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const data = await requestJson("/api/admin/llm-queue-status");
+        const data = await requestJson("/api/llm-queue-status");
         if (cancelled) return;
         setLlmQueueStatus({
           inFlight: Number(data.inFlight ?? 0),
@@ -1127,6 +1137,8 @@ export default function AdminPage() {
                 <input type="number" min="1" step="1" value={llmQueueCapacity} onChange={(e) => setLlmQueueCapacity(e.target.value)} className={inputCls} />
               </div>
             </div>
+            <label className="mb-1 mt-3 block text-xs text-slate-500">翻译触发句数（默认 3，模型快可调小更实时）</label>
+            <input type="number" min="1" max="20" step="1" value={llmTranslateTriggerSentences} onChange={(e) => setLlmTranslateTriggerSentences(e.target.value)} className={inputCls} />
             {llmQueueStatus && (
               <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
                 队列状态：进行中 {llmQueueStatus.inFlight} · 排队 {llmQueueStatus.queued} · 累计拒绝 {llmQueueStatus.dropped}

@@ -346,6 +346,11 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "全局队列最多排队等待的请求数，超出直接拒绝，默认 10",
     validate: integerSetting("LLM queue capacity", 1, 200),
   },
+  "llm:translate_trigger_sentences": {
+    itemTitle: "翻译触发句数",
+    itemDescription: "实时翻译攒够多少句 final 触发一次，越小越实时（默认 3）",
+    validate: integerSetting("LLM translate trigger sentences", 1, 20),
+  },
   "mail:smtp_host": {
     itemTitle: "SMTP Host",
     itemDescription: "邮件服务主机",
@@ -554,6 +559,13 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "LLM 排队长度",
         itemDescription: "全局队列最多排队等待的请求数，超出直接拒绝",
         itemValue: "10",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "translate_trigger_sentences",
+        itemTitle: "翻译触发句数",
+        itemDescription: "实时翻译攒够多少句 final 触发一次，越小越实时",
+        itemValue: "3",
       },
       {
         itemSection: "mail",
@@ -1379,6 +1391,7 @@ export function getRuntimeConfig() {
       baseUrl: get("llm", "base_url"),
       model: get("llm", "model"),
       hasApiKey: Boolean(get("llm", "api_key")),
+      translateTriggerSentences: Number(String(get("llm", "translate_trigger_sentences") || "3").trim()) || 3,
     },
     defaultPromptTemplate: defaultTemplate
       ? {
