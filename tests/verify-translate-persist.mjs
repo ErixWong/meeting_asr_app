@@ -157,11 +157,13 @@ async function run() {
     check("生成版本号递增（≥2）", (final?.versionNo ?? 0) >= 2, `versionNo=${final?.versionNo}`);
   }
 } finally {
-  if (meetingId) {
-    db.prepare("DELETE FROM meeting_llm_results WHERE meeting_id = ?").run(meetingId);
-    db.prepare("DELETE FROM meeting_asr_results WHERE meeting_id = ?").run(meetingId);
-    db.prepare("DELETE FROM meetings WHERE id = ?").run(meetingId);
-  }
+  db.prepare(
+    "DELETE FROM meeting_llm_results WHERE meeting_id IN (SELECT id FROM meetings WHERE created_by_user_id = ?)"
+  ).run(USER_ID);
+  db.prepare(
+    "DELETE FROM meeting_asr_results WHERE meeting_id IN (SELECT id FROM meetings WHERE created_by_user_id = ?)"
+  ).run(USER_ID);
+  db.prepare("DELETE FROM meetings WHERE created_by_user_id = ?").run(USER_ID);
   db.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(USER_ID);
   db.prepare("DELETE FROM user_roles WHERE user_id = ?").run(USER_ID);
   db.prepare("DELETE FROM users WHERE id = ?").run(USER_ID);
