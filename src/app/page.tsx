@@ -125,6 +125,7 @@ export default function MeetingPage() {
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
   const translationEnabledRef = useRef(false);
   const targetLangRef = useRef("en");
+  const asrLangRef = useRef("auto");
   const pendingTranslateRef = useRef<PendingTranslation[]>([]);
   const translateInFlightRef = useRef(false);
   const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -140,13 +141,28 @@ export default function MeetingPage() {
     translationEnabledRef.current = enabled;
     setTranslationEnabled(enabled);
     if (!enabled) {
-      resetTranslationScheduler();
+      resetTranslateRef.current();
     }
   }, []);
 
   const handleTargetLangChange = useCallback((lang: string) => {
     targetLangRef.current = lang;
     setTargetLang(lang);
+    if (asrLangRef.current !== "auto" && lang === asrLangRef.current && translationEnabledRef.current) {
+      translationEnabledRef.current = false;
+      setTranslationEnabled(false);
+      resetTranslateRef.current();
+    }
+  }, []);
+
+  const handleAsrLangChange = useCallback((lang: string) => {
+    asrLangRef.current = lang;
+    setAsrLang(lang);
+    if (lang !== "auto" && lang === targetLangRef.current && translationEnabledRef.current) {
+      translationEnabledRef.current = false;
+      setTranslationEnabled(false);
+      resetTranslateRef.current();
+    }
   }, []);
 
   const updateSummaryGenerating = useCallback((value: boolean, meetingId?: string | null) => {
@@ -222,7 +238,7 @@ export default function MeetingPage() {
     }, TRANSLATE_TRIGGER_INTERVAL_MS);
   }
 
-  function processTranslateBuffer() {
+  function processTranslateBuffer(force = false) {
     if (!translationEnabledRef.current) return;
     const pending = pendingTranslateRef.current;
     if (pending.length === 0) return;
@@ -232,7 +248,7 @@ export default function MeetingPage() {
     }
     const totalChars = pending.reduce((sum, item) => sum + item.text.length, 0);
     const due = Date.now() - lastTranslateAtRef.current >= TRANSLATE_TRIGGER_INTERVAL_MS;
-    if (pending.length < TRANSLATE_TRIGGER_SENTENCES && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
+    if (!force && pending.length < TRANSLATE_TRIGGER_SENTENCES && totalChars <= TRANSLATE_BUFFER_CHARS_MAX && !due) {
       scheduleTranslateTimer();
       return;
     }
@@ -284,6 +300,7 @@ export default function MeetingPage() {
 
   const feedTranslationBuffer = useCallback((result: TranscriptResult) => {
     if (!translationEnabledRef.current) return;
+    if (asrLangRef.current !== "auto" && asrLangRef.current === targetLangRef.current) return;
     const text = result.text.trim();
     if (!text) return;
     pendingTranslateRef.current.push({ text, time: result.time, timeSeconds: result.timeSeconds });
@@ -299,15 +316,19 @@ export default function MeetingPage() {
     pendingTranslateRef.current = [];
     translateInFlightRef.current = false;
     lastTranslateAtRef.current = 0;
+    setTranslations([]);
   }
 
   function flushTranslationBuffer() {
     if (pendingTranslateRef.current.length === 0 || translateInFlightRef.current) return;
-    processTranslateBuffer();
+    processTranslateBuffer(true);
   }
 
   const flushTranslateRef = useRef<() => void>(() => {});
   flushTranslateRef.current = flushTranslationBuffer;
+
+  const resetTranslateRef = useRef<() => void>(() => {});
+  resetTranslateRef.current = resetTranslationScheduler;
 
   const commitFinalResult = useCallback(
     (result: TranscriptResult, onCommitted?: TranscriptCommitListener) => {
@@ -332,7 +353,10 @@ export default function MeetingPage() {
   );
 
   useEffect(() => {
-    return () => resetTranscriptScheduler();
+    return () => {
+      resetTranscriptScheduler();
+      resetTranslateRef.current();
+    };
   }, [resetTranscriptScheduler]);
 
   const requestJson = useCallback(async <T = unknown,>(input: RequestInfo | URL, init?: RequestInit) => {
@@ -864,6 +888,7 @@ export default function MeetingPage() {
 
   const handleCreateNew = useCallback(() => {
     resetTranscriptScheduler();
+    resetTranslateRef.current();
     asrRecoveryRef.current = false;
     persistedMeetingIdRef.current = null;
     persistedSegmentCountRef.current = 0;
@@ -1707,7 +1732,7 @@ export default function MeetingPage() {
                       speakerEnabled={speakerEnabled}
                       onSpeakerChange={setSpeakerEnabled}
                       asrLang={asrLang}
-                      onLangChange={setAsrLang}
+                      onLangChange={handleAsrLangChange}
                       translationEnabled={translationEnabled}
                       onTranslationChange={handleTranslationChange}
                       targetLang={targetLang}

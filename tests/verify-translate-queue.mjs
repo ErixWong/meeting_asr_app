@@ -112,10 +112,16 @@ try {
 
   r = await jf("/api/admin/llm-queue-status", { cookies: adminCookies });
   check(
-    "管理员 queue-status 返回 200 且数字归零",
-    r.status === 200 && r.data?.inFlight === 0 && r.data?.queued === 0 && r.data?.dropped === 0,
+    "管理员 queue-status 返回 200 且字段齐全",
+    r.status === 200 &&
+      typeof r.data?.inFlight === "number" &&
+      typeof r.data?.queued === "number" &&
+      typeof r.data?.dropped === "number" &&
+      r.data.inFlight === 0 &&
+      r.data.queued === 0,
     JSON.stringify(r.data ?? {})
   );
+  const droppedBaseline = r.data?.dropped ?? 0;
 
   // 4. 新配置项已 seed
   r = await jf("/api/admin/settings", { cookies: adminCookies });
@@ -161,6 +167,11 @@ try {
     "压测后队列归零（inFlight/queued=0）",
     r.data?.inFlight === 0 && r.data?.queued === 0,
     JSON.stringify(r.data ?? {})
+  );
+  check(
+    "压测期间 dropped 计数未异常增长（≤ 并发数）",
+    (r.data?.dropped ?? 0) - droppedBaseline <= 6,
+    `delta=${(r.data?.dropped ?? 0) - droppedBaseline}`
   );
 
   // 7. 创建会议（默认 triggerLlm）不破坏原流程
