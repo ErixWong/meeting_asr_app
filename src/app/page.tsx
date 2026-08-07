@@ -1574,6 +1574,14 @@ export default function MeetingPage() {
                         </div>
                       </div>
                     )}
+                    <RecordingControls
+                      status={status}
+                      onStart={startRecording}
+                      onPause={pauseRecording}
+                      onResume={resumeRecording}
+                      onStop={stopRecording}
+                    />
+                    <div className="hidden h-6 w-px bg-slate-200 sm:block" />
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1588,14 +1596,7 @@ export default function MeetingPage() {
                     >
                       上传音频
                     </button>
-                     <RecordingControls
-                       status={status}
-                       onStart={startRecording}
-                      onPause={pauseRecording}
-                      onResume={resumeRecording}
-                      onStop={stopRecording}
-                    />
-                   </div>
+                  </div>
                  </div>
                 {speakerEnabled && (status === "idle" || status === "done") && (
                   <div className="border-b border-slate-100 bg-amber-50 px-4 py-2 text-xs text-amber-600">
