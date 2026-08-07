@@ -1634,6 +1634,11 @@ export default function MeetingPage() {
                 <div className="flex-1 overflow-auto">
                   <TranscriptView segments={liveSegments} />
                 </div>
+                {speakerEnabled && (status === "idle" || status === "done") && (
+                  <div className="border-t border-slate-100 px-4 py-2 text-xs text-amber-600">
+                    系统声音开启：开始录音时会弹出共享窗口，请选择「整个屏幕」（可采到所有应用的声音）并确认共享声音
+                  </div>
+                )}
               </div>
             )}
           </div>
