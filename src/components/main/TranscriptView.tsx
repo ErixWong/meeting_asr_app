@@ -48,6 +48,8 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
   let current: MergedParagraph | null = null;
 
   for (const seg of segments) {
+    const cleanText = stripSenseVoiceTokens(seg.text);
+    if (!cleanText) continue;
     const segSpeakerId = seg.speakerId ?? null;
     const segSource = seg.source ?? undefined;
 
@@ -59,7 +61,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
       current.speakerId === segSpeakerId &&
       current.isFinal
     ) {
-      current.text += stripSenseVoiceTokens(seg.text);
+      current.text += cleanText;
       current.isFinal = seg.isFinal;
     } else {
       if (current) {
@@ -72,7 +74,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
         speakerId: segSpeakerId,
         source: segSource,
         deviceId: seg.deviceId,
-        text: stripSenseVoiceTokens(seg.text),
+        text: cleanText,
         isFinal: seg.isFinal,
       };
     }

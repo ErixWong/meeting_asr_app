@@ -128,6 +128,7 @@ export default function MeetingPage() {
   const asrLangRef = useRef("auto");
   const pendingTranslateRef = useRef<PendingTranslation[]>([]);
   const translateInFlightRef = useRef(false);
+  const translateGenerationRef = useRef(0);
   const translateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const translateScheduledRef = useRef(false);
   const lastTranslateAtRef = useRef(0);
@@ -273,6 +274,7 @@ export default function MeetingPage() {
     }
 
     translateInFlightRef.current = true;
+    const generation = translateGenerationRef.current;
     const batch = pending;
     pendingTranslateRef.current = [];
     const targetLangCode = targetLangRef.current;
@@ -287,6 +289,7 @@ export default function MeetingPage() {
         if (!res.ok) throw new Error(String(data.error ?? `HTTP ${res.status}`));
         const text = String(data.text ?? "").trim();
         if (!text) throw new Error("Empty translation response");
+        if (generation !== translateGenerationRef.current) return;
         setTranslations((prev) => [
           ...prev,
           {
@@ -297,6 +300,7 @@ export default function MeetingPage() {
           },
         ]);
       } catch (error) {
+        if (generation !== translateGenerationRef.current) return;
         console.warn("Translation failed, buffer retained for retry:", error);
         const merged = [...batch, ...pendingTranslateRef.current];
         while (
@@ -307,9 +311,11 @@ export default function MeetingPage() {
         }
         pendingTranslateRef.current = merged;
       } finally {
-        translateInFlightRef.current = false;
-        lastTranslateAtRef.current = Date.now();
-        scheduleTranslateTimer();
+        if (generation === translateGenerationRef.current) {
+          translateInFlightRef.current = false;
+          lastTranslateAtRef.current = Date.now();
+          scheduleTranslateTimer();
+        }
       }
     })();
   }
@@ -334,6 +340,7 @@ export default function MeetingPage() {
     translateScheduledRef.current = false;
     pendingTranslateRef.current = [];
     translateInFlightRef.current = false;
+    translateGenerationRef.current += 1;
     lastTranslateAtRef.current = 0;
     setTranslations([]);
   }
