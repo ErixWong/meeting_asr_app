@@ -1608,10 +1608,14 @@ export default function MeetingPage() {
                         </label>
                         <button
                           onClick={() => generateHistoryTranslation()}
-                          disabled={translationGenerating}
+                          disabled={translationGenerating || selected?.status === "llm_processing"}
                           className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
                         >
-                          {translationGenerating ? "翻译中..." : "翻译"}
+                          {translationGenerating || selected?.status === "llm_processing"
+                            ? selected?.status === "llm_processing" && !translationGenerating
+                              ? "处理中..."
+                              : "翻译中..."
+                            : "翻译"}
                         </button>
                         {translationVersions.length > 0 && (
                           <div className="flex items-center gap-1">

@@ -2627,9 +2627,12 @@ async function translateMeetingFlow(
     }
     if (current.length > 0) batches.push(current);
 
-    const translations = await Promise.all(
-      batches.map((batch) => llmQueue.enqueue("translate", () => translateSentences(batch, lang)))
-    );
+    // 批内串行直连 LLM，不再经队列嵌套入队（外层 summary 槽已保证整个翻译任务并发=1；
+    // 嵌套入队会在多任务并发时因槽位被外层占用导致 30s 排队超时，任务必失败）
+    const translations: string[] = [];
+    for (const batch of batches) {
+      translations.push(await translateSentences(batch, lang));
+    }
     const resultMarkdown = translations.join("\n\n");
     if (!resultMarkdown.trim()) {
       throw new Error("LLM returned empty translation result");
