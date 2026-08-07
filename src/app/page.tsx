@@ -1551,7 +1551,7 @@ export default function MeetingPage() {
                 )}
               </div>
             ) : (
-              <div className="mx-auto flex h-full max-w-5xl flex-col rounded-xl border border-slate-200 bg-white">
+              <div className="flex h-full w-full flex-col rounded-xl border border-slate-200 bg-white">
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-4 py-3">
                   <div>
                     <h2 className="text-xl font-semibold text-slate-800">新增录音</h2>
