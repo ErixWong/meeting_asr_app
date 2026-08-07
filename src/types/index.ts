@@ -10,6 +10,8 @@ export interface TranscriptSegment {
   id: string;
   speaker: string;
   speakerId?: number | null;
+  source?: "mic" | "speaker";
+  deviceId?: string;
   text: string;
   time: string;
   timeSeconds: number;

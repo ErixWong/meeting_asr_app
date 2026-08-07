@@ -54,6 +54,8 @@ cat > .env <<'EOF'
 # 线上访问的 Origin（浏览器地址栏的协议+域名+端口，多个用逗号分隔）
 # 不配置时 WebSocket (/asr) 握手会被 Origin 白名单拒绝
 ASR_GATEWAY_ALLOWED_ORIGINS=https://meeting.example.com
+# 直接使用 http://host:3123 时设为 false；HTTPS 反向代理时设为 true
+AUTH_COOKIE_SECURE=false
 # 引导管理员（首次启动创建）
 BOOTSTRAP_ADMIN_ACCOUNT=admin
 BOOTSTRAP_ADMIN_PASSWORD=<强密码，勿用默认值>
@@ -70,7 +72,7 @@ docker compose ps            # 状态应为 running (healthy)
 ```
 
 - 首次启动较慢（容器内 `npm ci` + `npm run build`，视网络与磁盘 2~5 分钟），健康检查 `start_period` 已按 180s 配置。
-- 启动命令为条件式：`node_modules` 存在则跳过安装，`.next/BUILD_ID` 存在则跳过构建，之后直接启动应用。
+- 启动命令为条件式：`node_modules/next/package.json` 存在则跳过安装，`.next/BUILD_ID` 存在则跳过构建，之后直接启动应用。这样即使 Docker 自动创建了空的 `.docker/node_modules` 挂载目录，也会正常执行 `npm ci`。
 
 ### 3.5 验证
 
@@ -110,6 +112,7 @@ docker compose restart app
 
 - **必须**设置 `BOOTSTRAP_ADMIN_PASSWORD`，默认 `admin123` 仅限开发。
 - **必须**将 `ASR_GATEWAY_ALLOWED_ORIGINS` 配置为实际访问 Origin，否则 WebSocket 握手被拒（生产默认拒绝未认证连接）。
+- 如果通过 HTTPS 反向代理访问，将 `AUTH_COOKIE_SECURE` 设为 `true`；如果直接通过 HTTP 访问 3123 端口，保持为 `false`，否则浏览器不会发送登录 cookie。
 - 当前容器以 root 运行；如需加固，可在 compose 增加 `user: "node"` 并对 `.docker/` 目录 `chown -R node:node`。
 - 敏感配置（ASR/LLM/SMTP 密钥）存于 SQLite，注意 `.docker/data` 的访问权限。
 

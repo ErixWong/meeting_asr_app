@@ -4,8 +4,14 @@ export interface TranscriptResult {
   text: string;
   isFinal: boolean;
   speakerId?: number | null;
+  source?: "mic" | "speaker";
+  deviceId?: string;
   time: string;
   timeSeconds: number;
+}
+
+function segmentSourceKey(segment: Pick<TranscriptSegment, "source" | "deviceId">): string {
+  return `${segment.source ?? "mic"}:${segment.deviceId ?? ""}`;
 }
 
 export function updateTranscriptSegments(
@@ -13,20 +19,27 @@ export function updateTranscriptSegments(
   result: TranscriptResult,
   createId: () => string
 ): TranscriptSegment[] {
-  const lastIndex = segments.length - 1;
-  const lastSegment = segments[lastIndex];
+  const resultKey = `${result.source ?? "mic"}:${result.deviceId ?? ""}`;
 
-  if (lastSegment && !lastSegment.isFinal) {
+  let lastIndex = -1;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (segmentSourceKey(segments[i]) === resultKey) {
+      lastIndex = i;
+      break;
+    }
+  }
+
+  if (lastIndex >= 0 && !segments[lastIndex].isFinal) {
     const updated = [...segments];
     updated[lastIndex] = result.isFinal
       ? {
-          ...lastSegment,
+          ...updated[lastIndex],
           text: result.text,
           speakerId: result.speakerId,
           isFinal: true,
         }
       : {
-          ...lastSegment,
+          ...updated[lastIndex],
           text: result.text,
         };
     return updated;
@@ -38,6 +51,8 @@ export function updateTranscriptSegments(
       id: createId(),
       speaker: "",
       speakerId: result.speakerId,
+      source: result.source,
+      deviceId: result.deviceId,
       text: result.text,
       time: result.time,
       timeSeconds: result.timeSeconds,

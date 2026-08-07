@@ -156,10 +156,14 @@ export class FunASRClient {
     this.sessionStarted = false;
 
     try {
-      const constraints: MediaStreamConstraints = {
-        audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-      };
-      this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (deviceId === "speaker") {
+        this.mediaStream = await this.captureSystemAudio();
+      } else {
+        const constraints: MediaStreamConstraints = {
+          audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+        };
+        this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      }
       this.audioContext = new AudioContext({ sampleRate: 16000 });
       if (this.audioContext.state === "suspended") {
         await this.audioContext.resume();
@@ -172,6 +176,36 @@ export class FunASRClient {
       this.options.onError(error as Error);
       throw error;
     }
+  }
+
+  /**
+   * Captures system audio output via getDisplayMedia (screen share).
+   * Chrome/Edge support "share system audio" when sharing the whole screen
+   * or a tab; the video track is stopped immediately since only audio is needed.
+   */
+  private async captureSystemAudio(): Promise<MediaStream> {
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+    } catch (error) {
+      const err = error as DOMException;
+      if (err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError") {
+        throw new Error("已取消共享，未捕获系统声音");
+      }
+      throw new Error("无法获取系统声音：请确认浏览器支持（Chrome/Edge），并允许共享屏幕");
+    }
+
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error("未捕获到系统音频，请选择“整个屏幕”（或含声音的标签页）并开启共享声音");
+    }
+
+    stream.getVideoTracks().forEach((track) => track.stop());
+    return stream;
   }
 
   private async connectWebSocket(): Promise<void> {
@@ -407,16 +441,21 @@ export class FunASRClient {
 export async function getAudioDevices(): Promise<
   { deviceId: string; label: string }[]
 > {
+  const devices: { deviceId: string; label: string }[] = [];
   try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices
-      .filter((device) => device.kind === "audioinput")
-      .map((device) => ({
-        deviceId: device.deviceId,
-        label: device.label || `麦克风 ${device.deviceId.slice(0, 8)}`,
-      }));
+    const list = await navigator.mediaDevices.enumerateDevices();
+    devices.push(
+      ...list
+        .filter((device) => device.kind === "audioinput")
+        .map((device) => ({
+          deviceId: device.deviceId,
+          label: device.label || `麦克风 ${device.deviceId.slice(0, 8)}`,
+        }))
+    );
   } catch (error) {
     console.error("Failed to get audio devices:", error);
-    return [{ deviceId: "default", label: "默认麦克风" }];
+    devices.push({ deviceId: "default", label: "默认麦克风" });
   }
+  devices.push({ deviceId: "speaker", label: "系统声音 (Speaker)" });
+  return devices;
 }
