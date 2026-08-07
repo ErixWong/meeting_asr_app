@@ -1374,10 +1374,15 @@ export default function MeetingPage() {
   }, [llmResults]);
 
   const deleteLlmResult = useCallback(
-    async (resultId: string) => {
+    async (resultId: string, kind: "summary" | "translation" = "summary") => {
       if (!selected) return;
       const meetingId = selected.id;
-      if (!window.confirm("确定删除该纪要版本？关联的发送记录也会一并删除。")) return;
+      const label = kind === "translation" ? "翻译" : "纪要";
+      const confirmText =
+        kind === "translation"
+          ? "确定删除该翻译版本？"
+          : "确定删除该纪要版本？关联的发送记录也会一并删除。";
+      if (!window.confirm(confirmText)) return;
       try {
         await requestJson(`/api/meetings/${meetingId}/llm-results?resultId=${encodeURIComponent(resultId)}`, {
           method: "DELETE",
@@ -1385,7 +1390,7 @@ export default function MeetingPage() {
         if (!isActiveMeeting(meetingId)) return;
         await loadLlmResults(meetingId);
         await refreshMeeting(meetingId);
-        showNotice("success", "纪要版本已删除");
+        showNotice("success", `${label}版本已删除`);
       } catch (error) {
         console.error("Delete llm result failed:", error);
         if (!isActiveMeeting(meetingId)) return;
@@ -1644,6 +1649,15 @@ export default function MeetingPage() {
                                 V{version.versionNo}
                               </button>
                             ))}
+                            {selectedTranslation && (
+                              <button
+                                onClick={() => deleteLlmResult(selectedTranslation.id, "translation")}
+                                title="删除该翻译版本"
+                                className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-400 hover:border-red-200 hover:bg-red-50 hover:text-red-500"
+                              >
+                                ✕ 删除
+                              </button>
+                            )}
                           </div>
                         )}
                       </div>
