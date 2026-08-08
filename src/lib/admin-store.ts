@@ -2320,7 +2320,7 @@ export function listMeetings() {
         (
           SELECT result_markdown
           FROM meeting_llm_results lr
-          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded'
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type != 'translation'
           ORDER BY lr.version_no DESC, lr.created_at DESC
           LIMIT 1
         ) as summary
@@ -2347,7 +2347,7 @@ function queryMeetingRowById(id: string) {
         (
           SELECT result_markdown
           FROM meeting_llm_results lr
-          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded'
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type != 'translation'
           ORDER BY lr.version_no DESC, lr.created_at DESC
           LIMIT 1
         ) as summary
@@ -2525,13 +2525,14 @@ export function listMeetingLlmResultSummaries(meetingId: string) {
         version_no as versionNo,
         result_type as resultType,
         result_title as resultTitle,
+        generation_config_snapshot as generationConfigSnapshot,
         error_message as errorMessage,
         created_at as createdAt
       FROM meeting_llm_results
       WHERE meeting_id = ?
       ORDER BY version_no DESC, created_at DESC
     `)
-    .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "errorMessage" | "createdAt">>(meetingId);
+    .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "generationConfigSnapshot" | "errorMessage" | "createdAt">>(meetingId);
 }
 
 export function getMeetingLlmResultDetail(meetingId: string, resultId: string) {
