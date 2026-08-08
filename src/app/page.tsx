@@ -5,7 +5,8 @@ import {
   RecordStatus,
   MeetingAsrResult,
   MeetingAsrResultDetail,
-  MeetingLlmResult,
+  MeetingLlmResultSummary,
+  MeetingLlmResultContent,
   MeetingRecord,
   MeetingSendRecord,
   PromptTemplate,
@@ -101,7 +102,8 @@ export default function MeetingPage() {
   const [summaryGenerating, setSummaryGenerating] = useState(false);
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState("");
-  const [llmResults, setLlmResults] = useState<MeetingLlmResult[]>([]);
+  const [llmResults, setLlmResults] = useState<MeetingLlmResultSummary[]>([]);
+  const [llmContentById, setLlmContentById] = useState<Record<string, string>>({});
   const [selectedLlmResultId, setSelectedLlmResultId] = useState<string | null>(null);
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]);
   const [selectedPromptTemplateId, setSelectedPromptTemplateId] = useState<string>("");
@@ -125,6 +127,7 @@ export default function MeetingPage() {
   const selectedMeetingIdRef = useRef<string | null>(null);
   const fullDetailLoadedRef = useRef(false);
   const selectedLlmResultIdRef = useRef<string | null>(null);
+  const llmContentByIdRef = useRef<Record<string, string>>({});
   const summaryGeneratingRef = useRef(false);
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<Map<string, VoiceprintFeature[]>>(new Map());
@@ -534,7 +537,7 @@ export default function MeetingPage() {
     try {
       const [meetingData, llmData] = await Promise.all([
         requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}?view=light`),
-        requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`).catch(() => ({ llmResults: [] })),
+        requestJson<{ llmResults?: MeetingLlmResultSummary[] }>(`/api/meetings/${meetingId}/llm-results`).catch(() => ({ llmResults: [] })),
       ]);
 
       if (!isActiveMeeting(meetingId)) return;
@@ -548,9 +551,6 @@ export default function MeetingPage() {
       const nextResults = llmData.llmResults ?? [];
       setLlmResults(nextResults);
       setSelectedLlmResultId(nextResults[0]?.id ?? null);
-      if (nextResults[0]?.resultMarkdown) {
-        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: nextResults[0].resultMarkdown } : prev));
-      }
     } catch (error) {
       console.error("Failed to prime meeting async state:", error);
     }
@@ -1001,7 +1001,7 @@ export default function MeetingPage() {
 
   const loadLlmResults = useCallback(async (meetingId: string) => {
     try {
-      const data = await requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`);
+      const data = await requestJson<{ llmResults?: MeetingLlmResultSummary[] }>(`/api/meetings/${meetingId}/llm-results`);
       if (!isActiveMeeting(meetingId)) return;
       const nextResults = data.llmResults ?? [];
       const prevSelected = selectedLlmResultIdRef.current;
@@ -1011,10 +1011,6 @@ export default function MeetingPage() {
           : (nextResults[0]?.id ?? null);
       setLlmResults(nextResults);
       setSelectedLlmResultId(preserved);
-      const chosen = nextResults.find((item) => item.id === preserved);
-      if (chosen?.resultMarkdown) {
-        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: chosen.resultMarkdown } : prev));
-      }
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load llm results:", error);
@@ -1040,6 +1036,67 @@ export default function MeetingPage() {
   useEffect(() => {
     selectedLlmResultIdRef.current = selectedLlmResultId;
   }, [selectedLlmResultId]);
+
+  const loadLlmResultContent = useCallback(
+    async (meetingId: string, resultId: string): Promise<string> => {
+      const data = await requestJson<{ llmResult?: MeetingLlmResultContent }>(`/api/meetings/${meetingId}/llm-results/${resultId}`);
+      const content = data.llmResult?.resultMarkdown ?? "";
+      llmContentByIdRef.current[resultId] = content;
+      setLlmContentById((prev) => ({ ...prev, [resultId]: content }));
+      return content;
+    },
+    [requestJson]
+  );
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !selectedLlmResultId) return;
+    const version = llmResults.find((item) => item.id === selectedLlmResultId);
+    if (!version) return;
+
+    if (version.status !== "succeeded") {
+      if (version.status === "failed") {
+        setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== "" ? { ...prev, summary: "" } : prev));
+      }
+      return;
+    }
+    if (llmContentByIdRef.current[version.id] !== undefined) {
+      const cached = llmContentByIdRef.current[version.id];
+      setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== cached ? { ...prev, summary: cached } : prev));
+      return;
+    }
+    let cancelled = false;
+    loadLlmResultContent(meetingId, version.id)
+      .then((content) => {
+        if (cancelled || !isActiveMeeting(meetingId) || selectedLlmResultIdRef.current !== version.id) return;
+        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: content } : prev));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        if (error instanceof ApiRequestError && error.status === 401) return;
+        console.error("Failed to load llm result content:", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedLlmResultId]);
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !selectedTranslationId) return;
+    const version = llmResults.find((item) => item.id === selectedTranslationId);
+    if (!version || version.status !== "succeeded") return;
+    if (llmContentByIdRef.current[version.id] !== undefined) return;
+    let cancelled = false;
+    loadLlmResultContent(meetingId, version.id).catch((error) => {
+      if (cancelled) return;
+      if (error instanceof ApiRequestError && error.status === 401) return;
+      console.error("Failed to load translation content:", error);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedTranslationId]);
 
   const loadAsrResults = useCallback(async (meetingId: string) => {
     try {
@@ -1406,12 +1463,8 @@ export default function MeetingPage() {
   const selectLlmResult = useCallback((resultId: string) => {
     selectedLlmResultIdRef.current = resultId;
     setSelectedLlmResultId(resultId);
-    const next = llmResults.find((item) => item.id === resultId);
-    if (next) {
-      setSelected((prev) => prev ? { ...prev, summary: next.resultMarkdown } : prev);
-      setEditingSummary(false);
-    }
-  }, [llmResults]);
+    setEditingSummary(false);
+  }, []);
 
   const deleteLlmResult = useCallback(
     async (resultId: string, kind: "summary" | "translation" = "summary") => {
@@ -1452,6 +1505,8 @@ export default function MeetingPage() {
             resultMarkdown: summaryText,
           }),
         });
+        llmContentByIdRef.current[selectedLlmResultId] = summaryText;
+        setLlmContentById((prev) => ({ ...prev, [selectedLlmResultId]: summaryText }));
         await loadLlmResults(selected.id);
       }
       const updated = { ...selected, summary: summaryText };
@@ -1710,7 +1765,7 @@ export default function MeetingPage() {
                           </div>
                         ) : selectedTranslation?.status === "succeeded" ? (
                           <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
-                            {selectedTranslation.resultMarkdown}
+                            {llmContentById[selectedTranslation.id] ?? "译文加载中..."}
                           </div>
                         ) : selectedTranslation?.status === "failed" ? (
                           <div className="text-sm text-red-500">

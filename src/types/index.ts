@@ -29,6 +29,23 @@ export interface MeetingRecord {
   summary: string;
 }
 
+export interface MeetingLlmResultSummary {
+  id: string;
+  meetingId: string;
+  promptTemplateId: string;
+  generationMode: string;
+  status: string;
+  versionNo: number;
+  resultType: string;
+  resultTitle: string;
+  errorMessage?: string | null;
+  createdAt?: string;
+}
+
+export interface MeetingLlmResultContent extends MeetingLlmResultSummary {
+  resultMarkdown: string;
+}
+
 export interface MeetingLlmResult {
   id: string;
   meetingId: string;

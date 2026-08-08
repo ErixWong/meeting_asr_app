@@ -4,7 +4,7 @@ import {
   claimMeetingLlmGeneration,
   createMeetingLlmResult,
   deleteMeetingLlmResult,
-  listMeetingLlmResults,
+  listMeetingLlmResultSummaries,
   updateMeetingLlmResult,
 } from "@/lib/admin-store";
 
@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const llmResults = listMeetingLlmResults(id);
+    const llmResults = listMeetingLlmResultSummaries(id);
     if (llmResults === null) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

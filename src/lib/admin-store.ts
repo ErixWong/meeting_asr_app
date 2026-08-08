@@ -2512,9 +2512,48 @@ export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
   };
 }
 
-export function listMeetingLlmResults(meetingId: string) {
+export function listMeetingLlmResultSummaries(meetingId: string) {
   if (!ensureMeetingOwned(meetingId)) return null;
-  return listMeetingLlmResultsByMeetingId(meetingId);
+  return getDb()
+    .prepare(`
+      SELECT
+        id,
+        meeting_id as meetingId,
+        prompt_template_id as promptTemplateId,
+        generation_mode as generationMode,
+        status,
+        version_no as versionNo,
+        result_type as resultType,
+        result_title as resultTitle,
+        error_message as errorMessage,
+        created_at as createdAt
+      FROM meeting_llm_results
+      WHERE meeting_id = ?
+      ORDER BY version_no DESC, created_at DESC
+    `)
+    .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "errorMessage" | "createdAt">>(meetingId);
+}
+
+export function getMeetingLlmResultDetail(meetingId: string, resultId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
+  return getDb()
+    .prepare(`
+      SELECT
+        id,
+        meeting_id as meetingId,
+        prompt_template_id as promptTemplateId,
+        generation_mode as generationMode,
+        status,
+        version_no as versionNo,
+        result_type as resultType,
+        result_title as resultTitle,
+        result_markdown as resultMarkdown,
+        error_message as errorMessage,
+        created_at as createdAt
+      FROM meeting_llm_results
+      WHERE meeting_id = ? AND id = ?
+    `)
+    .get<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "resultMarkdown" | "errorMessage" | "createdAt">>(meetingId, resultId) ?? null;
 }
 
 function truncateUtf16(text: string, maxLength: number): string {
