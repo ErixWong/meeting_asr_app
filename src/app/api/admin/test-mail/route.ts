@@ -10,6 +10,7 @@ export async function POST(req: NextRequest) {
       const port = Number(body.smtpPort || 465);
       const user = String(body.smtpUsername || "");
       const pass = String(body.smtpPassword || getSettingValue("mail", "smtp_password"));
+      const secure = String(body.smtpSecure ?? getSettingValue("mail", "smtp_secure") ?? "1") !== "0";
 
       if (!host || !port) {
         return NextResponse.json({ ok: false, error: "Mail config incomplete" }, { status: 400 });
@@ -19,7 +20,7 @@ export async function POST(req: NextRequest) {
       const transporter = nodemailer.createTransport({
         host,
         port,
-        secure: port === 465,
+        secure,
         auth: user ? { user, pass } : undefined,
       });
 
