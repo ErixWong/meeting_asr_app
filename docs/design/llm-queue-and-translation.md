@@ -44,6 +44,11 @@
 - 历史翻译 `translateMeetingFlow`：final 句分批（≤5 句/≤1000 字）→ 串行直连 `translateSentences` → 全成写 succeeded / 任批失败写 failed（含错误信息，可重试）
 - 前端：转录 tab 目标语言 + 翻译按钮 + 版本按钮行（V1/V2...，失败红/处理中琥珀）+ 版本切换/删除；生成走 `llm_processing` 状态复用现有 2s 轮询
 - 类型隔离：summary tab 只显示纪要版本（`result_type !== 'translation'`），互不污染
+- **`meeting.summary` 派生字段约束**：`listMeetings` / `queryMeetingRowById` 的 summary 子查询
+  是"最新成功结果"（`status='succeeded'` 按 version_no 降序取 1 条），必须排除
+  `result_type='translation'`，否则翻译版本号更大时会把 `summary` 顶替成译文，
+  导致"会议纪要 tab 正文区显示译文、版本列表却没有译文"的错位（fix-260808-01）。
+  新增其他 resultType（如清洗/总结变体）时，需评估该子查询是否同样排除。
 
 **版本号并发安全**：`getNextLlmVersionNo` 在 `withTransaction` 内 MAX+1，实时入库与纪要/翻译生成并发无冲突。
 

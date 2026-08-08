@@ -38,6 +38,7 @@ export interface MeetingLlmResultSummary {
   versionNo: number;
   resultType: string;
   resultTitle: string;
+  generationConfigSnapshot?: string | null;
   errorMessage?: string | null;
   createdAt?: string;
 }

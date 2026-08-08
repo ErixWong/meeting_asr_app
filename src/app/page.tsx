@@ -45,6 +45,17 @@ const HISTORY_TRANSLATE_LANGS = [
   { value: "ko", label: "韩语" },
 ];
 
+function getTranslationLangLabel(result: MeetingLlmResultSummary): string | null {
+  if (result.resultType !== "translation" || !result.generationConfigSnapshot) return null;
+  try {
+    const snapshot = JSON.parse(result.generationConfigSnapshot) as { targetLang?: string };
+    if (!snapshot?.targetLang) return null;
+    return HISTORY_TRANSLATE_LANGS.find((lang) => lang.value === snapshot.targetLang)?.label ?? snapshot.targetLang;
+  } catch {
+    return null;
+  }
+}
+
 function formatAsrCreatedAt(value?: string) {
   if (!value) return "-";
   const date = new Date(value);
@@ -99,7 +110,7 @@ export default function MeetingPage() {
   const [llmQueueInfo, setLlmQueueInfo] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
   const [lastTranslateElapsedMs, setLastTranslateElapsedMs] = useState<number | null>(null);
   const [historyTranslateLang, setHistoryTranslateLang] = useState("en");
-  const [selectedTranslationId, setSelectedTranslationId] = useState<string | null>(null);
+  const [selectedVersionId, setSelectedVersionId] = useState<string | null>(null);
   const [translationGenerating, setTranslationGenerating] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [liveSegments, setLiveSegments] = useState<TranscriptSegment[]>([]);
@@ -113,7 +124,6 @@ export default function MeetingPage() {
   const [summaryText, setSummaryText] = useState("");
   const [llmResults, setLlmResults] = useState<MeetingLlmResultSummary[]>([]);
   const [llmContentById, setLlmContentById] = useState<Record<string, string>>({});
-  const [selectedLlmResultId, setSelectedLlmResultId] = useState<string | null>(null);
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]);
   const [selectedPromptTemplateId, setSelectedPromptTemplateId] = useState<string>("");
   const [mailTo, setMailTo] = useState("");
@@ -145,8 +155,9 @@ export default function MeetingPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectedMeetingIdRef = useRef<string | null>(null);
   const fullDetailLoadedRef = useRef(false);
-  const selectedLlmResultIdRef = useRef<string | null>(null);
+  const selectedVersionIdRef = useRef<string | null>(null);
   const llmContentByIdRef = useRef<Record<string, string>>({});
+  const autoSelectTranslationRef = useRef(false);
   const summaryGeneratingRef = useRef(false);
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<Map<string, VoiceprintFeature[]>>(new Map());
@@ -569,7 +580,7 @@ export default function MeetingPage() {
 
       const nextResults = llmData.llmResults ?? [];
       setLlmResults(nextResults);
-      setSelectedLlmResultId(nextResults[0]?.id ?? null);
+      setSelectedVersionId((prev) => (prev && nextResults.some((item) => item.id === prev) ? prev : null));
     } catch (error) {
       console.error("Failed to prime meeting async state:", error);
     }
@@ -972,7 +983,7 @@ export default function MeetingPage() {
         selectedMeetingIdRef.current = meeting.id;
         setSelected(meeting);
         setLlmResults([]);
-        setSelectedLlmResultId(null);
+        setSelectedVersionId(null);
         setSendRecords([]);
         setAsrResults([]);
         setSelectedAsrResult(null);
@@ -1012,7 +1023,8 @@ export default function MeetingPage() {
     setStatus("idle");
     setElapsed(0);
     setLlmResults([]);
-    setSelectedLlmResultId(null);
+    setSelectedVersionId(null);
+    autoSelectTranslationRef.current = false;
     setSendRecords([]);
     setAsrResults([]);
     setSelectedAsrResult(null);
@@ -1023,19 +1035,19 @@ export default function MeetingPage() {
       const data = await requestJson<{ llmResults?: MeetingLlmResultSummary[] }>(`/api/meetings/${meetingId}/llm-results`);
       if (!isActiveMeeting(meetingId)) return;
       const nextResults = data.llmResults ?? [];
-      const prevSelected = selectedLlmResultIdRef.current;
+      const prevSelected = selectedVersionIdRef.current;
       const preserved =
         prevSelected && nextResults.some((item) => item.id === prevSelected)
           ? prevSelected
-          : (nextResults[0]?.id ?? null);
+          : null;
       setLlmResults(nextResults);
-      setSelectedLlmResultId(preserved);
+      setSelectedVersionId(preserved);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load llm results:", error);
       if (!isActiveMeeting(meetingId)) return;
       setLlmResults([]);
-      setSelectedLlmResultId(null);
+      setSelectedVersionId(null);
     }
   }, [isActiveMeeting, requestJson]);
 
@@ -1053,8 +1065,8 @@ export default function MeetingPage() {
   }, [isActiveMeeting, requestJson]);
 
   useEffect(() => {
-    selectedLlmResultIdRef.current = selectedLlmResultId;
-  }, [selectedLlmResultId]);
+    selectedVersionIdRef.current = selectedVersionId;
+  }, [selectedVersionId]);
 
   const loadLlmResultContent = useCallback(
     async (meetingId: string, resultId: string): Promise<string> => {
@@ -1069,53 +1081,20 @@ export default function MeetingPage() {
 
   useEffect(() => {
     const meetingId = selected?.id;
-    if (!meetingId || !selectedLlmResultId) return;
-    const version = llmResults.find((item) => item.id === selectedLlmResultId);
-    if (!version) return;
-
-    if (version.status !== "succeeded") {
-      if (version.status === "failed") {
-        setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== "" ? { ...prev, summary: "" } : prev));
-      }
-      return;
-    }
-    if (llmContentByIdRef.current[version.id] !== undefined) {
-      const cached = llmContentByIdRef.current[version.id];
-      setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== cached ? { ...prev, summary: cached } : prev));
-      return;
-    }
-    let cancelled = false;
-    loadLlmResultContent(meetingId, version.id)
-      .then((content) => {
-        if (cancelled || !isActiveMeeting(meetingId) || selectedLlmResultIdRef.current !== version.id) return;
-        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: content } : prev));
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        if (error instanceof ApiRequestError && error.status === 401) return;
-        console.error("Failed to load llm result content:", error);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedLlmResultId]);
-
-  useEffect(() => {
-    const meetingId = selected?.id;
-    if (!meetingId || !selectedTranslationId) return;
-    const version = llmResults.find((item) => item.id === selectedTranslationId);
+    if (!meetingId || !selectedVersionId) return;
+    const version = llmResults.find((item) => item.id === selectedVersionId);
     if (!version || version.status !== "succeeded") return;
     if (llmContentByIdRef.current[version.id] !== undefined) return;
     let cancelled = false;
     loadLlmResultContent(meetingId, version.id).catch((error) => {
       if (cancelled) return;
       if (error instanceof ApiRequestError && error.status === 401) return;
-      console.error("Failed to load translation content:", error);
+      console.error("Failed to load llm result content:", error);
     });
     return () => {
       cancelled = true;
     };
-  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedTranslationId]);
+  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedVersionId]);
 
   const loadAsrResults = useCallback(async (meetingId: string) => {
     try {
@@ -1286,7 +1265,7 @@ export default function MeetingPage() {
             selectedMeetingIdRef.current = meeting.id;
             setSelected(meeting);
             setLlmResults([]);
-            setSelectedLlmResultId(null);
+            setSelectedVersionId(null);
             setSendRecords([]);
             setAsrResults([]);
             setSelectedAsrResult(null);
@@ -1368,8 +1347,10 @@ export default function MeetingPage() {
         body: JSON.stringify({ promptTemplateId: SYSTEM_TRANSLATE_TEMPLATE_ID, targetLang: historyTranslateLang }),
       });
       if (!isActiveMeeting(meetingId)) return;
+      autoSelectTranslationRef.current = true;
+      setViewTab("summary");
       setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, status: "llm_processing" } : prev));
-      showNotice("info", "翻译已开始，完成后自动显示");
+      showNotice("info", "翻译已开始，完成后在「生成结果」中查看");
     } catch (err) {
       console.error("Generate translation failed:", err);
       if (!isActiveMeeting(meetingId)) return;
@@ -1391,20 +1372,26 @@ export default function MeetingPage() {
   }, [selected?.status, translationGenerating]);
 
   useEffect(() => {
+    if (!autoSelectTranslationRef.current) return;
     const done = llmResults.filter(
       (item) => item.resultType === "translation" && (item.status === "succeeded" || item.status === "failed")
     );
-    if (done.length === 0) {
-      setSelectedTranslationId(null);
-      return;
-    }
-    const latest = done[done.length - 1];
-    setSelectedTranslationId((prev) => (prev && done.some((item) => item.id === prev) ? prev : latest.id));
+    if (done.length === 0) return;
+    autoSelectTranslationRef.current = false;
+    setSelectedVersionId(done[0].id);
   }, [llmResults]);
 
   const sendSummary = useCallback(async () => {
-    if (!selected || !selected.summary) return;
+    if (!selected) return;
     const meetingId = selected.id;
+
+    const currentResult =
+      llmResults.find((item) => item.id === selectedVersionId && item.resultType !== "translation") ??
+      llmResults.find((item) => item.resultType !== "translation" && item.status === "succeeded");
+    if (!currentResult) {
+      showNotice("error", "当前会议还没有可发送的纪要结果");
+      return;
+    }
 
     const toRecipients = mailTo
       .split(",")
@@ -1422,11 +1409,6 @@ export default function MeetingPage() {
 
     setSendingMail(true);
     try {
-      const currentResult = llmResults.find((item) => item.id === selectedLlmResultId) ?? llmResults[0];
-      if (!currentResult) {
-        throw new Error("当前会议还没有可发送的纪要结果");
-      }
-
       await requestJson(`/api/meetings/${meetingId}/send-mail`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1455,7 +1437,7 @@ export default function MeetingPage() {
         setSendingMail(false);
       }
     }
-  }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedLlmResultId, showNotice]);
+  }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedVersionId, showNotice]);
 
   const openSendModal = useCallback(() => {
     setMailTo(currentUser?.email ?? "");
@@ -1464,24 +1446,23 @@ export default function MeetingPage() {
   }, [currentUser]);
 
   const activePromptTemplates = promptTemplates.filter((template) => template.status === "active");
-  const summaryResults = llmResults.filter((item) => item.resultType !== "translation");
-  const currentLlmResult = summaryResults.find((item) => item.id === selectedLlmResultId) ?? summaryResults[0] ?? null;
-  const currentVersionSendRecords = currentLlmResult
-    ? sendRecords.filter((record) => record.meetingLlmResultId === currentLlmResult.id)
+  const currentVersion =
+    llmResults.find((item) => item.id === selectedVersionId) ??
+    llmResults.find((item) => item.resultType !== "translation" && item.status === "succeeded") ??
+    llmResults[0] ??
+    null;
+  const currentVersionContent = currentVersion ? (llmContentById[currentVersion.id] ?? "") : "";
+  const currentVersionLangLabel = currentVersion ? getTranslationLangLabel(currentVersion) : null;
+  const currentVersionSendRecords = currentVersion
+    ? sendRecords.filter((record) => record.meetingLlmResultId === currentVersion.id)
     : [];
   const summaryBusy = summaryGenerating || selected?.status === "llm_processing";
-  const translationVersions = llmResults.filter((item) => item.resultType === "translation");
-  const selectedTranslation =
-    translationVersions.find((item) => item.id === selectedTranslationId) ??
-    translationVersions.filter((item) => item.status === "succeeded").slice(-1)[0] ??
-    translationVersions.slice(-1)[0] ??
-    null;
   const selectedPromptTemplate =
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
 
-  const selectLlmResult = useCallback((resultId: string) => {
-    selectedLlmResultIdRef.current = resultId;
-    setSelectedLlmResultId(resultId);
+  const selectVersion = useCallback((resultId: string) => {
+    selectedVersionIdRef.current = resultId;
+    setSelectedVersionId(resultId);
     setEditingSummary(false);
   }, []);
 
@@ -1514,30 +1495,27 @@ export default function MeetingPage() {
 
   const saveSummaryEdit = useCallback(async () => {
     if (!selected) return;
+    const versionId = selectedVersionId;
+    if (!versionId) return;
     try {
-      if (selectedLlmResultId) {
-        await requestJson(`/api/meetings/${selected.id}/llm-results`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            id: selectedLlmResultId,
-            resultMarkdown: summaryText,
-          }),
-        });
-        llmContentByIdRef.current[selectedLlmResultId] = summaryText;
-        setLlmContentById((prev) => ({ ...prev, [selectedLlmResultId]: summaryText }));
-        await loadLlmResults(selected.id);
-      }
-      const updated = { ...selected, summary: summaryText };
-      setSelected(updated);
-      setMeetings((prev) => prev.map((m) => m.id === selected.id ? updated : m));
+      await requestJson(`/api/meetings/${selected.id}/llm-results`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: versionId,
+          resultMarkdown: summaryText,
+        }),
+      });
+      llmContentByIdRef.current[versionId] = summaryText;
+      setLlmContentById((prev) => ({ ...prev, [versionId]: summaryText }));
+      await loadLlmResults(selected.id);
       setEditingSummary(false);
       showNotice("success", "会议纪要已保存");
     } catch (error) {
       console.error("Failed to save summary:", error);
       showNotice("error", `保存失败: ${(error as Error).message}`);
     }
-  }, [loadLlmResults, requestJson, selected, selectedLlmResultId, showNotice, summaryText]);
+  }, [loadLlmResults, requestJson, selected, selectedVersionId, showNotice, summaryText]);
 
   const selectedDeviceLabel = (() => {
     const parts: string[] = [];
@@ -1592,6 +1570,8 @@ export default function MeetingPage() {
                 setSendingMail(false);
                 setLiveSegments([]);
                 setViewTab("summary");
+                autoSelectTranslationRef.current = false;
+                setSelectedVersionId(null);
                 setAsrResults([]);
                 setSelectedAsrResult(null);
                 loadLlmResults(m.id).catch(console.error);
@@ -1623,7 +1603,7 @@ export default function MeetingPage() {
                     selectedMeetingIdRef.current = null;
                     setSelected(null);
                     setLlmResults([]);
-                    setSelectedLlmResultId(null);
+                    setSelectedVersionId(null);
                     setSendRecords([]);
                     setAsrResults([]);
                     setSelectedAsrResult(null);
@@ -1669,7 +1649,7 @@ export default function MeetingPage() {
                             : "text-slate-500"
                         }`}
                       >
-                        会议纪要
+                        生成结果
                       </button>
                       <button
                         onClick={() => {
@@ -1736,68 +1716,27 @@ export default function MeetingPage() {
                               : "翻译中..."
                             : "翻译"}
                         </button>
-                        {translationVersions.length > 0 && (
-                          <div className="flex items-center gap-1">
-                            <span className="text-xs text-slate-400">版本</span>
-                            {translationVersions.map((version) => (
-                              <button
-                                key={version.id}
-                                onClick={() => setSelectedTranslationId(version.id)}
-                                title={
-                                  version.status === "failed"
-                                    ? (version.errorMessage ?? "翻译失败")
-                                    : version.status === "succeeded"
-                                      ? "查看译文"
-                                      : "生成中"
-                                }
-                                className={`rounded px-2 py-1 text-xs font-medium ${
-                                  version.id === selectedTranslation?.id
-                                    ? "bg-brand text-white"
-                                    : version.status === "failed"
-                                      ? "border border-red-200 bg-red-50 text-red-500 hover:bg-red-100"
-                                      : version.status === "succeeded"
-                                        ? "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                                        : "border border-amber-200 bg-amber-50 text-amber-600"
-                                }`}
-                              >
-                                V{version.versionNo}
-                              </button>
-                            ))}
-                            {selectedTranslation && (
-                              <button
-                                onClick={() => deleteLlmResult(selectedTranslation.id, "translation")}
-                                title="删除该翻译版本"
-                                className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-400 hover:border-red-200 hover:bg-red-50 hover:text-red-500"
-                              >
-                                ✕ 删除
-                              </button>
-                            )}
-                          </div>
-                        )}
                       </div>
-                      <div className="min-h-0 flex-1">
-                        <TranscriptView segments={selected.transcript} />
-                      </div>
-                      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto border-t border-slate-100 px-2 pt-2">
-                        {translationGenerating ? (
-                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
-                            <div className="mb-2 h-6 w-6 animate-spin rounded-full border-2 border-brand border-t-transparent" />
-                            <p className="text-sm">正在翻译...</p>
-                          </div>
-                        ) : selectedTranslation?.status === "succeeded" ? (
-                          <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
-                            {llmContentById[selectedTranslation.id] ?? "译文加载中..."}
-                          </div>
-                        ) : selectedTranslation?.status === "failed" ? (
-                          <div className="text-sm text-red-500">
-                            {selectedTranslation.errorMessage ?? "翻译失败"}
-                          </div>
-                        ) : (
-                          <div className="flex h-full flex-col items-center justify-center text-slate-400">
-                            <div className="text-2xl">🌐</div>
-                            <p className="mt-2 text-sm">尚未翻译，选择目标语言后点击「翻译」</p>
-                          </div>
-                        )}
+                      <div className="flex min-h-0 flex-1 flex-col">
+                        <div className="mb-1 flex shrink-0 items-center justify-end">
+                          <button
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(selected.transcript.map((s) => s.text).join(""));
+                                showNotice("success", "转写原文已复制");
+                              } catch (error) {
+                                console.error("Failed to copy transcript:", error);
+                                showNotice("error", "复制失败，请检查浏览器剪贴板权限");
+                              }
+                            }}
+                            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
+                          >
+                            复制原文
+                          </button>
+                        </div>
+                        <div className="min-h-0 flex-1">
+                          <TranscriptView segments={selected.transcript} />
+                        </div>
                       </div>
                     </div>
                   ) : viewTab === "asrRaw" ? (
@@ -1849,26 +1788,31 @@ export default function MeetingPage() {
                     <div className="flex min-h-full flex-col gap-3">
                       <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
-                          {summaryResults.length === 0 ? (
+                          {llmResults.length === 0 ? (
                             <span className="whitespace-nowrap text-sm text-slate-400">暂无版本</span>
                           ) : (
-                            summaryResults.map((result) => {
+                            llmResults.map((result) => {
                               const failed = result.status === "failed";
+                              const isTranslation = result.resultType === "translation";
+                              const active = result.id === currentVersion?.id;
+                              const langLabel = isTranslation ? getTranslationLangLabel(result) : null;
                               return (
                                 <button
                                   key={result.id}
-                                  onClick={() => selectLlmResult(result.id)}
+                                  onClick={() => selectVersion(result.id)}
                                   className={`shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1.5 text-sm ${
                                     failed
                                       ? "border-red-200 bg-red-50 text-red-600 hover:bg-red-100"
-                                      : result.id === currentLlmResult?.id
+                                      : active
                                         ? "border-brand bg-brand/5 text-brand"
                                         : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
                                   }`}
-                                  title={failed ? result.errorMessage ?? "生成失败" : result.generationMode}
+                                  title={failed ? result.errorMessage ?? "生成失败" : isTranslation ? (langLabel ? `译文（${langLabel}）` : "查看译文") : result.generationMode}
                                 >
                                   V{result.versionNo}
-                                  {failed ? (
+                                  {isTranslation ? (
+                                    <span className="ml-1 text-xs opacity-80">🌐 译文{langLabel ? `(${langLabel})` : ""}</span>
+                                  ) : failed ? (
                                     <span className="ml-1 text-xs opacity-80">失败</span>
                                   ) : result.resultTitle ? (
                                     <span className="ml-1 text-xs opacity-70">{result.resultTitle}</span>
@@ -1919,14 +1863,16 @@ export default function MeetingPage() {
                       <div className="flex min-h-[18rem] flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
                         <div className="grid grid-cols-12 items-center gap-3 border-b border-slate-100 px-4 py-2">
                           <div className="col-span-4">
-                            {currentLlmResult?.errorMessage ? (
-                              <div className="text-xs text-amber-600">⚠️ {currentLlmResult.errorMessage}</div>
+                            {currentVersion?.errorMessage ? (
+                              <div className="text-xs text-amber-600">⚠️ {currentVersion.errorMessage}</div>
+                            ) : currentVersion?.resultType === "translation" ? (
+                              <span className="text-xs text-slate-400">译文内容{currentVersionLangLabel ? `（${currentVersionLangLabel}）` : ""}</span>
                             ) : (
                               <span className="text-xs text-slate-400">纪要内容</span>
                             )}
                           </div>
                           <div className="col-span-8 flex flex-wrap justify-end gap-2">
-                            {currentLlmResult && (
+                            {currentVersion && currentVersion.resultType !== "translation" && currentVersion.status === "succeeded" && (
                               <>
                                 <button
                                   onClick={() => {
@@ -1967,7 +1913,10 @@ export default function MeetingPage() {
                                 ) : (
                                   <button
                                     onClick={() => {
-                                      setSummaryText(selected.summary);
+                                      if (currentVersion) {
+                                        selectVersion(currentVersion.id);
+                                      }
+                                      setSummaryText(currentVersionContent);
                                       setEditingSummary(true);
                                     }}
                                     className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
@@ -1982,22 +1931,58 @@ export default function MeetingPage() {
                                 >
                                   发送该版本
                                 </button>
-                                <button
-                                  onClick={() => deleteLlmResult(currentLlmResult.id)}
-                                  className="rounded-md border border-slate-200 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
-                                >
-                                  删除该版本
-                                </button>
                               </>
+                            )}
+                            {currentVersion && (
+                              <button
+                                onClick={() => deleteLlmResult(currentVersion.id, currentVersion.resultType === "translation" ? "translation" : "summary")}
+                                className="rounded-md border border-slate-200 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
+                              >
+                                删除该版本
+                              </button>
                             )}
                           </div>
                         </div>
                         {summaryBusy ? (
                           <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center text-slate-400">
                             <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-brand border-t-transparent" />
-                            <p>正在生成会议纪要...</p>
+                            <p>正在生成...</p>
                           </div>
-                        ) : selected.summary ? (
+                        ) : currentVersion?.resultType === "translation" ? (
+                          currentVersion.status === "succeeded" ? (
+                            <div className="scroll-thin flex min-h-[18rem] flex-1 flex-col overflow-y-auto p-4">
+                              <div className="mb-2 flex shrink-0 items-center justify-end">
+                                <button
+                                  onClick={async () => {
+                                    if (!currentVersionContent) return;
+                                    try {
+                                      await navigator.clipboard.writeText(currentVersionContent);
+                                      showNotice("success", "译文已复制");
+                                    } catch (error) {
+                                      console.error("Failed to copy translation:", error);
+                                      showNotice("error", "复制失败，请检查浏览器剪贴板权限");
+                                    }
+                                  }}
+                                  className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
+                                >
+                                  复制译文
+                                </button>
+                              </div>
+                              <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
+                                {currentVersionContent || "译文加载中..."}
+                              </div>
+                            </div>
+                          ) : currentVersion.status === "failed" ? (
+                            <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
+                              <p className="text-sm text-red-500">{currentVersion.errorMessage ?? "翻译失败"}</p>
+                            </div>
+                          ) : (
+                            <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center text-slate-400">
+                              <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                              <p>正在生成译文...</p>
+                            </div>
+                          )
+                        ) : currentVersion?.status === "succeeded" ? (
                           editingSummary ? (
                             <div className="flex min-h-[18rem] flex-1 flex-col">
                               <div className="flex shrink-0 items-center justify-between border-b border-slate-100 bg-slate-50/60 px-3 py-1.5 text-xs text-slate-400">
@@ -2018,45 +2003,25 @@ export default function MeetingPage() {
                             </div>
                           ) : (
                             <div className="scroll-thin flex-1 min-h-[18rem] overflow-y-auto p-4">
-                              <MarkdownPreview markdown={selected.summary} />
+                              {currentVersionContent ? (
+                                <MarkdownPreview markdown={currentVersionContent} />
+                              ) : (
+                                <div className="flex h-full items-center justify-center text-slate-400">内容加载中...</div>
+                              )}
                             </div>
                           )
+                        ) : currentVersion?.status === "failed" ? (
+                          <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
+                            <p className="text-sm text-red-500">{currentVersion.errorMessage ?? "生成失败"}</p>
+                          </div>
                         ) : (
                           <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
-                            {selected.lastErrorMessage ? (
-                              <>
-                                <p className="text-sm text-amber-600">⚠️ {selected.lastErrorMessage}</p>
-                                <p className="mt-2 text-sm">可以删除失败的版本后重新生成。</p>
-                              </>
-                            ) : (
-                              <>
-                                <p>这个会议还没有纪要版本。</p>
-                                <p className="mt-1 text-sm">选择模板后生成，生成结果会作为一个独立版本保留。</p>
-                              </>
-                            )}
+                            <p>这个会议还没有版本。</p>
+                            <p className="mt-1 text-sm">点击「AI生成」生成纪要，或在转写记录中选择语种「翻译」生成译文。</p>
                           </div>
                         )}
                       </div>
                     </div>
-                  )}
-                </div>
-                <div className="mt-3 flex gap-2">
-                  {viewTab === "transcript" && (
-                  <button
-                    onClick={async () => {
-                      const text = selected.transcript.map((s) => s.text).join("");
-                      try {
-                        await navigator.clipboard.writeText(text);
-                        showNotice("success", "转写全文已复制");
-                      } catch (error) {
-                        console.error("Failed to copy transcript:", error);
-                        showNotice("error", "复制失败，请检查浏览器剪贴板权限");
-                      }
-                    }}
-                    className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
-                  >
-                    复制全文
-                  </button>
                   )}
                 </div>
               </div>
