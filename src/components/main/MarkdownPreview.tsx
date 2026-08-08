@@ -54,6 +54,7 @@ function parseMarkdown(markdown: string): Block[] {
   while (index < lines.length) {
     const line = lines[index];
     const trimmed = line.trim();
+    const lineStart = index;
 
     if (!trimmed) {
       index += 1;
@@ -73,7 +74,7 @@ function parseMarkdown(markdown: string): Block[] {
       continue;
     }
 
-    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
       blocks.push({ type: "heading", level: heading[1].length, text: heading[2].trim() });
       index += 1;
@@ -109,12 +110,12 @@ function parseMarkdown(markdown: string): Block[] {
       continue;
     }
 
-    const listMatch = line.match(/^(\s*)([-*+]\s+|\d+\.\s+)(.+)$/);
+    const listMatch = line.match(/^(\s*)([-*+]\s+|\d+\.\s+)(.*)$/);
     if (listMatch) {
       const ordered = /\d+\.\s+/.test(listMatch[2]);
       const items: string[] = [];
       while (index < lines.length) {
-        const itemMatch = lines[index].match(/^(\s*)([-*+]\s+|\d+\.\s+)(.+)$/);
+        const itemMatch = lines[index].match(/^(\s*)([-*+]\s+|\d+\.\s+)(.*)$/);
         if (!itemMatch || /\d+\.\s+/.test(itemMatch[2]) !== ordered) break;
         items.push(itemMatch[3].trim());
         index += 1;
@@ -127,6 +128,10 @@ function parseMarkdown(markdown: string): Block[] {
     while (index < lines.length && lines[index].trim() && !isBlockStart(lines, index)) {
       paragraphLines.push(lines[index].trim());
       index += 1;
+    }
+    if (index === lineStart) {
+      index += 1;
+      continue;
     }
     blocks.push({ type: "paragraph", text: paragraphLines.join(" ") });
   }
