@@ -30,6 +30,8 @@ import HistoryList from "@/components/main/HistoryList";
 import AsrResultDetailView from "@/components/main/AsrResultDetailView";
 import { formatTime } from "@/components/main/RecordingControls";
 import { useAuthSession } from "@/lib/use-auth-session";
+import { useTts } from "@/components/tts/TtsProvider";
+import TtsReadableSync from "@/components/tts/TtsReadableSync";
 
 let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
@@ -49,6 +51,13 @@ function formatAsrCreatedAt(value?: string) {
   if (Number.isNaN(date.getTime())) return "-";
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function getTranscriptPlainText(segments: TranscriptSegment[]) {
+  return segments
+    .map((segment) => segment.text.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 type ActionNotice = {
@@ -119,6 +128,16 @@ export default function MeetingPage() {
   const [asrErrorMessage, setAsrErrorMessage] = useState<string | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
+  const { isSupported, isSpeaking, canRead, hasSelection, toggleSpeak } = useTts();
+  const readableText = selected
+    ? viewTab === "transcript"
+      ? getTranscriptPlainText(selected.transcript)
+      : viewTab === "asrRaw"
+        ? selectedAsrResult?.normalizedText ?? ""
+        : editingSummary
+          ? summaryText
+          : selected.summary
+    : getTranscriptPlainText(liveSegments);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const asrClientsRef = useRef<Map<string, FunASRClient>>(new Map());
   const segmentsRef = useRef<TranscriptSegment[]>([]);
@@ -1538,21 +1557,23 @@ export default function MeetingPage() {
         : "border-sky-200 bg-sky-50 text-sky-700";
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {notice && (
-        <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
-          <span>{notice.message}</span>
-          <button
-            type="button"
-            onClick={() => setNotice(null)}
-            className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
-          >
-            关闭
-          </button>
-        </div>
-      )}
+    <>
+      <TtsReadableSync text={readableText} />
+      <div className="flex min-h-0 flex-1 flex-col">
+        {notice && (
+          <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
+            <span>{notice.message}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+            >
+              关闭
+            </button>
+          </div>
+        )}
 
-      <div className="flex min-w-0 flex-1 overflow-hidden">
+        <div className="flex min-w-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex-1 overflow-y-auto">
             <HistoryList
@@ -1897,14 +1918,14 @@ export default function MeetingPage() {
 
                       <div className="flex min-h-[18rem] flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
                         <div className="grid grid-cols-12 items-center gap-3 border-b border-slate-100 px-4 py-2">
-                          <div className="col-span-9">
+                          <div className="col-span-4">
                             {currentLlmResult?.errorMessage ? (
                               <div className="text-xs text-amber-600">⚠️ {currentLlmResult.errorMessage}</div>
                             ) : (
                               <span className="text-xs text-slate-400">纪要内容</span>
                             )}
                           </div>
-                          <div className="col-span-3 flex justify-end gap-2">
+                          <div className="col-span-8 flex flex-wrap justify-end gap-2">
                             {currentLlmResult && (
                               <>
                                 <button
@@ -1918,6 +1939,16 @@ export default function MeetingPage() {
                                 >
                                   发送记录
                                 </button>
+                                {isSupported && (
+                                  <button
+                                    onClick={toggleSpeak}
+                                    disabled={!canRead && !isSpeaking}
+                                    className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                    title="优先朗读选中文本；未选中时朗读当前全文"
+                                  >
+                                    {isSpeaking ? "停止朗读" : hasSelection ? "朗读选中部分" : "朗读全文"}
+                                  </button>
+                                )}
                                 {editingSummary ? (
                                   <>
                                     <button
@@ -2284,7 +2315,8 @@ export default function MeetingPage() {
             </div>
           </div>
         )}
+        </div>
       </div>
-    </div>
+    </>
   );
 }

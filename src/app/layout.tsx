@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import AppHeader from "@/components/layout/AppHeader";
+import { TtsProvider } from "@/components/tts/TtsProvider";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -15,10 +16,12 @@ export default function RootLayout({
   return (
     <html lang="zh-CN">
       <body className="min-h-screen bg-slate-50">
-        <div className="flex h-screen flex-col">
-          <AppHeader />
-          {children}
-        </div>
+        <TtsProvider>
+          <div className="flex h-screen flex-col">
+            <AppHeader />
+            {children}
+          </div>
+        </TtsProvider>
       </body>
     </html>
   );
