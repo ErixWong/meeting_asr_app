@@ -1167,7 +1167,7 @@ export default function MeetingPage() {
     poll().catch(console.error);
     const timer = window.setInterval(() => {
       poll().catch(console.error);
-    }, 2000);
+    }, 8000);
 
     return () => {
       disposed = true;
