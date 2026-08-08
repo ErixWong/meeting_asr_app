@@ -2,7 +2,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { StringDecoder } from "node:string_decoder";
 import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
 import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
 import {
@@ -191,6 +190,7 @@ type ActorContext = {
   accountName: string;
   displayName: string;
   status: string;
+  email?: string | null;
   mustChangePassword?: boolean;
 };
 
@@ -333,7 +333,7 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   },
   "llm:timeout_ms": {
     itemTitle: "调用超时（毫秒）",
-    itemDescription: "留空使用默认 180000",
+    itemDescription: "留空使用默认 300000",
     validate: integerSetting("LLM timeout", 1_000, 600_000),
   },
   "llm:max_concurrency": {
@@ -360,6 +360,14 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemTitle: "SMTP Port",
     itemDescription: "邮件服务端口",
     validate: integerSetting("SMTP port", 1, 65_535, true),
+  },
+  "mail:smtp_secure": {
+    itemTitle: "SSL 加密",
+    itemDescription: "使用 SSL/TLS 加密连接（如 465 端口）；关闭则使用明文（如内部 relay 的 25 端口）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "SMTP secure", 16, false);
+      return normalized === "0" || normalized.toLowerCase() === "false" || normalized.toLowerCase() === "no" ? "0" : "1";
+    },
   },
   "mail:smtp_username": {
     itemTitle: "SMTP Username",
@@ -409,6 +417,25 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
       return JSON.stringify(recipients.map((item) => item.trim()));
     },
   },
+  "mail:allowed_domains": {
+    itemTitle: "允许的收件邮箱域名",
+    itemDescription: "逗号分隔，限制纪要只能发送到这些域名（如 company.com）；留空则不限制",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Allowed recipient domains", 512, false);
+      if (!normalized) return "";
+      const domains = normalized
+        .split(",")
+        .map((item) => item.trim().toLowerCase().replace(/^@/, ""))
+        .filter(Boolean);
+      if (domains.length === 0) return "";
+      for (const domain of domains) {
+        if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(domain)) {
+          throw new Error(`Allowed recipient domain "${domain}" is invalid`);
+        }
+      }
+      return domains.join(",");
+    },
+  },
   "system:default_prompt_template_id": {
     itemTitle: "默认纪要模板",
     itemDescription: "自动生成首版结果时使用",
@@ -419,6 +446,8 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
 let dbSeeded = false;
 const actorContext = new AsyncLocalStorage<ActorContext>();
 let transactionDepth = 0;
+
+const globalForLlmReconcile = globalThis as unknown as { __llmStuckReconciled?: boolean };
 
 function withTransaction<T>(callback: () => T): T {
   const database = getDb();
@@ -449,8 +478,30 @@ function getDb(): DatabaseSync {
     dbSeeded = true;
     migrateAuthSchema(database);
     seedDefaults(database);
+    reconcileStuckLlmProcessing(database);
   }
   return database;
+}
+
+function reconcileStuckLlmProcessing(database: DatabaseSync) {
+  if (globalForLlmReconcile.__llmStuckReconciled) return;
+  globalForLlmReconcile.__llmStuckReconciled = true;
+
+  const stuck = database
+    .prepare("SELECT id FROM meetings WHERE status = 'llm_processing'")
+    .all() as Array<{ id: string }>;
+  for (const row of stuck) {
+    database
+      .prepare(`
+        UPDATE meetings
+        SET status = 'llm_failed', last_error_message = ?, status_updated_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'llm_processing'
+      `)
+      .run("服务重启，生成任务已中断，请重新生成", nowIso(), nowIso(), row.id);
+  }
+  if (stuck.length > 0) {
+    console.warn(`[LLM] reconcile: marked ${stuck.length} stuck llm_processing meeting(s) as failed`);
+  }
 }
 
 function migrateAuthSchema(database: DatabaseSync) {
@@ -543,7 +594,7 @@ function seedDefaults(database: DatabaseSync) {
         itemSection: "llm",
         itemMark: "timeout_ms",
         itemTitle: "调用超时（毫秒）",
-        itemDescription: "留空使用默认 180000",
+        itemDescription: "留空使用默认 300000",
         itemValue: "",
       },
       {
@@ -580,6 +631,13 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "SMTP Port",
         itemDescription: "邮件服务端口",
         itemValue: "465",
+      },
+      {
+        itemSection: "mail",
+        itemMark: "smtp_secure",
+        itemTitle: "SSL 加密",
+        itemDescription: "使用 SSL/TLS 加密连接（如 465 端口）；关闭则使用明文（如内部 relay 的 25 端口）",
+        itemValue: "1",
       },
       {
         itemSection: "mail",
@@ -629,6 +687,13 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "Default CC",
         itemDescription: "默认抄送",
         itemValue: "[]",
+      },
+      {
+        itemSection: "mail",
+        itemMark: "allowed_domains",
+        itemTitle: "允许的收件邮箱域名",
+        itemDescription: "逗号分隔，限制纪要只能发送到这些域名；留空则不限制",
+        itemValue: "",
       },
       {
         itemSection: "system",
@@ -883,7 +948,7 @@ export async function translateSentences(sentences: string[], targetLang: string
       throw new Error(`LLM API error: ${status} ${text.slice(0, 200)}`);
     }
     const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: unknown } }> };
-    const translated = String(parsed.choices?.[0]?.message?.content ?? "").trim();
+    const translated = stripLeadingThinking(String(parsed.choices?.[0]?.message?.content ?? "").trim());
     if (!translated) throw new Error("LLM returned empty translation");
     return { text: translated, elapsedMs: Date.now() - requestStartedAt };
   } finally {
@@ -1683,6 +1748,7 @@ export function getActorByAccountName(accountName: string) {
         id,
         account_name as accountName,
         display_name as displayName,
+        email,
         status,
         must_change_password as mustChangePassword
       FROM users
@@ -1756,6 +1822,7 @@ export function getActorBySessionToken(token: string) {
         u.id,
         u.account_name as accountName,
         u.display_name as displayName,
+        u.email,
         u.status,
         u.must_change_password as mustChangePassword
       FROM auth_sessions s
@@ -2445,9 +2512,48 @@ export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
   };
 }
 
-export function listMeetingLlmResults(meetingId: string) {
+export function listMeetingLlmResultSummaries(meetingId: string) {
   if (!ensureMeetingOwned(meetingId)) return null;
-  return listMeetingLlmResultsByMeetingId(meetingId);
+  return getDb()
+    .prepare(`
+      SELECT
+        id,
+        meeting_id as meetingId,
+        prompt_template_id as promptTemplateId,
+        generation_mode as generationMode,
+        status,
+        version_no as versionNo,
+        result_type as resultType,
+        result_title as resultTitle,
+        error_message as errorMessage,
+        created_at as createdAt
+      FROM meeting_llm_results
+      WHERE meeting_id = ?
+      ORDER BY version_no DESC, created_at DESC
+    `)
+    .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "errorMessage" | "createdAt">>(meetingId);
+}
+
+export function getMeetingLlmResultDetail(meetingId: string, resultId: string) {
+  if (!ensureMeetingOwned(meetingId)) return null;
+  return getDb()
+    .prepare(`
+      SELECT
+        id,
+        meeting_id as meetingId,
+        prompt_template_id as promptTemplateId,
+        generation_mode as generationMode,
+        status,
+        version_no as versionNo,
+        result_type as resultType,
+        result_title as resultTitle,
+        result_markdown as resultMarkdown,
+        error_message as errorMessage,
+        created_at as createdAt
+      FROM meeting_llm_results
+      WHERE meeting_id = ? AND id = ?
+    `)
+    .get<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "resultMarkdown" | "errorMessage" | "createdAt">>(meetingId, resultId) ?? null;
 }
 
 function truncateUtf16(text: string, maxLength: number): string {
@@ -2458,36 +2564,15 @@ function truncateUtf16(text: string, maxLength: number): string {
   return cut;
 }
 
-function parseSseText(text: string): {
-  content: string;
-  finishReason: string | null;
-  chunkCount: number;
-  reasoningChars: number;
-} {
-  let content = "";
-  let reasoningChars = 0;
-  let finishReason: string | null = null;
-  let chunkCount = 0;
-
-  for (const block of text.split(/\r?\n\r?\n/)) {
-    for (const line of block.split(/\r?\n/)) {
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (!payload || payload === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(payload);
-        chunkCount++;
-        const choice = parsed.choices?.[0];
-        const delta = choice?.delta;
-        if (delta?.content) content += String(delta.content);
-        if (delta?.reasoning_content) reasoningChars += String(delta.reasoning_content).length;
-        if (choice?.finish_reason) finishReason = choice.finish_reason;
-      } catch {
-        // skip malformed sse block
-      }
-    }
-  }
-  return { content, finishReason, chunkCount, reasoningChars };
+function stripLeadingThinking(content: string): string {
+  let cleaned = content.replace(/^\s+/, "");
+  cleaned = cleaned.replace(/^<think>[\s\S]*?<\/think>\s*/i, "");
+  cleaned = cleaned.replace(/^(<\/?think>\s*)+/i, "");
+  cleaned = cleaned.replace(/^\[[\s\S]*?\](?:\s*\n|$)/, (match) => {
+    const block = match.slice(0, match.lastIndexOf("]") + 1);
+    return block.includes("\n") || block.trim() === cleaned.trim() ? "" : match;
+  });
+  return cleaned;
 }
 
 function llmRequest(
@@ -2497,7 +2582,6 @@ function llmRequest(
     headers: Record<string, string>;
     body: string;
     signal: AbortSignal;
-    onData?: (text: string) => void;
   }
 ): Promise<{ status: number; text: string; headersAt: number; bodyAt: number }> {
   return new Promise((resolve, reject) => {
@@ -2517,17 +2601,10 @@ function llmRequest(
       (res) => {
         const headersAt = Date.now();
         const chunks: Buffer[] = [];
-        const decoder = new StringDecoder("utf8");
         res.on("data", (chunk) => {
-          const buf = Buffer.from(chunk);
-          chunks.push(buf);
-          if (options.onData) options.onData(decoder.write(buf));
+          chunks.push(Buffer.from(chunk));
         });
         res.on("end", () => {
-          if (options.onData) {
-            const rest = decoder.end();
-            if (rest) options.onData(rest);
-          }
           resolve({
             status: res.statusCode ?? 0,
             text: Buffer.concat(chunks).toString("utf8"),
@@ -2825,31 +2902,29 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
   const rawPrompt = String(template.content || "").replaceAll("{transcript}", inputTranscriptSnapshot);
   const contextSize = Number(String(get("llm", "context_size") || "").trim()) || 0;
   const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
-  const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 180000;
+  const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 300000;
   const prompt = contextSize > 0 && rawPrompt.length > contextSize ? truncateUtf16(rawPrompt, contextSize) : rawPrompt;
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
 
   let llmFinishReason: string | null = null;
   let resultMarkdown = "";
   let rawText = "";
+  let reasoningChars = 0;
   const startedAt = Date.now();
 
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     console.log(
-      `[LLM] generate: meeting=${meetingId} model=${model} url=${baseUrl} promptChars=${prompt.length} maxTokens=${maxTokens > 0 ? maxTokens : "auto"} contextSize=${contextSize > 0 ? contextSize : "full"} timeoutMs=${timeoutMs}`
+      `[LLM] generate: meeting=${meetingId} model=${model} url=${baseUrl} promptChars=${prompt.length} maxTokens=${maxTokens > 0 ? maxTokens : "auto"} contextSize=${contextSize > 0 ? contextSize : "full"} timeoutMs=${timeoutMs} stream=false`
     );
 
     try {
-      let sseLineBuffer = "";
-      let streamTokenCount = 0;
-      let streamFirstLogged = false;
       const { status, text, headersAt, bodyAt } = await llmRequest(endpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Accept": "text/event-stream",
+          "Accept": "application/json",
           ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         },
         body: JSON.stringify({
@@ -2859,33 +2934,9 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
             { role: "user", content: prompt },
           ],
           temperature: 0.3,
-          stream: true,
           ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
         }),
         signal: controller.signal,
-        onData: (chunkText) => {
-          sseLineBuffer += chunkText;
-          let nl: number;
-          while ((nl = sseLineBuffer.indexOf("\n")) >= 0) {
-            const line = sseLineBuffer.slice(0, nl).trim();
-            sseLineBuffer = sseLineBuffer.slice(nl + 1);
-            if (!line.startsWith("data:")) continue;
-            if (!streamFirstLogged) {
-              streamFirstLogged = true;
-              console.log(`[LLM] stream: first SSE event received at ${Date.now() - startedAt}ms`);
-            }
-            const payload = line.slice(5).trim();
-            if (!payload || payload === "[DONE]") continue;
-            try {
-              const parsed = JSON.parse(payload);
-              const delta = parsed.choices?.[0]?.delta;
-              if (delta?.content || delta?.reasoning_content) streamTokenCount++;
-            } catch {}
-          }
-          if (streamTokenCount > 0 && streamTokenCount % 50 === 0) {
-            console.log(`[LLM] stream: tokens=${streamTokenCount} elapsed=${Date.now() - startedAt}ms`);
-          }
-        },
       });
 
       console.log(`[LLM] headers: status=${status} elapsed=${headersAt - startedAt}ms`);
@@ -2906,11 +2957,21 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
       throw new Error(`LLM returned empty body (raw=${rawText.slice(0, 500)})`);
     }
 
-    const sse = parseSseText(rawText);
-    llmFinishReason = sse.finishReason;
-    resultMarkdown = sse.content || "";
+    let parsedJson: { choices?: Array<{ message?: Record<string, unknown>; finish_reason?: string | null }> };
+    try {
+      parsedJson = JSON.parse(rawText) as typeof parsedJson;
+    } catch (parseError) {
+      throw new Error(
+        `LLM returned non-JSON body (${String(parseError).slice(0, 200)} raw=${rawText.slice(0, 500)})`
+      );
+    }
+    const choice = parsedJson.choices?.[0];
+    const message = choice?.message;
+    llmFinishReason = choice?.finish_reason ?? null;
+    resultMarkdown = stripLeadingThinking(String(message?.content ?? "").trim());
+    reasoningChars = String(message?.reasoning_content ?? "").length;
     console.log(
-      `[LLM] parsed: streamChunks=${sse.chunkCount} finishReason=${llmFinishReason ?? "N/A"} contentChars=${String(resultMarkdown).length} reasoningChars=${sse.reasoningChars}`
+      `[LLM] parsed: finishReason=${llmFinishReason ?? "N/A"} contentChars=${String(resultMarkdown).length} reasoningChars=${reasoningChars}`
     );
 
     if (!String(resultMarkdown).trim()) {
@@ -3237,8 +3298,26 @@ export async function createMeetingSendRecord(input: {
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
+  const allowedDomains = get("mail", "allowed_domains")
+    .split(",")
+    .map((item) => item.trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean);
+
+  if (allowedDomains.length > 0) {
+    const recipientsToCheck = [...toRecipients, ...ccRecipients];
+    const domainOf = (email: string) => {
+      const at = email.lastIndexOf("@");
+      return at > -1 ? email.slice(at + 1).toLowerCase() : "";
+    };
+    const disallowed = recipientsToCheck.filter((email) => !allowedDomains.includes(domainOf(email)));
+    if (disallowed.length > 0) {
+      throw new Error(`邮件收件人不在允许的域名范围内，已阻止发送: ${disallowed.join(", ")}`);
+    }
+  }
+
   const host = get("mail", "smtp_host");
   const port = Number(get("mail", "smtp_port") || "465");
+  const secure = get("mail", "smtp_secure") !== "0";
   const user = get("mail", "smtp_username");
   const pass = get("mail", "smtp_password");
   const fromName = get("mail", "from_name");
@@ -3262,7 +3341,7 @@ export async function createMeetingSendRecord(input: {
     const transporter = nodemailer.createTransport({
       host,
       port,
-      secure: port === 465,
+      secure,
       auth: user ? { user, pass } : undefined,
     });
 

@@ -15,6 +15,7 @@ export async function GET(req: Request) {
       id: actor.id,
       accountName: actor.accountName,
       displayName: actor.displayName,
+      email: actor.email ?? "",
       mustChangePassword: Boolean(actor.mustChangePassword),
       roles: getActorRoleKeys(actor.id, actor.status),
     },

@@ -222,10 +222,12 @@ export default function AdminPage() {
 
   const [mailHost, setMailHost] = useState("smtp.example.com");
   const [mailPort, setMailPort] = useState("465");
+  const [mailSecure, setMailSecure] = useState(true);
   const [mailUser, setMailUser] = useState("meeting@example.com");
   const [mailPassword, setMailPassword] = useState("");
   const [mailFromName, setMailFromName] = useState("会议纪要机器人");
   const [mailFromEmail, setMailFromEmail] = useState("meeting@example.com");
+  const [mailAllowedDomains, setMailAllowedDomains] = useState("");
   const [mailStatus, setMailStatus] = useState<"ok" | "fail" | "idle">("idle");
 
   const [defaultTemplateId, setDefaultTemplateId] = useState("");
@@ -319,7 +321,7 @@ export default function AdminPage() {
         itemSection: "llm",
         itemMark: "timeout_ms",
         itemTitle: "调用超时（毫秒）",
-        itemDescription: "留空使用默认 180000",
+        itemDescription: "留空使用默认 300000",
         itemValue: llmTimeoutMs,
       },
       {
@@ -359,6 +361,13 @@ export default function AdminPage() {
       },
       {
         itemSection: "mail",
+        itemMark: "smtp_secure",
+        itemTitle: "SSL 加密",
+        itemDescription: "使用 SSL/TLS 加密连接（如 465 端口）；关闭则使用明文（如内部 relay 的 25 端口）",
+        itemValue: mailSecure ? "1" : "0",
+      },
+      {
+        itemSection: "mail",
         itemMark: "smtp_username",
         itemTitle: "SMTP Username",
         itemDescription: "邮件服务用户名",
@@ -384,6 +393,13 @@ export default function AdminPage() {
         itemTitle: "From Email",
         itemDescription: "发件人邮箱",
         itemValue: mailFromEmail,
+      },
+      {
+        itemSection: "mail",
+        itemMark: "allowed_domains",
+        itemTitle: "允许的收件邮箱域名",
+        itemDescription: "逗号分隔，限制纪要只能发送到这些域名（如 company.com）；留空则不限制",
+        itemValue: mailAllowedDomains,
       },
       {
         itemSection: "system",
@@ -414,6 +430,8 @@ export default function AdminPage() {
       mailPassword,
       mailPort,
       mailUser,
+      mailAllowedDomains,
+      mailSecure,
     ]
   );
 
@@ -479,10 +497,12 @@ export default function AdminPage() {
 
         setMailHost(get("mail", "smtp_host", "smtp.example.com"));
         setMailPort(get("mail", "smtp_port", "465"));
+        setMailSecure(get("mail", "smtp_secure", "1") !== "0");
         setMailUser(get("mail", "smtp_username", "meeting@example.com"));
         setMailPassword(get("mail", "smtp_password", ""));
         setMailFromName(get("mail", "from_name", "会议纪要机器人"));
         setMailFromEmail(get("mail", "from_email", "meeting@example.com"));
+        setMailAllowedDomains(get("mail", "allowed_domains", ""));
 
         const nextTemplates = (templatesData.templates ?? []) as PromptTemplateItem[];
         const nextHotwords = (hotwordsData.hotwords ?? []) as HotwordItem[];
@@ -971,6 +991,7 @@ export default function AdminPage() {
           smtpPort: mailPort,
           smtpUsername: mailUser,
           smtpPassword: mailPassword,
+          smtpSecure: mailSecure,
         }),
       });
       setMailStatus("ok");
@@ -1115,45 +1136,61 @@ export default function AdminPage() {
 
         {!loading && activeTab === "llm" && (
           <Card title="LLM 配置" icon="🤖">
-            <label className="mb-1 block text-xs text-slate-500">端点地址</label>
-            <input value={llmUrl} onChange={(e) => setLlmUrl(e.target.value)} className={inputCls} placeholder="http://host:port/v1" />
-            <label className="mb-1 mt-3 block text-xs text-slate-500">API Key</label>
-            <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} className={inputCls} placeholder="留空保持已保存值" />
-            <label className="mb-1 mt-3 block text-xs text-slate-500">模型名称</label>
-            <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)} className={inputCls} />
-            <label className="mb-1 mt-3 block text-xs text-slate-500">上下文大小（字符，留空不截断）</label>
-            <input type="number" min="1" step="1" value={llmContextSize} onChange={(e) => setLlmContextSize(e.target.value)} className={inputCls} placeholder="留空 = 不截断" />
-            <label className="mb-1 mt-3 block text-xs text-slate-500">最大回复 Tokens（留空由 LLM 决定）</label>
-            <input type="number" min="1" step="1" value={llmMaxTokens} onChange={(e) => setLlmMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 由 LLM 决定" />
-            <label className="mb-1 mt-3 block text-xs text-slate-500">调用超时（毫秒，留空默认 180000）</label>
-            <input type="number" min="1" step="1" value={llmTimeoutMs} onChange={(e) => setLlmTimeoutMs(e.target.value)} className={inputCls} placeholder="留空 = 180000" />
-            <div className="mt-3 grid grid-cols-2 gap-3">
+            <div className="space-y-3">
               <div>
-                <label className="mb-1 block text-xs text-slate-500">LLM 并发数（默认 2）</label>
-                <input type="number" min="1" step="1" value={llmConcurrency} onChange={(e) => setLlmConcurrency(e.target.value)} className={inputCls} />
+                <label className="mb-1 block text-xs text-slate-500">端点地址</label>
+                <input value={llmUrl} onChange={(e) => setLlmUrl(e.target.value)} className={inputCls} placeholder="http://host:port/v1" />
               </div>
               <div>
-                <label className="mb-1 block text-xs text-slate-500">LLM 排队长度（默认 10）</label>
-                <input type="number" min="1" step="1" value={llmQueueCapacity} onChange={(e) => setLlmQueueCapacity(e.target.value)} className={inputCls} />
+                <label className="mb-1 block text-xs text-slate-500">API Key</label>
+                <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} className={inputCls} placeholder="留空保持已保存值" />
               </div>
-            </div>
-            <label className="mb-1 mt-3 block text-xs text-slate-500">翻译触发句数（默认 3，模型快可调小更实时）</label>
-            <input type="number" min="1" max="20" step="1" value={llmTranslateTriggerSentences} onChange={(e) => setLlmTranslateTriggerSentences(e.target.value)} className={inputCls} />
-            {llmQueueStatus && (
-              <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
-                队列状态：进行中 {llmQueueStatus.inFlight} · 排队 {llmQueueStatus.queued} · 累计拒绝 {llmQueueStatus.dropped}
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">模型名称</label>
+                  <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)} className={inputCls} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">上下文大小（字符，留空不截断）</label>
+                  <input type="number" min="1" step="1" value={llmContextSize} onChange={(e) => setLlmContextSize(e.target.value)} className={inputCls} placeholder="留空 = 不截断" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">最大回复 Tokens（留空由 LLM 决定）</label>
+                  <input type="number" min="1" step="1" value={llmMaxTokens} onChange={(e) => setLlmMaxTokens(e.target.value)} className={inputCls} placeholder="留空 = 由 LLM 决定" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">调用超时（毫秒，留空默认 300000）</label>
+                  <input type="number" min="1" step="1" value={llmTimeoutMs} onChange={(e) => setLlmTimeoutMs(e.target.value)} className={inputCls} placeholder="留空 = 300000" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">LLM 并发数（默认 2）</label>
+                  <input type="number" min="1" step="1" value={llmConcurrency} onChange={(e) => setLlmConcurrency(e.target.value)} className={inputCls} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">LLM 排队长度（默认 10）</label>
+                  <input type="number" min="1" step="1" value={llmQueueCapacity} onChange={(e) => setLlmQueueCapacity(e.target.value)} className={inputCls} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">翻译触发句数（默认 3，模型快可调小更实时）</label>
+                  <input type="number" min="1" max="20" step="1" value={llmTranslateTriggerSentences} onChange={(e) => setLlmTranslateTriggerSentences(e.target.value)} className={inputCls} />
+                </div>
               </div>
-            )}
-            <div className="mt-3 flex items-center justify-between">
-              <StatusBadge status={llmStatus} />
-              <button onClick={testLlm} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">
-                测试 API
-              </button>
-            </div>
-            <div className="mt-3">
-              <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>
-                {savingSettings ? "保存中..." : "保存 LLM 配置"}
-              </button>
+              {llmQueueStatus && (
+                <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                  队列状态：进行中 {llmQueueStatus.inFlight} · 排队 {llmQueueStatus.queued} · 累计拒绝 {llmQueueStatus.dropped}
+                </div>
+              )}
+              <div className="flex items-center justify-between">
+                <StatusBadge status={llmStatus} />
+                <button onClick={testLlm} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50">
+                  测试 API
+                </button>
+              </div>
+              <div>
+                <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>
+                  {savingSettings ? "保存中..." : "保存 LLM 配置"}
+                </button>
+              </div>
             </div>
           </Card>
         )}
@@ -1170,6 +1207,27 @@ export default function AdminPage() {
                 <input value={mailPort} onChange={(e) => setMailPort(e.target.value)} className={inputCls} />
               </div>
               <div>
+                <label className="mb-1 block text-xs text-slate-500">SSL 加密</label>
+                <div className="flex h-[38px] items-center gap-2">
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={mailSecure}
+                    onClick={() => setMailSecure((prev) => !prev)}
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition ${
+                      mailSecure ? "bg-brand" : "bg-slate-300"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${
+                        mailSecure ? "left-[22px]" : "left-0.5"
+                      }`}
+                    />
+                  </button>
+                  <span className="text-sm text-slate-600">{mailSecure ? "已启用（465 端口）" : "未启用（明文，如 25 端口）"}</span>
+                </div>
+              </div>
+              <div>
                 <label className="mb-1 block text-xs text-slate-500">SMTP Username</label>
                 <input value={mailUser} onChange={(e) => setMailUser(e.target.value)} className={inputCls} />
               </div>
@@ -1184,6 +1242,15 @@ export default function AdminPage() {
               <div>
                 <label className="mb-1 block text-xs text-slate-500">发件人邮箱</label>
                 <input value={mailFromEmail} onChange={(e) => setMailFromEmail(e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-slate-500">允许的收件邮箱域名</label>
+                <input
+                  value={mailAllowedDomains}
+                  onChange={(e) => setMailAllowedDomains(e.target.value)}
+                  className={inputCls}
+                  placeholder="company.com, partner.com（留空不限制）"
+                />
               </div>
             </div>
             <div className="mt-3 flex items-center justify-between">

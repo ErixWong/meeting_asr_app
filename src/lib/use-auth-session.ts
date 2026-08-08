@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 export type CurrentUser = {
   accountName: string;
   displayName: string;
+  email: string;
   mustChangePassword: boolean;
   roles: string[];
 };

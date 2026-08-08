@@ -5,7 +5,8 @@ import {
   RecordStatus,
   MeetingAsrResult,
   MeetingAsrResultDetail,
-  MeetingLlmResult,
+  MeetingLlmResultSummary,
+  MeetingLlmResultContent,
   MeetingRecord,
   MeetingSendRecord,
   PromptTemplate,
@@ -29,6 +30,8 @@ import HistoryList from "@/components/main/HistoryList";
 import AsrResultDetailView from "@/components/main/AsrResultDetailView";
 import { formatTime } from "@/components/main/RecordingControls";
 import { useAuthSession } from "@/lib/use-auth-session";
+import { useTts } from "@/components/tts/TtsProvider";
+import TtsReadableSync from "@/components/tts/TtsReadableSync";
 
 let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
@@ -48,6 +51,13 @@ function formatAsrCreatedAt(value?: string) {
   if (Number.isNaN(date.getTime())) return "-";
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function getTranscriptPlainText(segments: TranscriptSegment[]) {
+  return segments
+    .map((segment) => segment.text.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 type ActionNotice = {
@@ -101,7 +111,8 @@ export default function MeetingPage() {
   const [summaryGenerating, setSummaryGenerating] = useState(false);
   const [editingSummary, setEditingSummary] = useState(false);
   const [summaryText, setSummaryText] = useState("");
-  const [llmResults, setLlmResults] = useState<MeetingLlmResult[]>([]);
+  const [llmResults, setLlmResults] = useState<MeetingLlmResultSummary[]>([]);
+  const [llmContentById, setLlmContentById] = useState<Record<string, string>>({});
   const [selectedLlmResultId, setSelectedLlmResultId] = useState<string | null>(null);
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]);
   const [selectedPromptTemplateId, setSelectedPromptTemplateId] = useState<string>("");
@@ -111,16 +122,31 @@ export default function MeetingPage() {
   const [asrResults, setAsrResults] = useState<MeetingAsrResult[]>([]);
   const [selectedAsrResult, setSelectedAsrResult] = useState<MeetingAsrResultDetail | null>(null);
   const [sendingMail, setSendingMail] = useState(false);
+  const [sendModalOpen, setSendModalOpen] = useState(false);
+  const [sendRecordsModalOpen, setSendRecordsModalOpen] = useState(false);
   const [asrReady, setAsrReady] = useState(false);
   const [asrErrorMessage, setAsrErrorMessage] = useState<string | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
+  const { isSupported, isSpeaking, canRead, hasSelection, toggleSpeak } = useTts();
+  const readableText = selected
+    ? viewTab === "transcript"
+      ? getTranscriptPlainText(selected.transcript)
+      : viewTab === "asrRaw"
+        ? selectedAsrResult?.normalizedText ?? ""
+        : editingSummary
+          ? summaryText
+          : selected.summary
+    : getTranscriptPlainText(liveSegments);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const asrClientsRef = useRef<Map<string, FunASRClient>>(new Map());
   const segmentsRef = useRef<TranscriptSegment[]>([]);
   const elapsedRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectedMeetingIdRef = useRef<string | null>(null);
+  const fullDetailLoadedRef = useRef(false);
+  const selectedLlmResultIdRef = useRef<string | null>(null);
+  const llmContentByIdRef = useRef<Record<string, string>>({});
   const summaryGeneratingRef = useRef(false);
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<Map<string, VoiceprintFeature[]>>(new Map());
@@ -529,8 +555,8 @@ export default function MeetingPage() {
   const primeMeetingAsyncState = useCallback(async (meetingId: string) => {
     try {
       const [meetingData, llmData] = await Promise.all([
-        requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`),
-        requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`).catch(() => ({ llmResults: [] })),
+        requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}?view=light`),
+        requestJson<{ llmResults?: MeetingLlmResultSummary[] }>(`/api/meetings/${meetingId}/llm-results`).catch(() => ({ llmResults: [] })),
       ]);
 
       if (!isActiveMeeting(meetingId)) return;
@@ -538,15 +564,12 @@ export default function MeetingPage() {
       const latestMeeting = meetingData.meeting;
       if (latestMeeting) {
         setMeetings((prev) => prev.map((item) => (item.id === meetingId ? latestMeeting : item)));
-        setSelected((prev) => (prev && prev.id === meetingId ? latestMeeting : prev));
+        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, ...latestMeeting, transcript: prev.transcript } : prev));
       }
 
       const nextResults = llmData.llmResults ?? [];
       setLlmResults(nextResults);
       setSelectedLlmResultId(nextResults[0]?.id ?? null);
-      if (nextResults[0]?.resultMarkdown) {
-        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: nextResults[0].resultMarkdown } : prev));
-      }
     } catch (error) {
       console.error("Failed to prime meeting async state:", error);
     }
@@ -981,6 +1004,7 @@ export default function MeetingPage() {
     persistedSegmentCountRef.current = 0;
     setAsrErrorMessage(null);
     selectedMeetingIdRef.current = null;
+    fullDetailLoadedRef.current = false;
     setSelected(null);
     updateSummaryGenerating(false, null);
     setSendingMail(false);
@@ -996,14 +1020,16 @@ export default function MeetingPage() {
 
   const loadLlmResults = useCallback(async (meetingId: string) => {
     try {
-      const data = await requestJson<{ llmResults?: MeetingLlmResult[] }>(`/api/meetings/${meetingId}/llm-results`);
+      const data = await requestJson<{ llmResults?: MeetingLlmResultSummary[] }>(`/api/meetings/${meetingId}/llm-results`);
       if (!isActiveMeeting(meetingId)) return;
       const nextResults = data.llmResults ?? [];
+      const prevSelected = selectedLlmResultIdRef.current;
+      const preserved =
+        prevSelected && nextResults.some((item) => item.id === prevSelected)
+          ? prevSelected
+          : (nextResults[0]?.id ?? null);
       setLlmResults(nextResults);
-      setSelectedLlmResultId(nextResults[0]?.id ?? null);
-      if (nextResults[0]?.resultMarkdown) {
-        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: nextResults[0].resultMarkdown } : prev));
-      }
+      setSelectedLlmResultId(preserved);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load llm results:", error);
@@ -1026,20 +1052,78 @@ export default function MeetingPage() {
     }
   }, [isActiveMeeting, requestJson]);
 
+  useEffect(() => {
+    selectedLlmResultIdRef.current = selectedLlmResultId;
+  }, [selectedLlmResultId]);
+
+  const loadLlmResultContent = useCallback(
+    async (meetingId: string, resultId: string): Promise<string> => {
+      const data = await requestJson<{ llmResult?: MeetingLlmResultContent }>(`/api/meetings/${meetingId}/llm-results/${resultId}`);
+      const content = data.llmResult?.resultMarkdown ?? "";
+      llmContentByIdRef.current[resultId] = content;
+      setLlmContentById((prev) => ({ ...prev, [resultId]: content }));
+      return content;
+    },
+    [requestJson]
+  );
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !selectedLlmResultId) return;
+    const version = llmResults.find((item) => item.id === selectedLlmResultId);
+    if (!version) return;
+
+    if (version.status !== "succeeded") {
+      if (version.status === "failed") {
+        setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== "" ? { ...prev, summary: "" } : prev));
+      }
+      return;
+    }
+    if (llmContentByIdRef.current[version.id] !== undefined) {
+      const cached = llmContentByIdRef.current[version.id];
+      setSelected((prev) => (prev && prev.id === meetingId && prev.summary !== cached ? { ...prev, summary: cached } : prev));
+      return;
+    }
+    let cancelled = false;
+    loadLlmResultContent(meetingId, version.id)
+      .then((content) => {
+        if (cancelled || !isActiveMeeting(meetingId) || selectedLlmResultIdRef.current !== version.id) return;
+        setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, summary: content } : prev));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        if (error instanceof ApiRequestError && error.status === 401) return;
+        console.error("Failed to load llm result content:", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedLlmResultId]);
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !selectedTranslationId) return;
+    const version = llmResults.find((item) => item.id === selectedTranslationId);
+    if (!version || version.status !== "succeeded") return;
+    if (llmContentByIdRef.current[version.id] !== undefined) return;
+    let cancelled = false;
+    loadLlmResultContent(meetingId, version.id).catch((error) => {
+      if (cancelled) return;
+      if (error instanceof ApiRequestError && error.status === 401) return;
+      console.error("Failed to load translation content:", error);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedTranslationId]);
+
   const loadAsrResults = useCallback(async (meetingId: string) => {
     try {
       const data = await requestJson<{ asrResults?: MeetingAsrResult[] }>(`/api/meetings/${meetingId}/asr-results`);
       if (!isActiveMeeting(meetingId)) return;
       const nextResults = data.asrResults ?? [];
       setAsrResults(nextResults);
-
-      if (nextResults[0]?.id) {
-        const detailData = await requestJson<{ asrResult?: MeetingAsrResultDetail }>(`/api/meetings/${meetingId}/asr-results/${nextResults[0].id}`);
-        if (!isActiveMeeting(meetingId)) return;
-        setSelectedAsrResult(detailData.asrResult ?? null);
-      } else {
-        setSelectedAsrResult(null);
-      }
+      setSelectedAsrResult(null);
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) return;
       console.error("Failed to load asr results:", error);
@@ -1072,6 +1156,15 @@ export default function MeetingPage() {
     return meeting;
   }, [requestJson]);
 
+  const loadMeetingFull = useCallback(async (meetingId: string) => {
+    const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`);
+    if (!isActiveMeeting(meetingId)) return;
+    const meeting = data.meeting;
+    if (!meeting) return;
+    fullDetailLoadedRef.current = true;
+    setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, transcript: meeting.transcript } : prev));
+  }, [isActiveMeeting, requestJson]);
+
   useEffect(() => {
     if (!selected?.id || selected.status !== "llm_processing") {
       return;
@@ -1093,7 +1186,7 @@ export default function MeetingPage() {
     poll().catch(console.error);
     const timer = window.setInterval(() => {
       poll().catch(console.error);
-    }, 2000);
+    }, 8000);
 
     return () => {
       disposed = true;
@@ -1233,6 +1326,10 @@ export default function MeetingPage() {
 
   const generateSummary = useCallback(async (promptTemplateId?: string) => {
     if (!selected || summaryGeneratingRef.current) return;
+    if (selected.status === "llm_processing") {
+      showNotice("info", "纪要正在生成中，请稍候");
+      return;
+    }
     const meetingId = selected.id;
     updateSummaryGenerating(true, meetingId);
     try {
@@ -1345,6 +1442,7 @@ export default function MeetingPage() {
       if (!isActiveMeeting(meetingId)) return;
       await loadSendRecords(meetingId);
       await refreshMeeting(meetingId);
+      setSendModalOpen(false);
       showNotice("success", "会议纪要已发送");
     } catch (error) {
       console.error("Failed to send summary:", error);
@@ -1359,9 +1457,19 @@ export default function MeetingPage() {
     }
   }, [isActiveMeeting, llmResults, loadSendRecords, mailCc, mailTo, refreshMeeting, requestJson, selected, selectedLlmResultId, showNotice]);
 
+  const openSendModal = useCallback(() => {
+    setMailTo(currentUser?.email ?? "");
+    setMailCc("");
+    setSendModalOpen(true);
+  }, [currentUser]);
+
   const activePromptTemplates = promptTemplates.filter((template) => template.status === "active");
   const summaryResults = llmResults.filter((item) => item.resultType !== "translation");
   const currentLlmResult = summaryResults.find((item) => item.id === selectedLlmResultId) ?? summaryResults[0] ?? null;
+  const currentVersionSendRecords = currentLlmResult
+    ? sendRecords.filter((record) => record.meetingLlmResultId === currentLlmResult.id)
+    : [];
+  const summaryBusy = summaryGenerating || selected?.status === "llm_processing";
   const translationVersions = llmResults.filter((item) => item.resultType === "translation");
   const selectedTranslation =
     translationVersions.find((item) => item.id === selectedTranslationId) ??
@@ -1372,13 +1480,10 @@ export default function MeetingPage() {
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
 
   const selectLlmResult = useCallback((resultId: string) => {
+    selectedLlmResultIdRef.current = resultId;
     setSelectedLlmResultId(resultId);
-    const next = llmResults.find((item) => item.id === resultId);
-    if (next) {
-      setSelected((prev) => prev ? { ...prev, summary: next.resultMarkdown } : prev);
-      setEditingSummary(false);
-    }
-  }, [llmResults]);
+    setEditingSummary(false);
+  }, []);
 
   const deleteLlmResult = useCallback(
     async (resultId: string, kind: "summary" | "translation" = "summary") => {
@@ -1419,6 +1524,8 @@ export default function MeetingPage() {
             resultMarkdown: summaryText,
           }),
         });
+        llmContentByIdRef.current[selectedLlmResultId] = summaryText;
+        setLlmContentById((prev) => ({ ...prev, [selectedLlmResultId]: summaryText }));
         await loadLlmResults(selected.id);
       }
       const updated = { ...selected, summary: summaryText };
@@ -1450,21 +1557,23 @@ export default function MeetingPage() {
         : "border-sky-200 bg-sky-50 text-sky-700";
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {notice && (
-        <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
-          <span>{notice.message}</span>
-          <button
-            type="button"
-            onClick={() => setNotice(null)}
-            className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
-          >
-            关闭
-          </button>
-        </div>
-      )}
+    <>
+      <TtsReadableSync text={readableText} />
+      <div className="flex min-h-0 flex-1 flex-col">
+        {notice && (
+          <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
+            <span>{notice.message}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+            >
+              关闭
+            </button>
+          </div>
+        )}
 
-      <div className="flex min-w-0 flex-1 overflow-hidden">
+        <div className="flex min-w-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex-1 overflow-y-auto">
             <HistoryList
@@ -1477,22 +1586,15 @@ export default function MeetingPage() {
                  persistedSegmentCountRef.current = 0;
                  setAsrErrorMessage(null);
                  selectedMeetingIdRef.current = m.id;
+                fullDetailLoadedRef.current = false;
                 setSelected(m);
                 updateSummaryGenerating(false, null);
                 setSendingMail(false);
                 setLiveSegments([]);
                 setViewTab("summary");
+                setAsrResults([]);
+                setSelectedAsrResult(null);
                 loadLlmResults(m.id).catch(console.error);
-                loadSendRecords(m.id).catch(console.error);
-                loadAsrResults(m.id).catch(console.error);
-                requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${m.id}`)
-                  .then((data) => {
-                    const meeting = data.meeting;
-                    if (!meeting || selectedMeetingIdRef.current !== m.id) return;
-                    setSelected(meeting);
-                    setMeetings((prev) => prev.map((item) => (item.id === m.id ? meeting : item)));
-                  })
-                  .catch(console.error);
               }}
               onCreateNew={handleCreateNew}
               onRename={async (id, newTitle) => {
@@ -1570,7 +1672,12 @@ export default function MeetingPage() {
                         会议纪要
                       </button>
                       <button
-                        onClick={() => setViewTab("transcript")}
+                        onClick={() => {
+                          setViewTab("transcript");
+                          if (selected && selected.transcript.length === 0 && !fullDetailLoadedRef.current) {
+                            loadMeetingFull(selected.id).catch(console.error);
+                          }
+                        }}
                         className={`rounded-md px-3 py-1 text-sm ${
                           viewTab === "transcript"
                             ? "bg-white text-brand shadow-sm"
@@ -1679,7 +1786,7 @@ export default function MeetingPage() {
                           </div>
                         ) : selectedTranslation?.status === "succeeded" ? (
                           <div className="whitespace-pre-wrap text-[15px] leading-relaxed text-emerald-700">
-                            {selectedTranslation.resultMarkdown}
+                            {llmContentById[selectedTranslation.id] ?? "译文加载中..."}
                           </div>
                         ) : selectedTranslation?.status === "failed" ? (
                           <div className="text-sm text-red-500">
@@ -1739,22 +1846,44 @@ export default function MeetingPage() {
                       </div>
                     )
                   ) : (
-                    <div className="flex min-h-full flex-col gap-4">
-                      <div className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
-                        <div className="min-w-0">
-                          <div className="text-sm font-semibold text-slate-800">会议纪要版本</div>
-                          <div className="mt-1 text-xs text-slate-500">
-                            {currentLlmResult
-                              ? `当前版本 V${currentLlmResult.versionNo} / ${currentLlmResult.resultTitle}`
-                              : "尚未生成纪要，请选择模板后生成。"}
-                          </div>
+                    <div className="flex min-h-full flex-col gap-3">
+                      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
+                          {summaryResults.length === 0 ? (
+                            <span className="whitespace-nowrap text-sm text-slate-400">暂无版本</span>
+                          ) : (
+                            summaryResults.map((result) => {
+                              const failed = result.status === "failed";
+                              return (
+                                <button
+                                  key={result.id}
+                                  onClick={() => selectLlmResult(result.id)}
+                                  className={`shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1.5 text-sm ${
+                                    failed
+                                      ? "border-red-200 bg-red-50 text-red-600 hover:bg-red-100"
+                                      : result.id === currentLlmResult?.id
+                                        ? "border-brand bg-brand/5 text-brand"
+                                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                                  }`}
+                                  title={failed ? result.errorMessage ?? "生成失败" : result.generationMode}
+                                >
+                                  V{result.versionNo}
+                                  {failed ? (
+                                    <span className="ml-1 text-xs opacity-80">失败</span>
+                                  ) : result.resultTitle ? (
+                                    <span className="ml-1 text-xs opacity-70">{result.resultTitle}</span>
+                                  ) : null}
+                                </button>
+                              );
+                            })
+                          )}
                         </div>
-                        <div className="flex flex-wrap items-center justify-end gap-2">
+                        <div className="flex shrink-0 flex-wrap items-center gap-2">
                           {activePromptTemplates.length > 0 ? (
                             <select
                               value={selectedPromptTemplate?.id ?? ""}
                               onChange={(e) => setSelectedPromptTemplateId(e.target.value)}
-                              className="min-w-44 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-600"
+                              className="min-w-40 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-600"
                             >
                               {activePromptTemplates.map((template) => (
                                 <option key={template.id} value={template.id}>
@@ -1767,65 +1896,126 @@ export default function MeetingPage() {
                           )}
                           <button
                             onClick={() => generateSummary(selectedPromptTemplate?.id)}
-                            disabled={summaryGenerating}
-                            className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:opacity-60"
+                            disabled={summaryBusy}
+                            className="flex items-center gap-1.5 rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:opacity-60"
                           >
-                            {summaryGenerating ? "生成中..." : selected.summary ? "按模板生成新版本" : "生成纪要"}
+                            <svg
+                              className="h-4 w-4"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3z" />
+                              <path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z" />
+                            </svg>
+                            {summaryBusy ? "生成中..." : "AI生成"}
                           </button>
                         </div>
                       </div>
 
-                      {summaryResults.length > 0 && (
-                        <div className="flex gap-2 overflow-x-auto pb-1">
-                          {summaryResults.map((result) => (
-                            <button
-                              key={result.id}
-                              onClick={() => selectLlmResult(result.id)}
-                              className={`shrink-0 rounded-md border px-3 py-2 text-left text-sm ${
-                                result.id === currentLlmResult?.id
-                                  ? "border-brand bg-brand/5 text-brand"
-                                  : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                              }`}
-                            >
-                              <div className="font-medium">V{result.versionNo} / {result.resultTitle}</div>
-                              <div className="mt-0.5 text-xs opacity-70">{result.generationMode}</div>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-
                       <div className="flex min-h-[18rem] flex-1 flex-col overflow-hidden rounded-lg border border-slate-200 bg-white">
                         <div className="grid grid-cols-12 items-center gap-3 border-b border-slate-100 px-4 py-2">
-                          <div className="col-span-9">
+                          <div className="col-span-4">
                             {currentLlmResult?.errorMessage ? (
                               <div className="text-xs text-amber-600">⚠️ {currentLlmResult.errorMessage}</div>
                             ) : (
                               <span className="text-xs text-slate-400">纪要内容</span>
                             )}
                           </div>
-                          <div className="col-span-3 flex justify-end">
+                          <div className="col-span-8 flex flex-wrap justify-end gap-2">
                             {currentLlmResult && (
-                              <button
-                                onClick={() => deleteLlmResult(currentLlmResult.id)}
-                                className="rounded-md border border-slate-200 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
-                              >
-                                删除该版本
-                              </button>
+                              <>
+                                <button
+                                  onClick={() => {
+                                    if (selected) {
+                                      loadSendRecords(selected.id).catch(console.error);
+                                    }
+                                    setSendRecordsModalOpen(true);
+                                  }}
+                                  className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
+                                >
+                                  发送记录
+                                </button>
+                                {isSupported && (
+                                  <button
+                                    onClick={toggleSpeak}
+                                    disabled={!canRead && !isSpeaking}
+                                    className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                    title="优先朗读选中文本；未选中时朗读当前全文"
+                                  >
+                                    {isSpeaking ? "停止朗读" : hasSelection ? "朗读选中部分" : "朗读全文"}
+                                  </button>
+                                )}
+                                {editingSummary ? (
+                                  <>
+                                    <button
+                                      onClick={saveSummaryEdit}
+                                      className="rounded-md bg-brand px-2 py-1 text-xs text-white hover:bg-brand-dark"
+                                    >
+                                      保存
+                                    </button>
+                                    <button
+                                      onClick={() => setEditingSummary(false)}
+                                      className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                                    >
+                                      取消
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    onClick={() => {
+                                      setSummaryText(selected.summary);
+                                      setEditingSummary(true);
+                                    }}
+                                    className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                                  >
+                                    编辑纪要
+                                  </button>
+                                )}
+                                <button
+                                  onClick={openSendModal}
+                                  disabled={sendingMail}
+                                  className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-100 disabled:opacity-60"
+                                >
+                                  发送该版本
+                                </button>
+                                <button
+                                  onClick={() => deleteLlmResult(currentLlmResult.id)}
+                                  className="rounded-md border border-slate-200 px-2 py-1 text-xs text-red-500 hover:bg-red-50"
+                                >
+                                  删除该版本
+                                </button>
+                              </>
                             )}
                           </div>
                         </div>
-                        {summaryGenerating ? (
+                        {summaryBusy ? (
                           <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center text-slate-400">
                             <div className="mb-3 h-8 w-8 animate-spin rounded-full border-2 border-brand border-t-transparent" />
                             <p>正在生成会议纪要...</p>
                           </div>
                         ) : selected.summary ? (
                           editingSummary ? (
-                            <textarea
-                              value={summaryText}
-                              onChange={(e) => setSummaryText(e.target.value)}
-                              className="scroll-thin flex-1 min-h-[18rem] w-full resize-none whitespace-pre-wrap p-4 text-[15px] leading-relaxed text-slate-700 focus:outline-none"
-                            />
+                            <div className="flex min-h-[18rem] flex-1 flex-col">
+                              <div className="flex shrink-0 items-center justify-between border-b border-slate-100 bg-slate-50/60 px-3 py-1.5 text-xs text-slate-400">
+                                <span>编辑 Markdown</span>
+                                <span>右侧为实时预览</span>
+                              </div>
+                              <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
+                                <textarea
+                                  value={summaryText}
+                                  onChange={(e) => setSummaryText(e.target.value)}
+                                  spellCheck={false}
+                                  className="scroll-thin min-h-[18rem] w-full resize-none border-r border-slate-100 p-4 font-mono text-[14px] leading-relaxed text-slate-700 focus:outline-none"
+                                />
+                                <div className="scroll-thin min-h-[18rem] overflow-y-auto p-4">
+                                  <MarkdownPreview markdown={summaryText} />
+                                </div>
+                              </div>
+                            </div>
                           ) : (
                             <div className="scroll-thin flex-1 min-h-[18rem] overflow-y-auto p-4">
                               <MarkdownPreview markdown={selected.summary} />
@@ -1833,8 +2023,17 @@ export default function MeetingPage() {
                           )
                         ) : (
                           <div className="flex flex-1 min-h-[18rem] flex-col items-center justify-center px-4 text-center text-slate-400">
-                            <p>这个会议还没有纪要版本。</p>
-                            <p className="mt-1 text-sm">选择模板后生成，生成结果会作为一个独立版本保留。</p>
+                            {selected.lastErrorMessage ? (
+                              <>
+                                <p className="text-sm text-amber-600">⚠️ {selected.lastErrorMessage}</p>
+                                <p className="mt-2 text-sm">可以删除失败的版本后重新生成。</p>
+                              </>
+                            ) : (
+                              <>
+                                <p>这个会议还没有纪要版本。</p>
+                                <p className="mt-1 text-sm">选择模板后生成，生成结果会作为一个独立版本保留。</p>
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1859,98 +2058,7 @@ export default function MeetingPage() {
                     复制全文
                   </button>
                   )}
-                  {viewTab === "summary" && selected.summary && (
-                    <>
-                      {editingSummary ? (
-                        <>
-                          <button
-                            onClick={saveSummaryEdit}
-                            className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark"
-                          >
-                            保存
-                          </button>
-                          <button
-                            onClick={() => setEditingSummary(false)}
-                            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
-                          >
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          onClick={() => {
-                            setSummaryText(selected.summary);
-                            setEditingSummary(true);
-                          }}
-                          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
-                        >
-                          编辑纪要
-                        </button>
-                      )}
-                      <button
-                        onClick={() => sendSummary()}
-                        disabled={sendingMail}
-                        className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:opacity-60"
-                      >
-                        {sendingMail ? "发送中..." : "发送纪要"}
-                      </button>
-                    </>
-                  )}
                 </div>
-                {viewTab === "summary" && selected.summary && (
-                  <div className="mt-4 grid gap-4 rounded-xl border border-slate-200 bg-slate-50 p-4 md:grid-cols-2">
-                    <div>
-                      <label className="mb-1 block text-xs text-slate-500">主送</label>
-                      <input
-                        value={mailTo}
-                        onChange={(e) => setMailTo(e.target.value)}
-                        placeholder="a@example.com,b@example.com"
-                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand"
-                      />
-                    </div>
-                    <div>
-                      <label className="mb-1 block text-xs text-slate-500">抄送</label>
-                      <input
-                        value={mailCc}
-                        onChange={(e) => setMailCc(e.target.value)}
-                        placeholder="c@example.com"
-                        className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand"
-                      />
-                    </div>
-                    <div className="md:col-span-2">
-                      <div className="mb-2 text-xs font-medium text-slate-500">发送记录</div>
-                      {sendRecords.length === 0 ? (
-                        <div className="text-sm text-slate-400">暂无发送记录</div>
-                      ) : (
-                        <div className="space-y-2">
-                          {sendRecords.map((record) => (
-                            <div key={record.id} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
-                              <div className="flex items-center justify-between gap-3">
-                                <span className="font-medium text-slate-700">{record.subject}</span>
-                                <span className={`text-xs ${record.status === "sent" ? "text-emerald-600" : "text-red-600"}`}>
-                                  {record.status}
-                                </span>
-                              </div>
-                              <div className="mt-1 text-xs text-slate-500">
-                                To: {record.toRecipients.join(", ") || "-"}
-                              </div>
-                              {record.ccRecipients.length > 0 && (
-                                <div className="mt-1 text-xs text-slate-400">
-                                  Cc: {record.ccRecipients.join(", ")}
-                                </div>
-                              )}
-                              {record.errorMessage && (
-                                <div className="mt-1 text-xs text-red-500">
-                                  {record.errorMessage}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
               </div>
             ) : (
               <div className="flex h-full w-full flex-col rounded-xl border border-slate-200 bg-white">
@@ -2103,7 +2211,112 @@ export default function MeetingPage() {
             </div>
           )}
         </main>
+
+        {sendModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+            <div className="w-full max-w-lg overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-lg">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-base font-semibold text-slate-800">发送该版本纪要</h3>
+                <button
+                  onClick={() => setSendModalOpen(false)}
+                  disabled={sendingMail}
+                  className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+                  aria-label="关闭发送弹窗"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="mt-4 space-y-4">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">主送</label>
+                  <input
+                    value={mailTo}
+                    onChange={(e) => setMailTo(e.target.value)}
+                    placeholder="a@example.com,b@example.com"
+                    className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">抄送</label>
+                  <input
+                    value={mailCc}
+                    onChange={(e) => setMailCc(e.target.value)}
+                    placeholder="c@example.com"
+                    className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand"
+                  />
+                </div>
+              </div>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  onClick={() => setSendModalOpen(false)}
+                  disabled={sendingMail}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-60"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() => sendSummary()}
+                  disabled={sendingMail}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm text-white hover:bg-emerald-700 disabled:opacity-60"
+                >
+                  {sendingMail ? "发送中..." : "发送"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {sendRecordsModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+            <div className="w-full max-w-2xl overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-lg">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-base font-semibold text-slate-800">发送记录</h3>
+                <button
+                  onClick={() => setSendRecordsModalOpen(false)}
+                  className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                  aria-label="关闭发送记录弹窗"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="mt-4">
+                {currentVersionSendRecords.length === 0 ? (
+                  <div className="py-6 text-center text-sm text-slate-400">
+                    该版本还没有发送记录
+                  </div>
+                ) : (
+                  <div className="max-h-[60vh] space-y-2 overflow-y-auto">
+                    {currentVersionSendRecords.map((record) => (
+                      <div key={record.id} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="font-medium text-slate-700">{record.subject}</span>
+                          <span className={`text-xs ${record.status === "sent" ? "text-emerald-600" : "text-red-600"}`}>
+                            {record.status}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          To: {record.toRecipients.join(", ") || "-"}
+                        </div>
+                        {record.ccRecipients.length > 0 && (
+                          <div className="mt-1 text-xs text-slate-400">
+                            Cc: {record.ccRecipients.join(", ")}
+                          </div>
+                        )}
+                        {record.errorMessage && (
+                          <div className="mt-1 text-xs text-red-500">
+                            {record.errorMessage}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        </div>
       </div>
-    </div>
+    </>
   );
 }

@@ -23,7 +23,7 @@ const DEFAULT_CONFIG: LlmQueueConfig = { maxConcurrency: 2, capacity: 10 };
 const DEFAULT_WAIT_MS: Record<LlmTaskType, number> = {
   translate: 30_000,
   test: 30_000,
-  summary: 180_000,
+  summary: 300_000,
 };
 
 let configReader: ConfigReader = () => DEFAULT_CONFIG;
