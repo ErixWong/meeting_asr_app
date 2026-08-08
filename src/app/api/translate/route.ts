@@ -25,8 +25,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Translation payload too large" }, { status: 400 });
       }
 
-      const text = await llmQueue.enqueue("translate", () => translateSentences(sentences, targetLang));
-      return NextResponse.json({ text });
+      const result = await llmQueue.enqueue("translate", () => translateSentences(sentences, targetLang));
+      return NextResponse.json({ text: result.text, elapsedMs: result.elapsedMs });
     } catch (error) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Translation failed" },

@@ -101,6 +101,7 @@ try {
   );
   if (translateReachable) {
     check("翻译返回 text 字段", typeof r.data?.text === "string" && r.data.text.length > 0, JSON.stringify(r.data).slice(0, 150));
+    check("翻译返回 elapsedMs（模型耗时）", typeof r.data?.elapsedMs === "number" && r.data.elapsedMs > 0, `elapsedMs=${r.data?.elapsedMs}`);
   }
 
   // 3. 管理员
