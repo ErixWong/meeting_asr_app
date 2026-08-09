@@ -1079,23 +1079,6 @@ export default function MeetingPage() {
     [requestJson]
   );
 
-  useEffect(() => {
-    const meetingId = selected?.id;
-    if (!meetingId || !selectedVersionId) return;
-    const version = llmResults.find((item) => item.id === selectedVersionId);
-    if (!version || version.status !== "succeeded") return;
-    if (llmContentByIdRef.current[version.id] !== undefined) return;
-    let cancelled = false;
-    loadLlmResultContent(meetingId, version.id).catch((error) => {
-      if (cancelled) return;
-      if (error instanceof ApiRequestError && error.status === 401) return;
-      console.error("Failed to load llm result content:", error);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [isActiveMeeting, llmResults, loadLlmResultContent, selected?.id, selectedVersionId]);
-
   const loadAsrResults = useCallback(async (meetingId: string) => {
     try {
       const data = await requestJson<{ asrResults?: MeetingAsrResult[] }>(`/api/meetings/${meetingId}/asr-results`);
@@ -1456,6 +1439,22 @@ export default function MeetingPage() {
   const currentVersionSendRecords = currentVersion
     ? sendRecords.filter((record) => record.meetingLlmResultId === currentVersion.id)
     : [];
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !currentVersion) return;
+    if (currentVersion.status !== "succeeded") return;
+    if (llmContentByIdRef.current[currentVersion.id] !== undefined) return;
+    let cancelled = false;
+    loadLlmResultContent(meetingId, currentVersion.id).catch((error) => {
+      if (cancelled) return;
+      if (error instanceof ApiRequestError && error.status === 401) return;
+      console.error("Failed to load llm result content:", error);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentVersion, isActiveMeeting, loadLlmResultContent, selected?.id]);
   const summaryBusy = summaryGenerating || selected?.status === "llm_processing";
   const selectedPromptTemplate =
     activePromptTemplates.find((template) => template.id === selectedPromptTemplateId) ?? activePromptTemplates[0] ?? null;
