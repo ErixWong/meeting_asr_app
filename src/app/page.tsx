@@ -1688,51 +1688,51 @@ export default function MeetingPage() {
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
                     <div className="flex min-h-0 flex-1 flex-col gap-3">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <label className="flex items-center gap-1 text-xs text-slate-500">
-                          翻译为
-                          <select
-                            value={historyTranslateLang}
-                            onChange={(e) => setHistoryTranslateLang(e.target.value)}
-                            disabled={translationGenerating}
-                            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm text-slate-700 outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label className="flex items-center gap-1 text-xs text-slate-500">
+                            翻译为
+                            <select
+                              value={historyTranslateLang}
+                              onChange={(e) => setHistoryTranslateLang(e.target.value)}
+                              disabled={translationGenerating}
+                              className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm text-slate-700 outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+                            >
+                              {HISTORY_TRANSLATE_LANGS.map((lang) => (
+                                <option key={lang.value} value={lang.value}>
+                                  {lang.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            onClick={() => generateHistoryTranslation()}
+                            disabled={translationGenerating || selected?.status === "llm_processing"}
+                            className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            {HISTORY_TRANSLATE_LANGS.map((lang) => (
-                              <option key={lang.value} value={lang.value}>
-                                {lang.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
+                            {translationGenerating || selected?.status === "llm_processing"
+                              ? selected?.status === "llm_processing" && !translationGenerating
+                                ? "处理中..."
+                                : "翻译中..."
+                              : "翻译"}
+                          </button>
+                        </div>
                         <button
-                          onClick={() => generateHistoryTranslation()}
-                          disabled={translationGenerating || selected?.status === "llm_processing"}
-                          className="rounded-md bg-brand px-3 py-1.5 text-sm text-white hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-60"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(selected.transcript.map((s) => s.text).join(""));
+                              showNotice("success", "转写原文已复制");
+                            } catch (error) {
+                              console.error("Failed to copy transcript:", error);
+                              showNotice("error", "复制失败，请检查浏览器剪贴板权限");
+                            }
+                          }}
+                          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
                         >
-                          {translationGenerating || selected?.status === "llm_processing"
-                            ? selected?.status === "llm_processing" && !translationGenerating
-                              ? "处理中..."
-                              : "翻译中..."
-                            : "翻译"}
+                          复制原文
                         </button>
                       </div>
                       <div className="flex min-h-0 flex-1 flex-col">
-                        <div className="mb-1 flex shrink-0 items-center justify-end">
-                          <button
-                            onClick={async () => {
-                              try {
-                                await navigator.clipboard.writeText(selected.transcript.map((s) => s.text).join(""));
-                                showNotice("success", "转写原文已复制");
-                              } catch (error) {
-                                console.error("Failed to copy transcript:", error);
-                                showNotice("error", "复制失败，请检查浏览器剪贴板权限");
-                              }
-                            }}
-                            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50"
-                          >
-                            复制原文
-                          </button>
-                        </div>
                         <div className="min-h-0 flex-1">
                           <TranscriptView segments={selected.transcript} />
                         </div>
