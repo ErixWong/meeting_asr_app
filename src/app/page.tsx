@@ -2114,7 +2114,6 @@ export default function MeetingPage() {
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-4 py-3">
                   <div>
                     <h2 className="text-xl font-semibold text-slate-800">新增录音</h2>
-                    <p className="mt-1 text-sm text-slate-400">录音和上传只在这里操作；查看历史会议时不显示录音控件。</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
                     <DeviceSelector
