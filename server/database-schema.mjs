@@ -213,8 +213,182 @@ export function initializeDatabase(database) {
       ON auth_sessions(user_id);
   `);
 
+  runMigrations(database);
+
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_meeting_llm_results_meeting_version_created
       ON meeting_llm_results(meeting_id, version_no, created_at);
   `);
+}
+
+const MIGRATIONS = [
+  {
+    version: 1,
+    name: "meeting-llm-results-meeting-id",
+    up(database) {
+      const columns = database.prepare("PRAGMA table_info(meeting_llm_results)").all();
+      if (!columns.length) return;
+      if (columns.some((column) => column.name === "meeting_id")) return;
+
+      database.exec("ALTER TABLE meeting_send_records RENAME TO meeting_send_records_legacy");
+      database.exec("ALTER TABLE meeting_llm_results RENAME TO meeting_llm_results_legacy");
+
+        database.exec(`
+          CREATE TABLE meeting_llm_results (
+            id TEXT PRIMARY KEY,
+            meeting_id TEXT NOT NULL,
+            input_transcript_snapshot TEXT NOT NULL,
+            llm_setting_mark TEXT NOT NULL,
+            prompt_template_id TEXT NOT NULL,
+            generation_config_snapshot TEXT NOT NULL,
+            generation_mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            version_no INTEGER NOT NULL,
+            result_type TEXT NOT NULL,
+            result_title TEXT NOT NULL,
+            raw_prompt TEXT NOT NULL,
+            raw_response TEXT NOT NULL,
+            result_markdown TEXT NOT NULL,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+            FOREIGN KEY (prompt_template_id) REFERENCES llm_prompt_templates(id) ON DELETE RESTRICT,
+            UNIQUE (meeting_id, version_no)
+          )
+        `);
+
+        database.exec(`
+          CREATE TABLE meeting_send_records (
+            id TEXT PRIMARY KEY,
+            meeting_llm_result_id TEXT NOT NULL,
+            mail_template_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            to_recipients_json TEXT NOT NULL,
+            cc_recipients_json TEXT NOT NULL,
+            body_markdown TEXT NOT NULL,
+            body_html TEXT NOT NULL,
+            status TEXT NOT NULL,
+            mail_setting_mark TEXT NOT NULL,
+            mail_config_snapshot TEXT NOT NULL,
+            provider_type TEXT NOT NULL,
+            provider_message_id TEXT,
+            error_message TEXT,
+            sent_by_user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            FOREIGN KEY (meeting_llm_result_id) REFERENCES meeting_llm_results(id) ON DELETE CASCADE,
+            FOREIGN KEY (sent_by_user_id) REFERENCES users(id) ON DELETE RESTRICT
+          )
+        `);
+
+        database.exec(`
+          INSERT INTO meeting_llm_results (
+            id, meeting_id, input_transcript_snapshot, llm_setting_mark, prompt_template_id,
+            generation_config_snapshot, generation_mode, status, version_no, result_type,
+            result_title, raw_prompt, raw_response, result_markdown, error_message, created_at
+          )
+          SELECT
+            legacy.id,
+            asr.meeting_id,
+            COALESCE(asr.normalized_text, ''),
+            legacy.llm_setting_mark,
+            legacy.prompt_template_id,
+            legacy.generation_config_snapshot,
+            legacy.generation_mode,
+            legacy.status,
+            legacy.version_no,
+            legacy.result_type,
+            legacy.result_title,
+            legacy.raw_prompt,
+            legacy.raw_response,
+            legacy.result_markdown,
+            legacy.error_message,
+            legacy.created_at
+          FROM meeting_llm_results_legacy legacy
+          INNER JOIN meeting_asr_results asr ON asr.id = legacy.meeting_asr_result_id
+          WHERE legacy.id IN (
+            SELECT id FROM (
+              SELECT
+                l2.id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY asr2.meeting_id, l2.version_no
+                  ORDER BY l2.created_at DESC, l2.id DESC
+                ) AS rn
+              FROM meeting_llm_results_legacy l2
+              INNER JOIN meeting_asr_results asr2 ON asr2.id = l2.meeting_asr_result_id
+            ) ranked
+            WHERE ranked.rn = 1
+          )
+        `);
+
+        database.exec(`
+          INSERT INTO meeting_send_records (
+            id, meeting_llm_result_id, mail_template_type, subject,
+            to_recipients_json, cc_recipients_json, body_markdown, body_html,
+            status, mail_setting_mark, mail_config_snapshot, provider_type,
+            provider_message_id, error_message, sent_by_user_id, created_at, sent_at
+          )
+          SELECT
+            legacy.id, legacy.meeting_llm_result_id, legacy.mail_template_type, legacy.subject,
+            legacy.to_recipients_json, legacy.cc_recipients_json, legacy.body_markdown, legacy.body_html,
+            legacy.status, legacy.mail_setting_mark, legacy.mail_config_snapshot, legacy.provider_type,
+            legacy.provider_message_id, legacy.error_message, legacy.sent_by_user_id,
+            legacy.created_at, legacy.sent_at
+          FROM meeting_send_records_legacy legacy
+          INNER JOIN meeting_llm_results current_result
+            ON current_result.id = legacy.meeting_llm_result_id
+        `);
+
+        database.exec("DROP TABLE meeting_send_records_legacy");
+        database.exec("DROP TABLE meeting_llm_results_legacy");
+    },
+  },
+];
+
+function runMigrations(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER NOT NULL
+    );
+  `);
+
+  const row = database.prepare("SELECT version FROM schema_version LIMIT 1").get();
+  let currentVersion = row ? Number(row.version) : 0;
+
+  const latestVersion = MIGRATIONS.length;
+  if (currentVersion === 0) {
+    // 无版本记录：若表结构已是最新（全新库或已迁移库），直接标记最新版本；
+    // 否则视为旧库，从迁移 1 开始。
+    const llmColumns = database.prepare("PRAGMA table_info(meeting_llm_results)").all();
+    if (llmColumns.some((column) => column.name === "meeting_id")) {
+      currentVersion = latestVersion;
+      database
+        .prepare("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
+        .run(latestVersion);
+    }
+  }
+
+  if (currentVersion >= latestVersion) return;
+
+  for (const migration of MIGRATIONS) {
+    if (migration.version <= currentVersion) continue;
+
+    database.exec("PRAGMA foreign_keys = OFF");
+    database.exec("BEGIN");
+    try {
+      migration.up(database);
+      database
+        .prepare("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
+        .run(migration.version);
+      database.exec("COMMIT");
+      console.log(`[DB] Migration applied: v${migration.version} (${migration.name})`);
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw new Error(
+        `数据库迁移失败 v${migration.version} (${migration.name}): ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      database.exec("PRAGMA foreign_keys = ON");
+    }
+  }
 }
