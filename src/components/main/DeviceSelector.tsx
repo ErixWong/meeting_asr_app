@@ -55,55 +55,65 @@ export default function DeviceSelector({
 }: Props) {
   const mics = devices.filter((d) => d.deviceId !== "speaker");
   const sameAsSource = asrLang !== "auto" && asrLang === targetLang;
+
+  const fieldCls =
+    "w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:opacity-60";
+
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-      <span className="text-sm text-slate-500">采集</span>
-      <label className="flex items-center gap-1 text-sm text-slate-600">
-        🎤 麦克风
-        <select
-          value={micDeviceId ?? ""}
-          onChange={(e) => onMicChange(e.target.value || null)}
-          onMouseDown={() => onRequestMicRefresh()}
-          onFocus={() => onRequestMicRefresh()}
-          disabled={disabled}
-          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
-        >
-          <option value="">{NO_RECORDING}</option>
-          {mics.map((device) => (
-            <option key={device.deviceId} value={device.deviceId}>
-              {device.label}
-            </option>
-          ))}
-        </select>
-        <button
-          type="button"
-          onClick={onRequestMicRefresh}
-          disabled={disabled || micRefreshing}
-          title="刷新/授权后重新读取麦克风设备"
-          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-600 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-60"
-        >
-          {micRefreshing ? "…" : "🔄"}
-        </button>
-      </label>
-      <label className="flex items-center gap-1 text-sm text-slate-600">
-        🔊 系统声音
+    <div className="space-y-4">
+      {/* 麦克风 */}
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-500">麦克风 · 录制你的发言</label>
+        <div className="flex gap-2">
+          <select
+            value={micDeviceId ?? ""}
+            onChange={(e) => onMicChange(e.target.value || null)}
+            onMouseDown={() => onRequestMicRefresh()}
+            onFocus={() => onRequestMicRefresh()}
+            disabled={disabled}
+            className={fieldCls}
+          >
+            <option value="">{NO_RECORDING}</option>
+            {mics.map((device) => (
+              <option key={device.deviceId} value={device.deviceId}>
+                {device.label}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={onRequestMicRefresh}
+            disabled={disabled || micRefreshing}
+            title="刷新/授权后重新读取麦克风设备"
+            className="shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-500 shadow-sm transition-colors hover:bg-slate-50 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {micRefreshing ? "…" : "🔄"}
+          </button>
+        </div>
+      </div>
+
+      {/* 系统声音 */}
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-500">系统声音 · 录制扬声器播放内容</label>
         <select
           value={speakerEnabled ? "speaker" : ""}
           onChange={(e) => onSpeakerChange(e.target.value === "speaker")}
           disabled={disabled}
-          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+          className={fieldCls}
         >
           <option value="">{NO_RECORDING}</option>
           <option value="speaker">系统声音</option>
         </select>
-      </label>
-      <label className="flex items-center gap-1 text-sm text-slate-600">
-        🌐 语种
+      </div>
+
+      {/* 识别语种 */}
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-500">识别语种</label>
         <select
           value={asrLang}
           onChange={(e) => onLangChange(e.target.value)}
           disabled={disabled}
-          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+          className={fieldCls}
         >
           {ASR_LANGUAGES.map((lang) => (
             <option key={lang.value} value={lang.value}>
@@ -111,29 +121,38 @@ export default function DeviceSelector({
             </option>
           ))}
         </select>
-      </label>
-      <label className="flex items-center gap-1 text-sm text-slate-600" title={sameAsSource ? "目标语言与识别语种相同，勾选后将自动切换" : undefined}>
-        <input
-          type="checkbox"
-          checked={translationEnabled}
-          onChange={(e) => onTranslationChange(e.target.checked)}
-          disabled={disabled}
-          className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand disabled:opacity-60"
-        />
-        自动翻译
-        <select
-          value={targetLang}
-          onChange={(e) => onTargetLangChange(e.target.value)}
-          disabled={disabled}
-          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
+      </div>
+
+      {/* 自动翻译 */}
+      <div>
+        <label
+          className="flex cursor-pointer items-center justify-between gap-2 text-xs font-medium text-slate-500"
+          title={sameAsSource ? "目标语言与识别语种相同，勾选后将自动切换" : undefined}
         >
-          {TRANSLATE_LANGUAGES.map((lang) => (
-            <option key={lang.value} value={lang.value}>
-              {lang.label}
-            </option>
-          ))}
-        </select>
-      </label>
+          <span className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={translationEnabled}
+              onChange={(e) => onTranslationChange(e.target.checked)}
+              disabled={disabled}
+              className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand disabled:cursor-not-allowed disabled:opacity-60"
+            />
+            自动翻译
+          </span>
+          <select
+            value={targetLang}
+            onChange={(e) => onTargetLangChange(e.target.value)}
+            disabled={disabled}
+            className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-600 shadow-sm outline-none transition-colors focus:border-brand focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {TRANSLATE_LANGUAGES.map((lang) => (
+              <option key={lang.value} value={lang.value}>
+                {lang.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
     </div>
   );
 }

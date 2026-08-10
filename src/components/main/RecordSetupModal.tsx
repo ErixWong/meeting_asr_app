@@ -39,20 +39,28 @@ export default function RecordSetupModal({
   onConfirm,
 }: Props) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
-      <div className="w-full max-w-lg overflow-y-auto rounded-xl border border-slate-200 bg-white p-5 shadow-lg">
-        <div className="flex items-center justify-between gap-3">
-          <h3 className="text-base font-semibold text-slate-800">开始录音</h3>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/30 p-4 backdrop-blur-sm">
+      <div className="w-full max-w-md overflow-y-auto rounded-2xl border border-slate-100 bg-white p-6 shadow-xl shadow-slate-900/10">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand/10 text-lg">
+              🎙️
+            </div>
+            <div>
+              <h3 className="text-base font-semibold text-slate-800">开始录音</h3>
+              <p className="text-xs text-slate-400">设置采集方式后开始录制会议</p>
+            </div>
+          </div>
           <button
             onClick={onClose}
-            className="rounded-md px-2 py-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
             aria-label="关闭开始录音弹窗"
           >
             ×
           </button>
         </div>
 
-        <div className="mt-4 space-y-4">
+        <div className="mt-5 space-y-5">
           <DeviceSelector
             devices={devices}
             micDeviceId={micDeviceId}
@@ -69,19 +77,24 @@ export default function RecordSetupModal({
             onTargetLangChange={onTargetLangChange}
           />
 
-          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-            <div className="font-medium">采集说明：</div>
-            <ul className="ml-4 list-disc">
-              <li>🎤 麦克风：录制本地声音（你自己的发言）</li>
+          <div className="rounded-xl bg-slate-50 px-3.5 py-3 text-xs leading-relaxed text-slate-500">
+            <div className="mb-1 flex items-center gap-1.5 font-medium text-slate-600">
+              <span className="text-slate-400">ℹ</span> 采集说明
+            </div>
+            <ul className="ml-1 space-y-1">
               <li>
-                🔊 系统声音：录制扬声器播放的声音。网络会议中对方说话的声音在扬声器里，
-                要采集对方的声音，请选择录制系统声音
+                <span className="text-slate-600">🎤 麦克风</span>
+                ：录制本地声音（你自己的发言）
+              </li>
+              <li>
+                <span className="text-slate-600">🔊 系统声音</span>
+                ：录制扬声器播放的内容。要采集对方的声音，请选择系统声音
               </li>
             </ul>
             {speakerEnabled && (
               <>
-                <div className="mt-1 font-medium">系统声音开启：</div>
-                <ol className="ml-4 list-decimal">
+                <div className="mt-2 mb-1 font-medium text-slate-600">系统声音开启：</div>
+                <ol className="ml-1 list-decimal space-y-0.5 pl-4">
                   <li>开始录音时会弹出共享窗口</li>
                   <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
                   <li>并确认共享声音</li>
@@ -91,16 +104,16 @@ export default function RecordSetupModal({
           </div>
         </div>
 
-        <div className="mt-5 flex justify-end gap-2">
+        <div className="mt-6 flex justify-end gap-2">
           <button
             onClick={onClose}
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-50"
+            className="rounded-lg border border-slate-200 px-4 py-2 text-sm text-slate-600 transition-colors hover:bg-slate-50"
           >
             取消
           </button>
           <button
             onClick={onConfirm}
-            className="rounded-md bg-brand px-4 py-1.5 text-sm text-white hover:bg-brand-dark"
+            className="rounded-lg bg-brand px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-brand-dark"
           >
             开始录音
           </button>
