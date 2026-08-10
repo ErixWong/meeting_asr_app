@@ -16,6 +16,14 @@
 - `journal_mode=WAL` 必须保持（bind mount 环境验证失败时改 named volume，不得静默降级）；`synchronous` 保持 FULL。
 - 高频语句做模块级预编译缓存（`getPreparedStatements` 模式）。
 
+## 2.1 Schema 迁移机制（任务 `feat-260810-03-db-migration` 沉淀）
+
+- **约束**：表结构演进必须走 `server/database-schema.mjs` 的版本化迁移（`schema_version` 表 + `MIGRATIONS` 有序列表 + `runMigrations`），**禁止**只改 `CREATE TABLE IF NOT EXISTS` 而不补迁移——`IF NOT EXISTS` 不修改已存在表的列，旧库会因索引/查询引用新列而启动崩溃（历史教训：`meeting_llm_results` 缺 `meeting_id` 列导致 `idx_meeting_llm_results_meeting_version_created` 建索引抛 `no such column`，服务直接崩）。
+- 初始化顺序：建表（IF NOT EXISTS）→ `runMigrations` → 依赖迁移产物的索引（如 `idx_meeting_llm_results_meeting_version_created`）必须在迁移后创建。
+- 迁移执行：`PRAGMA foreign_keys = OFF` → `BEGIN` → `up(db)` → 写版本 → `COMMIT`，异常 `ROLLBACK` 并抛错终止启动；`PRAGMA foreign_keys` 切换必须在事务外（SQLite 事务内不生效）。
+- 新增迁移：追加 `MIGRATIONS` 条目并递增 `version`；新库（含最新结构列）启动时直接标记最新版本不执行迁移。
+- 数据迁移默认去重策略：目标表 UNIQUE 约束与源表粒度不同时（如 `(meeting_asr_result_id, version_no)` → `(meeting_id, version_no)`），同键重复行保留 `created_at` 最新，丢弃其余（历史重复生成数据不可恢复，迁移前应备份）。
+
 ## 3. 读路径分层：light / full
 
 - `getMeetingById`（full，含 transcript）仅用于详情展示与写路径返回值；`getMeetingLightById`（无 transcript）用于轮询、列表、状态刷新（`?view=light`）。
