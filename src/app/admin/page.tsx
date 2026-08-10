@@ -217,6 +217,7 @@ export default function AdminPage() {
   const [llmConcurrency, setLlmConcurrency] = useState("2");
   const [llmQueueCapacity, setLlmQueueCapacity] = useState("10");
   const [llmTranslateTriggerSentences, setLlmTranslateTriggerSentences] = useState("3");
+  const [llmThinkingModel, setLlmThinkingModel] = useState("1");
   const [llmQueueStatus, setLlmQueueStatus] = useState<{ inFlight: number; queued: number; dropped: number } | null>(null);
   const [llmStatus, setLlmStatus] = useState<"ok" | "fail" | "idle">("idle");
 
@@ -346,6 +347,13 @@ export default function AdminPage() {
         itemValue: llmTranslateTriggerSentences,
       },
       {
+        itemSection: "llm",
+        itemMark: "thinking_model",
+        itemTitle: "模型是否带思考模式",
+        itemDescription: "Qwen3 等推理模型会输出思考内容，开启后自动附加关闭思考参数",
+        itemValue: llmThinkingModel,
+      },
+      {
         itemSection: "mail",
         itemMark: "smtp_host",
         itemTitle: "SMTP Host",
@@ -424,6 +432,7 @@ export default function AdminPage() {
       llmConcurrency,
       llmQueueCapacity,
       llmTranslateTriggerSentences,
+      llmThinkingModel,
       mailFromEmail,
       mailFromName,
       mailHost,
@@ -494,6 +503,7 @@ export default function AdminPage() {
         setLlmConcurrency(get("llm", "max_concurrency", "2"));
         setLlmQueueCapacity(get("llm", "queue_capacity", "10"));
         setLlmTranslateTriggerSentences(get("llm", "translate_trigger_sentences", "3"));
+        setLlmThinkingModel(get("llm", "thinking_model", "1"));
 
         setMailHost(get("mail", "smtp_host", "smtp.example.com"));
         setMailPort(get("mail", "smtp_port", "465"));
@@ -1175,6 +1185,15 @@ export default function AdminPage() {
                   <input type="number" min="1" max="20" step="1" value={llmTranslateTriggerSentences} onChange={(e) => setLlmTranslateTriggerSentences(e.target.value)} className={inputCls} />
                 </div>
               </div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={llmThinkingModel === "1"}
+                  onChange={(e) => setLlmThinkingModel(e.target.checked ? "1" : "0")}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                模型带思考模式（Qwen3 / 推理模型默认开启，自动附加关闭思考参数防止思考混入输出）
+              </label>
               {llmQueueStatus && (
                 <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
                   队列状态：进行中 {llmQueueStatus.inFlight} · 排队 {llmQueueStatus.queued} · 累计拒绝 {llmQueueStatus.dropped}

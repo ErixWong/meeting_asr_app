@@ -1,530 +1,318 @@
-# 智能会议纪要系统 �?技术设计方�?
+# 智能会议纪要系统 — 技术设计
+
+> 本文档描述当前代码实现的实际架构与模块设计。配套文档：[UI 交互设计](./ui-interaction-design.md)、[认证产品化](./auth-productization.md)、[FunASR 模型说明](./funasr-models.md)、[设计决策](./design/)。
 
 ## 1. 项目概述
 
-构建一个基�?Web 的智能会议纪要系统，通过 FunASR 服务进行语音识别和说话人区分，结合本�?Qwen3.6-35b LLM 自动生成结构化会议纪要。当前实现已从阿里云 DashScope FunASR 迁移为优先接入本地部署的 FunASR WebSocket 服务，并保留原有云端路径作为兼容兜底�?
+构建一个基于 Web 的智能会议纪要系统：通过 ASR Gateway 统一接入 FunASR 服务进行实时语音识别，结合 OpenAI 兼容 LLM（如 `qwen3.6-35b`）自动生成结构化会议纪要，支持实时翻译、邮件发送与后台配置管理。
+
+当前实现以本地部署的 FunASR WebSocket 服务（2pass 协议）为默认上游，并保留阿里云 DashScope FunASR 作为兼容兜底；两者通过后台 ASR 配置切换。
 
 ### 1.1 核心能力
 
-- 实时语音转文字（流式 ASR�?
-- 说话人识别与分段（Speaker Diarization�?
-- USB 声卡设备选择（支�?Jabra 等外置设备）
-- LLM 驱动的会议纪要自动生�?- 历史会议记录管理
-- 管理员配置界面（声纹、LLM、提示词�?
-任务/行动项跟踪不属于当前产品范围；如后续需要，应作为独立产品开发，并消费本系统输出的转写文本或会议纪要�?
+- 实时语音转文字（流式 ASR，partial / final 双通道）
+- 双路采集：多麦克风 + 系统声音（`source` 区分 `mic` / `speaker`）
+- ASR 语种选择（`svs_lang`：auto / zh / en / ja / ko / yue）
+- 说话人聚类（浏览器端声纹特征提取 + 阈值聚类）
+- LLM 驱动的会议纪要自动生成（多模板、多版本）
+- 实时 / 历史 / 选中文本翻译（版本化持久化）
+- 语音朗读（Web Speech API）
+- 邮件发送（SMTP）与发送审计
+- 后台管理界面（RBAC、审计日志、连接测试）
+- 统一 HTTP + WebSocket 服务（`server/app-server.mjs`）
+
+任务/行动项跟踪不属于当前产品范围；如后续需要，应作为独立产品开发，消费本系统输出的转写文本或会议纪要。
+
 ### 1.2 架构总览
 
 ```
-┌──────────────────────────────────────────────────────────────�?
-�?                    Browser (Next.js)                         �?
-�?                                                              �?
-�? ┌────────────�? ┌──────────────�? ┌──────────────────────�? �?
-�? �?麦克风采�?  �? �?设备选择      �? �?历史记录 / 管理界面   �? �?
-�? �?Web Audio   �? �?enumerate-   �? �?React + Tailwind     �? �?
-�? �?API         �? �?Devices()    �? �?                     �? �?
-�? └──────┬─────�? └──────────────�? └──────────────────────�? �?
-�?        �?PCM 16kHz Int16                                     �?
-�?        �?                                                    �?
-�? ┌───────────────────�?      ┌────────────────────────────�? �?
-�? �?src/lib/funasr.ts │──────▶│ ASR Gateway                �? �?�? �?(Browser WS)      �?      �?server/asr-gateway.mjs     �? �?�? └─────────┬─────────�?      �? �?Local FunASR / DashScope�? �?
-�?           �?                └────────────────────────────�? �?
-�?           �?                                                �?
-�?           �?                ┌────────────────────────────�? �?
-�?           └────────────────▶│ Next.js API Route          �? �?
-�?                             �? �?Qwen /v1/chat/completions�?�?
-�?                             └────────────────────────────�? �?
-└────────────┼─────────────────────────────────────────────────�?
-             �?WebSocket
-             �?
-    ┌──────────────────�?
-  �?Local FunASR     �?
-  �?(2pass WS Server)�?
-    �?Paraformer + CAM++�?
-    └──────────────────�?
+浏览器 (Next.js)
+  麦克风采集 / 系统声音 → Web Audio API (ScriptProcessorNode, PCM 16kHz)
+      │
+      │  WebSocket  (src/lib/funasr.ts，每路一个 FunASRClient)
+      ▼
+ASR Gateway  (server/asr-gateway.mjs, 挂载 /asr)
+      │  按 app_settings.asr.provider 选择适配器
+      ├── 本地 FunASR（2pass WebSocket，如 Paraformer / SenseVoice）
+      └── DashScope FunASR（阿里云，兼容兜底）
+      │  原始事件写入 asr_capture_sessions / asr_capture_events
+      ▼
+Next.js API Routes（/api/meetings /api/admin /api/auth /api/translate ...）
+      │
+      ▼
+admin-store.ts（SQLite + 认证 + RBAC）
+      ├── SQLite 持久化（data/*.db）
+      └── LLM（OpenAI 兼容 /chat/completions，经全局队列 src/lib/llm-queue.ts）
 ```
-
----
 
 ## 2. 技术栈
 
-| 层级 | 选型 | 版本 | 说明 |
-|------|------|------|------|
-| 框架 | Next.js (App Router) | 14+ | 全栈 React 框架，API Routes 做后端代�?|
+| 类别 | 技术 | 版本 | 说明 |
+|:---|:---|:---|:---|
+| 框架 | Next.js (App Router) | 15 | 全栈 React 框架，API Routes 做后端代理 |
 | 语言 | TypeScript | 5.x | 类型安全 |
-| UI 样式 | Tailwind CSS | 3.x | 原子�?CSS |
-| 组件�?| shadcn/ui | latest | 基于 Radix UI，无 style-inject，兼�?Tailwind |
-| ASR 客户�?| 自研 `src/lib/funasr.ts` | - | 浏览器端固定连接 ASR Gateway `ws://localhost:8123` |
-| 音频采集 | Web Audio API | - | 浏览器原生，AudioWorklet 提取 PCM |
-| LLM | Qwen3.6-35b | - | OpenAI 兼容 API 格式 |
-| 数据�?| SQLite (better-sqlite3) | - | 本地持久�?|
-| 状态管�?| Zustand | 4.x | 轻量�?|
-
----
+| UI 样式 | Tailwind CSS | 3.x | 原子化 CSS |
+| 数据库 | SQLite（`node:sqlite` 内置模块） | built-in | 本地零依赖 |
+| 状态管理 | Zustand | 4.x | 轻量级 |
+| ASR 客户端 | 自研 `src/lib/funasr.ts` | - | 浏览器端固定连接 ASR Gateway |
+| 音频采集 | Web Audio API（ScriptProcessorNode） | - | 浏览器原生，提取 PCM 16kHz |
+| ASR 网关 | WebSocket（`ws`） | 8.x | 浏览器 ↔ 上游 ASR 中转 |
+| LLM | OpenAI 兼容 API（如 `qwen3.6-35b`） | - | 纪要/翻译/测试共用 |
+| 邮件 | Nodemailer | 9.x | SMTP 发送 |
+| 语音朗读 | Web Speech API | 内置 | 朗读转写/纪要/选中文本 |
 
 ## 3. 详细设计
 
 ### 3.1 音频采集模块
 
-#### 3.1.1 设备枚举
+#### 3.1.1 设备枚举与选择
 
-通过浏览�?`navigator.mediaDevices.enumerateDevices()` 获取所有音频输入设备�?
+通过 `navigator.mediaDevices.enumerateDevices()` 获取所有音频输入设备；用户从 `DeviceSelector` 选择目标设备，将 `deviceId` 传入 `getUserMedia()`。
 
-```typescript
-// 获取所有音频输入设�?
-const devices = await navigator.mediaDevices.enumerateDevices();
-const audioInputs = devices.filter(d => d.kind === 'audioinput');
+- 设备 label 在授权前为空；需先 `getUserMedia()` 获取权限后再次 `enumerateDevices()` 才能拿到完整名称
+- 采集配置：16kHz、单声道、关闭 echoCancellation / noiseSuppression / autoGainControl
+- 多路：每个选中麦克风一路采集（`deviceId` 区分），另有 `speaker` 路采集系统声音（`getDisplayMedia`），录音期间 `DeviceSelector` 禁用勾选，勾选集合下次录音生效
 
-// 包含�?
-// - 内置麦克�?
-// - USB Jabra 设备
-// - 其他外接声卡
-```
+#### 3.1.2 PCM 提取
 
-**注意�?* 设备 label 在未授权前为空字符串。需要先调用 `getUserMedia()` 获取权限后，再次 `enumerateDevices()` 才能获取完整设备名称�?
-
-#### 3.1.2 设备选择
-
-用户从下拉框选择目标设备，将 `deviceId` 传入 `getUserMedia()`�?
+使用 `AudioContext.createScriptProcessor(4096, 1, 1)` 从 `MediaStream` 提取 16kHz 单声道 PCM Int16 数据：
 
 ```typescript
-const stream = await navigator.mediaDevices.getUserMedia({
-  audio: {
-    deviceId: { exact: selectedDeviceId },
-    sampleRate: 16000,
-    channelCount: 1,
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: false
-  }
-});
-```
-
-#### 3.1.3 PCM 提取
-
-使用 `AudioWorklet` �?MediaStream 中提�?16kHz 单声�?PCM Int16 数据�?
-
-```typescript
-// audio-processor.ts (AudioWorklet processor)
-class PCMProcessor extends AudioWorkletProcessor {
-  process(inputs) {
-    const input = inputs[0][0]; // Float32Array, [-1, 1]
-    const pcm16 = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    this.port.postMessage(pcm16.buffer);
-    return true;
-  }
-}
-registerProcessor('pcm-processor', PCMProcessor);
-```
-
-### 3.2 FunASR 对接模块
-
-#### 3.2.1 当前连接方式
-
-浏览器端不再直接连接云端 FunASR，而是统一连接本地 **ASR Gateway** `ws://localhost:8123`。Gateway 在每次新�?WebSocket 连接时读�?SQLite 中的当前 ASR 配置和启用热词，决定上游目标�?
-- `app_settings.asr.provider = local_funasr` 时，连接本地部署�?FunASR 服务
-- `app_settings.asr.provider = dashscope` 时，连接阿里�?DashScope FunASR
-- `asr_hotwords.status = active` 的热词会在连接首帧注入本�?FunASR
-
-当前代码落点�?
-- `src/lib/funasr.ts`：浏览器录音、PCM 编码、发�?`run-task` / `finish-task`
-- `server/asr-gateway.mjs`：协议转换、上游连接、事件兼容、热词注入、原�?ASR 事件采集
-- `server/runtime-store.mjs`：供 Gateway 读取 SQLite 运行配置和写�?`asr_capture_sessions`
-- `src/app/api/config/route.ts`：向前端只暴�?ASR 是否已配置，不下发密钥、Workspace ID 或真实上游鉴权信�?
-Gateway 会将 `http://host:10095` 自动规范化为 `ws://host:10095/ws`。ASR 密钥、Workspace ID 和真实上游地址均停留在后端侧，普通录音页面只连接本地 Gateway�?
-#### 3.2.2 流式音频发�?
-
-将浏览器采集�?PCM Int16 数据通过 WebSocket 实时发送到 ASR Gateway，再�?Gateway 转发到上�?FunASR�?
-```typescript
-scriptProcessor.onaudioprocess = (event) => {
-  const inputData = event.inputBuffer.getChannelData(0);
-  const pcmData = convertFloat32ToInt16(inputData);
-  ws.send(pcmData.buffer);
+this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+this.scriptProcessor.onaudioprocess = (event) => {
+  const inputData = event.inputBuffer.getChannelData(0); // Float32Array [-1,1]
+  const pcm16 = convertFloat32ToInt16(inputData);        // Int16Array
+  ws.send(pcm16.buffer);
 };
 ```
 
-#### 3.2.3 本地 FunASR 协议兼容�?
+音频文件上传路径：`decodeAudioData` → 重采样至 16kHz → 转 Int16 → 同样经 WebSocket 送入 Gateway。
 
-本地部署�?FunASR 2pass WebSocket 服务与阿里云 DashScope 的消息协议不同，不能只替�?URL。实际联调中确认存在以下差异�?
+#### 3.1.3 转写段来源契约
 
-- 浏览器端原先发送的�?DashScope 风格 `run-task` / `finish-task`
-- 本地 FunASR 期望的是原生 2pass 初始化报文，例如 `mode: "2pass"`、`chunk_size`、`chunk_interval`、`is_speaking: true`
-- 本地 FunASR 不会返回 DashScope 风格�?`task-started`
-- 本地 FunASR 返回的识别结果字段更接近 `text` / `text_2pass` / `is_final`
+`TranscriptSegment`（前后端 + 存储 JSON 三方共享）：
 
-为避免大面积改动前端录音逻辑，当前在 `server/asr-gateway.mjs` 中增加了兼容层：
-
-1. 浏览器仍然只连接 `ws://localhost:8123`
-2. Gateway 收到 `run-task` 后，转换为本�?FunASR 2pass 初始化报�?3. Gateway 向浏览器合成 `task-started`，并携带 `capture_session_id`
-4. Gateway �?`finish-task` 转换�?`is_speaking: false` �?`is_eof: true`
-5. Gateway 将本�?FunASR 的返回结果重新包装为前端原本消费�?`result-generated`
-6. Gateway 将上游原�?ASR 事件写入 `asr_capture_sessions`，供会议保存时落�?`meeting_asr_results.raw_payload`
-
-原生 FunASR 2pass 初始化示意：
-
-```json
-{
-  "mode": "2pass",
-  "chunk_size": [5, 10, 5],
-  "chunk_interval": 10,
-  "encoder_chunk_look_back": 4,
-  "decoder_chunk_look_back": 0,
-  "audio_fs": 16000,
-  "wav_format": "pcm",
-  "wav_name": "meeting-task-id",
-  "is_speaking": true,
-  "itn": true,
-  "hotwords": "项目�?术语 缩写",
-  "svs_lang": "auto",
-  "svs_itn": true
+```ts
+interface TranscriptSegment {
+  id: string;
+  speaker: string;
+  speakerId?: number | null;
+  source?: "mic" | "speaker";   // 采集通道类型（非说话人身份）
+  deviceId?: string;             // mic 路的具体设备 id；speaker 路为 undefined
+  text: string;
+  time: string;
+  timeSeconds: number;
+  isFinal: boolean;
 }
 ```
 
-#### 3.2.4 说话人识�?
+说话人身份由 `speakerId` 表达；`source` 只区分 mic/speaker 两类。多路各自一个 `FunASRClient` + 网关会话（`captureSessionId` 区分）。详见 [设计决策 asr-dual-channel.md](./design/asr-dual-channel.md)。
 
-FunASR 服务端需启用 CAM++ 说话人模型。识别结果中包含说话�?ID�?
+### 3.2 ASR Gateway
 
-- WebSocket 协议：通过 `stamp_sents` 字段中的 `spk` 获取
-- OpenAI 兼容 API：通过 `segments[].speaker` 获取
+`server/asr-gateway.mjs` 是浏览器与 ASR 服务之间的统一代理层，浏览器只连接本服务 `/asr` 路径：
 
-需要在管理界面配置声纹 ID �?姓名的映射关系�?
+- 新连接时从 SQLite 读取 ASR 配置（provider、endpoint、api key、workspace id）与启用热词
+- 自动将 `http://...` 规范化为 `ws://.../ws`；本地模式剥离 DashScope `Authorization` 头
+- 将 DashScope 风格 `run-task` / `finish-task` 转换为本地 FunASR 2pass 初始化报文（`mode:"2pass"`、`chunk_size`、`chunk_interval`、`is_speaking` 等）与结束报文（`is_speaking:false` / `is_eof:true`）
+- 为前端合成 `task-started` / `task-finished`，并把上游结果重包装为前端消费的 `result-generated`
+- 透传 `svs_lang` 会话参数；在网关层剥离 SenseVoice 标签（`<|lang|><|emotion|><|event|>`），原始消息保留在 capture events
+- 结果文本取值优先级：`text` → `text_2pass` → `asr_result`；`isFinal = is_final || is_eof || mode 含 offline`
+- 将所有原始 ASR 事件写入 `asr_capture_sessions` / `asr_capture_events`
+- Origin 白名单校验；生产环境 WebSocket 握手要求有效登录 session（过期、强制改密、无业务角色均拒绝）
 
-#### 3.2.5 从阿里云 FunASR 迁移到本�?FunASR 的原因与分析
+### 3.3 前端转写状态机
 
-本次迁移不是简单的配置替换，而是一次接入形态变化。原始实现依赖阿里云 DashScope FunASR，核心特征是�?
+`src/lib/transcript-state.ts` 维护多通道转写状态：
 
-- 上游地址�?Workspace ID 拼接得到
-- 连接时携�?`Authorization: Bearer <apiKey>`
-- 客户端等�?`task-started` 后才开始发送音�?
-- 结果格式�?`header.event + payload.output.sentence`
+- partial 按 `(source, deviceId)` 隔离：从后往前定位“同来源最后一段”，未 final 则更新，否则追加；避免多路互相覆盖
+- final 才落最终段；partial 走节流合并（`PARTIAL_RENDER_INTERVAL_MS` + pending 缓冲）避免高频闪烁
+- 计时器以 `timerRef.current === null` 守卫防重复；声纹特征按路隔离（`Map<deviceId, VoiceprintFeature[]>`）
 
-迁移到本地部�?FunASR 的主要原因：
+### 3.4 说话人聚类
 
-1. 语音数据不再经过公有云，便于满足内网和数据合规要求�?
-2. 上游服务由本地容器控制，便于排障、升级模型和统一运维�?
-3. 减少对阿里云 workspace、认证方式和公网可达性的依赖�?
-4. 便于后续结合本地说话人模型、热词和专有词表做针对性优化�?
+浏览器端 `src/lib/voiceprint.ts` 实现说话人聚类（服务端 C++ 2pass 服务不支持服务端声纹）：
 
-迁移过程中实际遇到的问题�?
+- `transcript.final` 时用 `extractAudioSegment` 从本地音频缓冲切出该句音频
+- 提取 12 维声纹特征（RMS、基频 F0 自相关法、频谱质心/带宽/滚降/平坦度/通量，Web Audio API → 自实现 Cooley-Tukey FFT）
+- 余弦相似度 + 阈值聚类（默认 0.6），按路分配说话人 ID
+- 作为 FunASR 说话人标注的补充或本地降级方案
 
-1. 地址层问题：浏览器需要的不是 `http://host:10095`，而是 WebSocket 端点 `ws://host:10095/ws`�?
-2. 协议层问题：本地 FunASR 虽然接受 WebSocket 握手，但不会�?DashScope 协议返回 `task-started`�?
-3. 首包差异：透传 `run-task` 时，本地 FunASR 不返回识别消息；改为原生 2pass 初始化后可正常返回结果�?
-4. 生命周期差异：前端点击停止时发送的�?`finish-task`，本�?FunASR 实际需�?`is_speaking: false`�?
-5. 前端状态问题：页面首次渲染时配置尚未回填，可能误提示“未配置 FunASR”�?
+### 3.5 LLM 对接模块
 
-针对这些问题，项目中的落地修改如下：
+#### 3.5.1 API 格式
 
-- `server/asr-gateway.mjs`
-  - 新连接时读取 SQLite 中的 ASR provider、endpoint、api key、workspace id
-  - 自动�?`http://...` 规范化为 `ws://.../ws`
-  - 本地模式下移�?DashScope `Authorization` �?
-  - �?DashScope 风格 `run-task` 转为 FunASR 2pass 初始�?JSON
-  - �?`finish-task` 转为 `is_speaking: false` / `is_eof: true`
-  - 为前端合�?`task-started` �?`task-finished`
-  - 将本�?FunASR 返回结果重包�?`result-generated`
+LLM 使用 OpenAI 兼容格式，经 `src/lib/admin-store.ts` 服务端调用（密钥不落到前端）：
 
-- `src/app/api/config/route.ts`
-  - 只返�?`asr.isConfigured` 等非敏感摘要，供前端判断是否可以开始录�?
-- `src/app/page.tsx`
-  - 录音开始前按需重新拉取 `/api/config`
-  - 使用 Gateway 返回�?`capture_session_id` 保存会议，便于关联后端采集的原始 ASR 事件
+- 配置项：`llm:base_url`、`llm:api_key`、`llm:model`、`llm:context_size`、`llm:max_tokens`、`llm:timeout_ms`
+- 纪要：系统模板 + `{transcript}` 占位符 → 结构化 Markdown 纪要，多模板、多版本
+- 翻译：`translateSentences`（批量句子）与 `translateSelection`（任意文本）
+- 推理模型思考模式：`llm:thinking_model` 默认开启，自动附加关闭思考参数；结果用 `stripLeadingThinking` 清理思考内容
 
-- `package.json`
-  - 将开发启动脚本改�?`concurrently`
-  - 新增 `asr-gateway` 脚本
+#### 3.5.2 全局 LLM 队列
 
-- `scripts/probe-service.mjs`
-  - 新增服务探测脚本，用于判断目标端口是 TCP 可达、HTTP 服务还是 WebSocket 服务
+`src/lib/llm-queue.ts` 进程内信号量 + FIFO 队列，**所有 LLM 调用统一过闸**（翻译/纪要/手动/测试）：
 
-当前方案的收益：
+- 并发上限 = `llm:max_concurrency`（默认 2）；排队容量 = `llm:queue_capacity`（默认 10），超出直接拒绝
+- 排队等待上限：translate/test 30s、summary 300s，超时返回“LLM 繁忙”
+- 单例挂 `globalThis`（防 dev HMR 重置）；槽位持有到任务结束（`finally` 释放）
+- **禁止嵌套入队**：历史翻译管线外层占槽后，内层批直连 `translateSentences` 串行执行
+- 队列状态 `GET /api/llm-queue-status`（BUSINESS_ROLES）：`{inFlight, queued, dropped}`
 
-- 前端录音逻辑保持基本不变，改动集中在 ASR Gateway
-- 保留原阿里云接入路径，迁移风险可�?- 本地与云端两种模式可通过管理后台配置切换
+### 3.6 翻译体系
 
-当前仍需持续关注的点�?
-- 本地 FunASR 返回字段可能因镜像版本不同而变化，结果映射需要继续以实际日志为准
-- 默认 LLM 清洗当前为同�?post-commit 调用，后续如果耗时明显，应改为后台任务或增加超时治�?
-### 3.3 LLM 对接模块
+- **实时**：final 句缓存（不送 partial），攒满 N 句（`llm:translate_trigger_sentences`，默认 3）或距上次 10s 触发一次经 `/api/translate` 批翻；in-flight 守卫 + 会话代数（`translateGenerationRef`）防竞态；失败不清缓冲，下次自动重发；停止录音强制 flush
+- 源=目标语言（非 auto）自动切换目标语言；`/api/translate` 返回 `elapsedMs` 供 UI 显示“最近 Xs”
+- **历史**：`/api/meetings/:id/llm-results` 触发 `translateMeetingFlow`，final 句分批（≤5 句/≤1000 字）串行直连 `translateSentences`，全成写 succeeded / 任批失败写 failed
+- **选中**：`/api/translate-selection` 翻译任意选中文本
+- **持久化**：零 schema 迁移，复用 `meeting_llm_results` 版本化存储；`result_type='translation'`、`version_no` 全局递增、`input_transcript_snapshot` 存原文、`generation_config_snapshot` 存 `{targetLang, source}`。系统翻译模板 `system_translate`（id=`tpl-translate`）无条件 upsert
+- **摘要派生约束**：`listMeetings` / `queryMeetingRowById` 的 `summary` 子查询取“最新成功结果”，必须排除 `result_type='translation'`，避免译文顶替纪要
 
-#### 3.3.1 API 格式
+详见 [设计决策 llm-queue-and-translation.md](./design/llm-queue-and-translation.md)。
 
-Qwen3.6-35b 使用 OpenAI 兼容格式，通过 Next.js API Route 代理调用�?
+### 3.7 语音朗读
 
-```
-POST /api/llm
-Content-Type: application/json
+`src/components/tts/TtsProvider.tsx` 封装 Web Speech API：
 
-{
-  "messages": [
-    { "role": "system", "content": "系统提示�?.." },
-    { "role": "user", "content": "以下是一段会议转写记录：\n\n..." }
-  ],
-  "temperature": 0.3,
-  "max_tokens": 4096
-}
-```
+- 朗读当前可朗读文本（转写/纪要）或任意选中文本
+- 优先选择中文语音（`/^zh(-|_)/i`），否则回退 `zh-CN`
+- 通过 `selectionchange` 监听检测是否有选中文本，支持朗读/停止切换
 
-#### 3.3.2 系统提示词模�?
+### 3.8 认证与权限
 
-```
-你是一个专业的会议纪要助手。请根据以下会议转写记录，生成结构化的会议纪要�?
+- 会话：`auth_sessions`，Cookie 会话，TTL 7 天；密码使用 `scrypt-v1` 方案
+- 首次启动自动创建引导管理员；`must_change_password` 强制改密
+- API 角色守卫 `src/lib/api-auth.ts`：后台管理相关路由要求 `system_admin`，业务路由要求 `user`/`system_admin`（BUSINESS_ROLES）
+- 密钥类设置（`asr:api_key`、`llm:api_key`、`mail:smtp_password`）不回传前端，仅存服务端
 
-要求�?
-1. 识别会议主题
-2. 提炼各发言人要�?
-3. 总结关键结论
-4. 列出待办事项（如有）
-5. 使用 Markdown 格式输出
+### 3.9 数据库设计
 
-转写记录�?
-{transcript}
-```
+SQLite（`node:sqlite`），schema 定义于 `server/database-schema.mjs`：
 
-### 3.4 数据库设�?
-
-使用 SQLite 存储，表结构如下�?
-
-#### 3.4.1 系统配置�?(config)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| key | TEXT PRIMARY KEY | 配置键名 |
-| value | TEXT | 配置值（JSON 序列化） |
-| updated_at | DATETIME | 最后更新时�?|
-
-配置项包括：
-- `funasr_endpoint` �?FunASR WebSocket 地址
-- `qwen_api_url` �?Qwen API 地址
-- `qwen_api_key` �?Qwen API 密钥
-- `system_prompt` �?系统提示�?
-- `default_device_id` �?默认音频设备
-
-#### 3.4.2 会议记录�?(meetings)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER PRIMARY KEY | 自增 ID |
-| title | TEXT | 会议标题（可自动/手动生成�?|
-| transcript | TEXT | 完整转写文本 |
-| summary | TEXT | LLM 生成的会议纪�?|
-| speaker_map | TEXT | 说话人映�?JSON |
-| duration | INTEGER | 会议时长（秒�?|
-| created_at | DATETIME | 创建时间 |
-
-#### 3.4.3 声纹�?(voiceprints)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| id | INTEGER PRIMARY KEY | 自增 ID |
-| spk_id | INTEGER | FunASR 返回的说话人 ID |
-| name | TEXT | 显示名称 |
-| description | TEXT | 备注 |
-
----
+| 表 | 用途 |
+|:---|:---|
+| `app_settings` | 键值配置（ASR/LLM/Mail/队列等） |
+| `llm_prompt_templates` | 提示词模板（含系统翻译模板） |
+| `asr_hotwords` | ASR 热词 |
+| `users` | 用户（scrypt 密码、强制改密等） |
+| `roles` | 角色 |
+| `user_roles` | 用户-角色关联 |
+| `auth_sessions` | 登录会话 |
+| `meetings` | 会议主表 |
+| `meeting_asr_results` | 会议转写结果（含原始 payload） |
+| `meeting_llm_results` | 纪要/翻译版本化结果 |
+| `meeting_send_records` | 邮件发送记录 |
+| `asr_capture_sessions` | ASR 采集会话 |
+| `asr_capture_events` | ASR 原始事件 |
+| `audit_logs` | 审计日志（服务端定时清理） |
 
 ## 4. 页面设计
 
-### 4.1 主界�?(`/`)
+### 4.1 主界面（`/`）
 
-布局�?
+- 顶部：AppHeader（登录信息、管理入口）
+- 录音区：设备选择（麦克风多选 + 系统声音开关）、ASR 语种选择、目标语言选择、开始/停止录音、录音动画
+- 转写区：实时滚动字幕（partial 实时刷新，final 落段）、按路区分
+- 翻译区：实时译文、历史翻译（目标语言 + 版本按钮行 V1/V2...，失败红 / 处理中琥珀）、选中文本翻译
+- 纪要与版本：markdown 预览、版本切换、重新生成
+- 队列徽章：显示 `队列 N · 处理中 N` 与最近翻译耗时
 
-```
-┌─────────────────────────────────────────────────────�?
-�? Header: 智能会议纪要系统                  [管理] [设置] �?
-├────────────┬────────────────────────────────────────�?
-�?           �?                                       �?
-�? 历史记录   �?        主内容区                        �?
-�? ──────── �?                                       �?
-�? �?会议1   �?  ┌──────────────────────────────�?    �?
-�? �?会议2   �?  �?                             �?    �?
-�? �?会议3   �?  �?   [空状�? 点击开始录音]       �?    �?
-�? ...       �?  �?                             �?    �?
-�?           �?  └──────────────────────────────�?    �?
-�?           �?                                       �?
-�?           ├────────────────────────────────────────�?
-�?           �? [声卡选择 ▼]    [●开始录音]  [■停止]   �?
-└────────────┴────────────────────────────────────────�?
-```
+### 4.2 管理界面（`/admin`）
 
-**空状态：** 默认显示空白 + 提示文字 + 开始按�?
-
-**录音状态：** 显示录音动画（脉冲圆点）+ 实时转写文本�?+ 停止按钮
-
-**设备选择�?* 下拉框列出所有音频输入设备，包括 USB Jabra
-
-**历史记录�?* 左侧列表，点击加载历史会议纪要到主内容区
-
-### 4.2 管理界面 (`/admin`)
-
-当前管理界面�?Tab 组织�?
 | Tab | 内容 |
-|------|------|
-| ASR 配置 | Provider、端点地址、API Key、Workspace ID、真实连接测�?|
-| LLM 配置 | OpenAI 兼容 Base URL、API Key、模型名称、真实调用测�?|
-| 邮件配置 | SMTP 主机、端口、账号、发件人、默认主题、签名、真实连接测�?|
-| 提示词模�?| 模板列表、新增、编辑、停用、默认模板设�?|
-| 热词管理 | 热词列表、新增、编辑、停用、删�?|
-| 用户与权�?| 极简用户管理、固定角色分�?|
-| 审计日志 | 最�?100 条关键操作记�?|
+|:---|:---|
+| ASR 配置 | Provider、端点、API Key、Workspace ID、连接测试 |
+| LLM 配置 | Base URL、API Key、模型、上下文/最大 Tokens/超时、全局并发/排队长度、翻译触发句数、思考模型、调用测试 |
+| 邮件配置 | SMTP 主机/端口/账号、发件人、默认主题/签名、连接测试 |
+| 提示词模板 | 模板列表、新增、编辑、停用、默认模板设置 |
+| 热词管理 | 热词列表、新增、编辑、停用、删除 |
+| 用户与角色 | 用户管理、密码重置、角色分配 |
+| 审计日志 | 最近关键操作记录 |
 
-敏感配置只允许在后台侧读取和保存。普通录音页面不会通过 `/api/config` 获取 ASR API Key、Workspace ID 或真实上游鉴权信息�?
-### 4.3 极简 RBAC 与审�?
-一期只实现最小权限边界，不引入完整登录、组织架构或策略引擎�?
-固定角色�?
-| 角色 | 说明 |
-|------|------|
-| `user` | 普通用户，用于会议创建、查看、生成和发送 |
-| `system_admin` | 管理员，可管理提示词模板、ASR 热词、系统配置、用户角色、审计日志和连接测试 |
-
-当前开发阶段身份来源为 `getCurrentActor()` 中的 `admin` 用户，默认拥�?`system_admin`。后续接�?SSO 时替换身份来源即可，角色和审计表结构保持不变�?
-后台 API 已增加轻量角色守卫：
-
-| 范围 | 允许角色 |
-|------|----------|
-| `/api/admin/settings`、测试接口、用户、角色、审计日�?| `system_admin` |
-| `/api/admin/prompt-templates`、`/api/admin/hotwords` | `system_admin` |
-
-审计日志记录关键配置、模板、热词、用户、会议、LLM 生成和邮件发送动作。当前暂不做细粒度资源级授权，会议可见范围和真实登录态在后续身份接入任务中完善�?
----
+敏感配置只允许后台读写，普通页面经 `/api/config` 仅获取非敏感摘要（如 ASR 是否已配置、翻译触发句数）。
 
 ## 5. 项目结构
 
 ```
 meeting_asr_app/
-├── docs/
-�?  └── technical-design.md       # 本文�?
+├── docs/                        # 部署、模型、设计文档
+│   └── design/                  # ADR：数据流、双路 ASR、LLM 管线、队列与翻译、权限、性能
 ├── server/
-�?  └── asr-gateway.mjs           # ASR Gateway，兼�?DashScope / Local FunASR
+│   ├── app-server.mjs           # 统一 HTTP/WS 入口（Next.js + ASR Gateway + 清理定时器）
+│   ├── asr-gateway.mjs          # ASR Gateway（DashScope / Local FunASR 适配）
+│   ├── database-schema.mjs      # SQLite 表结构
+│   ├── db-shared.mjs            # 共享 DB 工具
+│   └── runtime-store.mjs        # Gateway 运行配置读取 + 采集会话存储
 ├── scripts/
-�?  └── probe-service.mjs         # TCP/HTTP/WS 服务探测脚本
+│   ├── check-dev-ports.mjs      # 开发端口检查
+│   └── probe-service.mjs        # TCP/HTTP/WS 服务探测
 ├── src/
-�?  ├── app/
-�?  �?  ├── layout.tsx            # 根布局
-�?  �?  ├── page.tsx              # 主页�?
-�?  �?  ├── admin/
-�?  �?  �?  └── page.tsx          # 管理界面
-�?  �?  └── api/
-�?  �?      ├── config/
-�?  �?      �?  └── route.ts      # 运行配置读取
-�?  �?      └── summarize/
-�?  �?          └── route.ts      # Qwen 摘要代理
-�?  ├── components/
-�?  �?  └── main/
-�?  �?      ├── RecordingControls.tsx
-�?  �?      ├── DeviceSelector.tsx
-�?  �?      ├── TranscriptView.tsx
-�?  �?      ├── HistoryList.tsx
-�?  �?      └── HotWordManager.tsx
-�?  ├── lib/
-�?  �?  ├── admin-store.ts        # SQLite 后端存储、配置、会议、审计、极简 RBAC
-�?  �?  ├── api-auth.ts           # 后台 API 轻量角色守卫
-�?  �?  ├── funasr.ts             # 浏览器端 ASR 客户�?�?  �?  ├── voiceprint.ts         # 声纹特征提取与聚�?�?  �?  └── mockData.ts           # 管理页示例数�?�?  └── types/
-�?      └── index.ts              # 类型定义
-├── package.json
-├── tailwind.config.ts
-├── tsconfig.json
-└── next.config.mjs
+│   ├── app/                     # 页面 + API Routes（/api/{config,meetings,translate,translate-selection,llm-queue-status,admin,auth}）
+│   ├── components/
+│   │   ├── main/                # RecordingControls、DeviceSelector、TranscriptView、TranslationView、HistoryList、HotWordManager、MarkdownPreview、AsrResultDetailView
+│   │   ├── tts/                 # TtsProvider、TtsReadableSync
+│   │   └── layout/              # AppHeader
+│   ├── lib/                     # admin-store、api-auth、funasr、voiceprint、transcript-state、llm-queue、use-auth-session、meeting-status、store-utils、mockData、auth-constants
+│   └── types/index.ts           # 类型定义
+├── docker-compose.yml
+├── middleware.ts
+├── next.config.mjs
+└── package.json
 ```
-
----
 
 ## 6. 核心流程
 
-### 6.1 开始录�?
+### 6.1 开始录音
 
 ```
-1. 用户点击"开始录�?
-2. 检�?FunASR 服务连通性（WebSocket 握手测试�?
-3. 调用 enumerateDevices() 刷新设备列表
-4. 用户选择声卡（或使用默认设备�?
-5. getUserMedia({ deviceId }) 打开麦克�?
-6. 创建 AudioContext (16kHz) + AudioWorklet
-7. 建立 FunASR WebSocket 连接，发送初始配�?
-8. AudioWorklet 输出 PCM �?通过 WebSocket 发�?
-9. 接收识别结果 �?实时渲染�?TranscriptView
-10. 显示录音动画
+1. 拉取 /api/config 获取非敏感配置（ASR 是否已配置、翻译触发句数）
+2. 检查 FunASR 服务连通性
+3. 刷新设备列表，用户勾选麦克风（可多选）与是否采集系统声音
+4. 为每路 createAudioContext + getUserMedia/getDisplayMedia
+5. 每路创建 FunASRClient（携带语种 svs_lang），建立 WebSocket 到 /asr
+6. ScriptProcessorNode 输出 PCM → WebSocket 发送
+7. 接收 transcript.partial（实时字幕）/ transcript.final（落段 + 触发声纹聚类 + 进入翻译缓存）
+8. 显示录音动画与队列徽章
 ```
 
 ### 6.2 停止录音
 
 ```
-1. 用户点击"停止录音"
-2. 关闭麦克风（track.stop()�?
-3. 关闭 AudioContext
-4. 发�?FunASR 结束信号（is_speaking: false�?
-5. 等待最终识别结�?
-6. 合并所有转写文本，按说话人分段
-7. 调用 Qwen API 生成会议纪要
-8. 保存�?SQLite
-9. 刷新左侧历史记录列表
+1. 强制 flush 翻译缓存（绕过阈值）
+2. 关闭各路麦克风/流与 AudioContext，发送结束信号（is_speaking:false）
+3. 等待最终识别结果，合并转写，按说话人分段
+4. 写入实时翻译（/api/meetings/:id/live-translation，纯持久化）
+5. 保存会议（含转写）到 SQLite
+6. 刷新历史列表；可选触发纪要生成
 ```
 
-### 6.3 说话人识别流�?
+### 6.3 纪要 / 翻译生成
 
 ```
-FunASR 返回识别结果
-  �?解析 stamp_sents 中的 spk ID
-  �?查找本地 voiceprints 表，spk_id �?name
-  �?未找到则显示�?发言�?X"
-  �?用户可在管理界面中补充映�?
+用户点击生成 / 目标语言翻译
+  → 校验会议有 final 转写段
+  → llmQueue.enqueue(type)（纪要 300s / 翻译 30s 等待上限）
+  → 服务端调用 LLM（纪要：模板渲染；翻译：分批直连 translateSentences）
+  → 结果按 version_no 写 meeting_llm_results（result_type: summary / translation）
+  → 前端 2s 轮询直至 succeeded / failed
 ```
 
----
+## 7. 环境变量
 
-## 7. 待确认事�?
+| 变量 | 说明 | 默认 |
+|:---|:---|:---|
+| `PORT` | 统一应用服务监听端口 | `3123` |
+| `APP_HOST` | 统一应用服务监听地址 | `0.0.0.0` |
+| `ASR_GATEWAY_PATH` | ASR Gateway WebSocket 路径 | `/asr` |
+| `ASR_GATEWAY_ALLOWED_ORIGINS` | 允许的 WebSocket 来源 | `http://localhost:3123,...` |
+| `BOOTSTRAP_ADMIN_ACCOUNT` | 引导管理员账号 | `admin` |
+| `BOOTSTRAP_ADMIN_PASSWORD` | 引导管理员密码 | `admin123`（仅开发） |
+| `DEV_ACTOR_ACCOUNT` | 开发环境自动登录账号 | — |
 
-| # | 问题 | 影响 |
-|---|------|------|
-| 1 | FunASR 服务端是否已启用 CAM++ 说话人模型？ | 决定能否获取说话�?ID |
-| 2 | 本地 FunASR 镜像的返回字段是否固定为 `text` / `text_2pass` / `is_final`�?| 影响代理结果映射 |
-| 3 | 会议纪要输出格式偏好（Markdown / JSON）？ | 影响 LLM prompt 设计 |
-| 4 | 是否需要支持离线模式（�?FunASR 时）�?| 影响功能范围 |
-| 5 | 是否需要音频录制保存（本地�?wav 文件）？ | 影响存储设计 |
+## 8. 已知边界与后续方向
 
----
+- 全局 LLM 队列为单进程实现；多实例部署需 Redis 协调（未实现）
+- 多实例扩展示范可参考 [deployment-guide.md](./deployment-guide.md) 与 `nginx-meeting-asr.conf`
+- 若需服务端声纹（CAM++ / ERES2NetV2），仅 Python 服务支持；当前 C++ 2pass 服务不支持，详见 [funasr-models.md](./funasr-models.md)
 
-## 8. 依赖清单
-
-### 8.1 npm 依赖
-
-```json
-{
-  "dependencies": {
-    "next": "^14.0.0",
-    "react": "^18.0.0",
-    "react-dom": "^18.0.0",
-    "funasr-client": "latest",
-    "better-sqlite3": "^11.0.0",
-    "zustand": "^4.0.0",
-    "openai": "^4.0.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.0.0",
-    "tailwindcss": "^3.0.0",
-    "@types/node": "^20.0.0",
-    "@types/react": "^18.0.0",
-    "@types/better-sqlite3": "^7.0.0"
-  }
-}
-```
-
-### 8.2 shadcn/ui 组件（按需安装�?
-
-- Button
-- Select
-- Input
-- Textarea
-- Card
-- Table
-- Dialog
-- Badge
-- ScrollArea
-- Tabs
-
----
-
-*文档版本: v1.1 | 更新时间: 2026-07-24*
+✌Bazinga！

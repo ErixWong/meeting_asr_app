@@ -15,6 +15,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "LLM config incomplete" }, { status: 400 });
       }
 
+      const disableThinking = getSettingValue("llm", "thinking_model") !== "0";
+
       await llmQueue.enqueue("test", async () => {
         const response = await fetch(`${baseUrl}/chat/completions`, {
           method: "POST",
@@ -27,6 +29,13 @@ export async function POST(req: NextRequest) {
             messages: [{ role: "user", content: "你好，请回复 OK。" }],
             max_tokens: 256,
             temperature: 0,
+            ...(disableThinking
+              ? {
+                  enable_thinking: false,
+                  chat_template_kwargs: { enable_thinking: false },
+                  think: false,
+                }
+              : {}),
           }),
         });
 
