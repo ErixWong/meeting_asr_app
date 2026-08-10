@@ -72,7 +72,7 @@ docker compose ps            # 状态应为 running (healthy)
 ```
 
 - 首次启动较慢（容器内 `npm ci` + `npm run build`，视网络与磁盘 2~5 分钟），健康检查 `start_period` 已按 180s 配置。
-- 启动命令为条件式：`node_modules/next/package.json` 存在则跳过安装，`.next/BUILD_ID` 存在则跳过构建，之后直接启动应用。这样即使 Docker 自动创建了空的 `.docker/node_modules` 挂载目录，也会正常执行 `npm ci`。
+- 启动命令为条件式：`node_modules/next/package.json` 存在则跳过安装；`.next/BUILD_ID` 存在且源码（`src/`、`server/`、`public/` 及构建相关配置）不比构建产物新，则跳过构建，之后直接启动应用。这样 Docker 自动创建的挂载目录会正常执行 `npm ci` / 首次构建；`git pull` 更新源码后重启容器即可自动重建，无需手动执行构建。
 
 ### 3.5 验证
 
@@ -86,13 +86,15 @@ docker compose exec app node -e "fetch('http://127.0.0.1:3123/login').then(r=>co
 
 ## 4. 代码更新
 
-源码为 bind mount，代码改动即时可见，但 `.next` 是旧构建，需重建后重启：
+源码为 bind mount，代码改动即时可见；容器启动时会自动检测源码是否比 `.next` 构建新，是则重建。更新流程：
 
 ```bash
-docker compose exec app npm run build
-docker compose restart app
+git pull                       # 拉取最新源码
+docker compose restart app     # 重启，启动时自动检测并重建 .next
 ```
 
+> 首次使用本机制（即 `docker-compose.yml` 有变更）时，需用 `docker compose up -d` 让新配置生效，之后的更新只需 `restart`。
+> 如需强制重建（如怀疑构建缓存异常），清空 `.docker/.next` 后重启，或执行 `docker compose exec app npm run build && docker compose restart app`。
 > 重建期间服务短暂不可用；`.docker/data` 中的数据库不受影响。
 
 ## 5. 数据备份与恢复
@@ -122,6 +124,6 @@ docker compose restart app
 |:---|:---|
 | 容器反复重启 / healthcheck 不通过 | 首次构建未完成，查看 `docker compose logs app`；确认网络可访问 npm registry |
 | 页面能打开，但录音/转写 WebSocket 失败 | `ASR_GATEWAY_ALLOWED_ORIGINS` 未包含实际 Origin |
-| 修改代码后不生效 | 未重建 `.next`，执行 `docker compose exec app npm run build && docker compose restart app` |
+| 修改代码后不生效 | 容器启动时自动检测源码并重建，直接执行 `docker compose restart app`；若仍未生效，确认 `docker-compose.yml` 已是最新（`docker compose up -d` 应用新配置） |
 | 需要彻底重置（重装依赖 + 重新构建） | `docker compose down` 后清空 `.docker/node_modules` 与 `.docker/.next` 再 `up -d` |
 | 换部署机迁移 | 源码 + `.env` + `.docker/data`（数据库）三者一并迁移即可 |

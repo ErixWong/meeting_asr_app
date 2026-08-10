@@ -9,7 +9,7 @@ services:
     working_dir: /app
     command: >
       sh -c "test -f node_modules/next/package.json || npm ci --no-audit --no-fund;
-      test -f .next/BUILD_ID || npm run build;
+      if ! test -f .next/BUILD_ID || find src server public tailwind.config.* postcss.config.* tsconfig.json -newer .next/BUILD_ID -print -quit | grep -q .; then npm run build; fi;
       exec node server/app-server.mjs"
     environment:
       PORT: 3123
