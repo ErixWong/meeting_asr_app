@@ -102,6 +102,7 @@ export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
+  const [micRefreshing, setMicRefreshing] = useState(false);
   const [speakerEnabled, setSpeakerEnabled] = useState(false);
   const [asrLang, setAsrLang] = useState<string>("auto");
   const [translationEnabled, setTranslationEnabled] = useState(false);
@@ -688,6 +689,30 @@ export default function MeetingPage() {
       }
     };
   }, [loadRuntimeConfig, requestJson, showNotice]);
+
+  const refreshMicDevices = useCallback(async () => {
+    setMicRefreshing(true);
+    try {
+      const deviceList = await getAudioDevices({ requestPermission: true });
+      const mapped: AudioDevice[] = deviceList.map((d) => ({
+        deviceId: d.deviceId,
+        label: d.label,
+      }));
+      if (mapped.length === 0) {
+        mapped.push({ deviceId: "default", label: "默认麦克风" });
+      }
+      setDevices(mapped);
+      setMicDeviceId((prev) => {
+        if (prev !== null && mapped.some((d) => d.deviceId === prev)) return prev;
+        return mapped.find((d) => d.deviceId !== "speaker")?.deviceId ?? null;
+      });
+    } catch (error) {
+      console.error("Failed to refresh mic devices:", error);
+      showNotice("error", `刷新麦克风设备失败: ${(error as Error).message}`);
+    } finally {
+      setMicRefreshing(false);
+    }
+  }, [showNotice]);
 
   const startRecording = useCallback(async (preserveTranscript = false) => {
     if (!preserveTranscript) {
@@ -2096,6 +2121,8 @@ export default function MeetingPage() {
                       devices={devices}
                       micDeviceId={micDeviceId}
                       onMicChange={setMicDeviceId}
+                      onRequestMicRefresh={refreshMicDevices}
+                      micRefreshing={micRefreshing}
                       speakerEnabled={speakerEnabled}
                       onSpeakerChange={setSpeakerEnabled}
                       asrLang={asrLang}

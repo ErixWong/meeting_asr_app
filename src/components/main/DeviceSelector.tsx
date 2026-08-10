@@ -6,6 +6,8 @@ interface Props {
   devices: AudioDevice[];
   micDeviceId: string | null;
   onMicChange: (deviceId: string | null) => void;
+  onRequestMicRefresh: () => void;
+  micRefreshing?: boolean;
   speakerEnabled: boolean;
   onSpeakerChange: (enabled: boolean) => void;
   asrLang: string;
@@ -39,6 +41,8 @@ export default function DeviceSelector({
   devices,
   micDeviceId,
   onMicChange,
+  onRequestMicRefresh,
+  micRefreshing = false,
   speakerEnabled,
   onSpeakerChange,
   asrLang,
@@ -59,6 +63,8 @@ export default function DeviceSelector({
         <select
           value={micDeviceId ?? ""}
           onChange={(e) => onMicChange(e.target.value || null)}
+          onMouseDown={() => onRequestMicRefresh()}
+          onFocus={() => onRequestMicRefresh()}
           disabled={disabled}
           className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-700 shadow-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand disabled:opacity-60"
         >
@@ -69,6 +75,15 @@ export default function DeviceSelector({
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          onClick={onRequestMicRefresh}
+          disabled={disabled || micRefreshing}
+          title="刷新/授权后重新读取麦克风设备"
+          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm text-slate-600 shadow-sm transition-colors hover:bg-slate-50 disabled:opacity-60"
+        >
+          {micRefreshing ? "…" : "🔄"}
+        </button>
       </label>
       <label className="flex items-center gap-1 text-sm text-slate-600">
         🔊 系统声音
