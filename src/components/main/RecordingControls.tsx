@@ -8,6 +8,9 @@ interface Props {
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
+  muted?: boolean;
+  micEnabled?: boolean;
+  onToggleMute?: () => void;
 }
 
 function formatTime(sec: number) {
@@ -24,6 +27,9 @@ export default function RecordingControls({
   onPause,
   onResume,
   onStop,
+  muted = false,
+  micEnabled = false,
+  onToggleMute,
 }: Props) {
   const recording = status === "recording";
   const paused = status === "paused";
@@ -48,6 +54,14 @@ export default function RecordingControls({
         </button>
       ) : recording ? (
         <>
+          {micEnabled && (
+            <button
+              onClick={onToggleMute}
+              className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+            >
+              {muted ? "🔇 已静音" : "🎙 静音"}
+            </button>
+          )}
           <button
             onClick={onPause}
             className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"

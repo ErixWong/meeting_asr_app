@@ -100,6 +100,7 @@ class ApiRequestError extends Error {
 
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
+  const [micMuted, setMicMuted] = useState(false);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
   const [micRefreshing, setMicRefreshing] = useState(false);
@@ -751,6 +752,7 @@ export default function MeetingPage() {
       persistedMeetingIdRef.current = null;
       persistedSegmentCountRef.current = 0;
       setLiveSegments([]);
+      setMicMuted(false);
       selectedMeetingIdRef.current = null;
       setSelected(null);
       voiceprintFeaturesRef.current = new Map();
@@ -888,6 +890,19 @@ export default function MeetingPage() {
     showNotice,
   ]);
 
+  const toggleMuteMic = useCallback(() => {
+    setMicMuted((prev) => {
+      const next = !prev;
+      for (const [deviceId, activeClient] of asrClientsRef.current.entries()) {
+        if (deviceId !== "speaker") {
+          if (next) activeClient.pause();
+          else activeClient.resume();
+        }
+      }
+      return next;
+    });
+  }, []);
+
   const pauseRecording = useCallback(() => {
     if (asrClientsRef.current.size === 0) return;
     asrRecoveryRef.current = false;
@@ -896,6 +911,7 @@ export default function MeetingPage() {
       activeClient.pause();
     }
     setStatus("paused");
+    setMicMuted(false);
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -947,6 +963,7 @@ export default function MeetingPage() {
       timerRef.current = null;
     }
     setStatus("generating");
+    setMicMuted(false);
 
     let recordingCaptureSessionId = "";
     if (asrClientsRef.current.size > 0) {
@@ -2114,7 +2131,6 @@ export default function MeetingPage() {
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-4 py-3">
                   <div>
                     <h2 className="text-xl font-semibold text-slate-800">新增录音</h2>
-                    <p className="mt-1 text-sm text-slate-400">录音和上传只在这里操作；查看历史会议时不显示录音控件。</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
                     <DeviceSelector
@@ -2147,6 +2163,9 @@ export default function MeetingPage() {
                       onPause={pauseRecording}
                       onResume={resumeRecording}
                       onStop={stopRecording}
+                      muted={micMuted}
+                      micEnabled={Boolean(micDeviceId)}
+                      onToggleMute={toggleMuteMic}
                     />
                     <div className="hidden h-6 w-px bg-slate-200 sm:block" />
                     <input
