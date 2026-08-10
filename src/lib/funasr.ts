@@ -442,20 +442,42 @@ export class FunASRClient {
   }
 }
 
-export async function getAudioDevices(): Promise<
+async function enumerateMicDevices(): Promise<
   { deviceId: string; label: string }[]
 > {
-  const devices: { deviceId: string; label: string }[] = [];
+  const list = await navigator.mediaDevices.enumerateDevices();
+  return list
+    .filter((device) => device.kind === "audioinput")
+    .map((device) => ({
+      deviceId: device.deviceId,
+      label: device.label || `麦克风 ${device.deviceId.slice(0, 8)}`,
+    }));
+}
+
+/**
+ * Requests microphone permission so the browser exposes real device labels and
+ * stable deviceIds. Returns the temporary stream so callers can stop it; a null
+ * return means permission was denied or is unavailable (e.g. not a secure context).
+ */
+export async function requestMicrophonePermission(): Promise<MediaStream | null> {
+  if (!navigator.mediaDevices?.getUserMedia) return null;
   try {
-    const list = await navigator.mediaDevices.enumerateDevices();
-    devices.push(
-      ...list
-        .filter((device) => device.kind === "audioinput")
-        .map((device) => ({
-          deviceId: device.deviceId,
-          label: device.label || `麦克风 ${device.deviceId.slice(0, 8)}`,
-        }))
-    );
+    return await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    return null;
+  }
+}
+
+export async function getAudioDevices(options?: {
+  requestPermission?: boolean;
+}): Promise<{ deviceId: string; label: string }[]> {
+  const devices: { deviceId: string; label: string }[] = [];
+  if (options?.requestPermission) {
+    const tempStream = await requestMicrophonePermission();
+    tempStream?.getTracks().forEach((track) => track.stop());
+  }
+  try {
+    devices.push(...(await enumerateMicDevices()));
   } catch (error) {
     console.error("Failed to get audio devices:", error);
     devices.push({ deviceId: "default", label: "默认麦克风" });
