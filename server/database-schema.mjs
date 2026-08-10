@@ -223,6 +223,19 @@ export function initializeDatabase(database) {
 
 const MIGRATIONS = [
   {
+    version: 2,
+    name: "drop-capture-sessions-raw-events-json",
+    up(database) {
+      // 历史版本 asr_capture_sessions 曾有 raw_events_json NOT NULL 列，
+      // 后来重构把原始事件移到独立 asr_capture_events 表，并从 CREATE TABLE /
+      // createCaptureSession 中移除了该列，但旧库未写迁移，导致新会话 INSERT
+      // 因 NOT NULL 约束失败。此迁移仅清除遗留列，不影响现有数据。
+      const columns = database.prepare("PRAGMA table_info(asr_capture_sessions)").all();
+      if (!columns.some((column) => column.name === "raw_events_json")) return;
+      database.exec("ALTER TABLE asr_capture_sessions DROP COLUMN raw_events_json");
+    },
+  },
+  {
     version: 1,
     name: "meeting-llm-results-meeting-id",
     up(database) {

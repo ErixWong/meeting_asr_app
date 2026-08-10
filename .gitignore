@@ -10,3 +10,4 @@ dev.err
 dev.log
 .DS_Store
 docs/tasks/
+.playwright-mcp/
