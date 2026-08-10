@@ -351,6 +351,15 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "实时翻译攒够多少句 final 触发一次，越小越实时（默认 3）",
     validate: integerSetting("LLM translate trigger sentences", 1, 20),
   },
+  "llm:thinking_model": {
+    itemTitle: "模型是否带思考模式",
+    itemDescription: "Qwen3 等推理模型会输出思考内容，开启后自动附加关闭思考参数（默认开）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Thinking model", 16, false);
+      const lower = normalized.toLowerCase();
+      return lower === "1" || lower === "true" || lower === "yes" ? "1" : "0";
+    },
+  },
   "mail:smtp_host": {
     itemTitle: "SMTP Host",
     itemDescription: "邮件服务主机",
@@ -617,6 +626,13 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "翻译触发句数",
         itemDescription: "实时翻译攒够多少句 final 触发一次，越小越实时",
         itemValue: "3",
+      },
+      {
+        itemSection: "llm",
+        itemMark: "thinking_model",
+        itemTitle: "模型是否带思考模式",
+        itemDescription: "Qwen3 等推理模型会输出思考内容，开启后自动附加关闭思考参数（默认开）",
+        itemValue: "1",
       },
       {
         itemSection: "mail",
@@ -898,6 +914,15 @@ export function getSettingValue(section: string, mark: string) {
   return row?.itemValue ?? "";
 }
 
+function buildDisableThinkingParams(): Record<string, unknown> {
+  if (getSettingValue("llm", "thinking_model") === "0") return {};
+  return {
+    enable_thinking: false,
+    chat_template_kwargs: { enable_thinking: false },
+    think: false,
+  };
+}
+
 const TRANSLATE_TARGET_LABELS: Record<string, string> = {
   zh: "中文",
   en: "英文",
@@ -940,6 +965,7 @@ export async function translateSentences(sentences: string[], targetLang: string
           { role: "user", content },
         ],
         temperature: 0.3,
+        ...buildDisableThinkingParams(),
       }),
       signal: controller.signal,
     });
@@ -1004,6 +1030,7 @@ export async function translateSelection(text: string, targetLang: string): Prom
           { role: "user", content: text },
         ],
         temperature: 0.2,
+        ...buildDisableThinkingParams(),
       }),
       signal: controller.signal,
     });
@@ -2631,8 +2658,20 @@ function truncateUtf16(text: string, maxLength: number): string {
 
 function stripLeadingThinking(content: string): string {
   let cleaned = content.replace(/^\s+/, "");
+  const closeTag = /<\/think\s*>/gi;
+  let lastClose = -1;
+  let lastCloseLen = 0;
+  let tagMatch: RegExpExecArray | null;
+  while ((tagMatch = closeTag.exec(cleaned)) !== null) {
+    lastClose = tagMatch.index;
+    lastCloseLen = tagMatch[0].length;
+  }
+  if (lastClose >= 0) {
+    cleaned = cleaned.slice(lastClose + lastCloseLen).replace(/^\s+/, "");
+  }
   cleaned = cleaned.replace(/^<think>[\s\S]*?<\/think>\s*/i, "");
-  cleaned = cleaned.replace(/^(<\/?think>\s*)+/i, "");
+  cleaned = cleaned.replace(/^(<\/?think\s*>?\s*)+/i, "");
+  cleaned = cleaned.replace(/^(?:<thinking>[\s\S]*?<\/thinking>|<reasoning>[\s\S]*?<\/reasoning>)\s*/i, "");
   cleaned = cleaned.replace(/^\[[\s\S]*?\](?:\s*\n|$)/, (match) => {
     const block = match.slice(0, match.lastIndexOf("]") + 1);
     return block.includes("\n") || block.trim() === cleaned.trim() ? "" : match;
@@ -3000,6 +3039,7 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
           ],
           temperature: 0.3,
           ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
+          ...buildDisableThinkingParams(),
         }),
         signal: controller.signal,
       });
