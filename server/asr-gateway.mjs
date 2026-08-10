@@ -374,8 +374,19 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
 
     sessionStarted = true;
     sessionId = String(message.sessionId || `asr-${randomUUID()}`);
-    ensureCaptureSession();
-    providerAdapter = createProviderAdapter(runtimeConfig, { ...message, sessionId });
+
+    try {
+      ensureCaptureSession();
+      providerAdapter = createProviderAdapter(runtimeConfig, { ...message, sessionId });
+    } catch (error) {
+      // 会话初始化（如捕获会话落库）失败时，将错误透传给客户端而不是抛出
+      // uncaughtException 让客户端静默挂起至超时。
+      failSession(
+        error instanceof Error ? `ASR session init failed: ${error.message}` : "ASR session init failed"
+      );
+      return;
+    }
+
     if (!providerAdapter) {
       failSession(`Unsupported ASR provider: ${runtimeConfig.providerType}`);
       return;
