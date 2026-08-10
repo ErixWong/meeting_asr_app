@@ -956,6 +956,70 @@ export async function translateSentences(sentences: string[], targetLang: string
   }
 }
 
+export interface TranslateSelectionResult {
+  text: string;
+  elapsedMs: number;
+}
+
+export async function translateSelection(text: string, targetLang: string): Promise<TranslateSelectionResult> {
+  const baseUrl = getSettingValue("llm", "base_url");
+  const apiKey = getSettingValue("llm", "api_key");
+  const model = getSettingValue("llm", "model");
+  if (!baseUrl || !model) throw new Error("LLM config incomplete");
+
+  const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
+  const targetLabel = TRANSLATE_TARGET_LABELS[targetLang] || targetLang || "英文";
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  const requestStartedAt = Date.now();
+  try {
+    const { status, text: responseText } = await llmRequest(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              `你是语言教学助手。用户会选中的一段文本（可能是单词、短语或句子），并希望翻译成${targetLabel}。` +
+              `请严格按下面的格式用 markdown 输出，每项独占一行，使用列表符号，不要多余说明、不要编号。\n` +
+              `\n` +
+              `单词或短语格式示例（把英文单词 snide 译为中文）：\n` +
+              `- 词性 + 释义：形容词；挖苦的，讽刺的\n` +
+              `- 音标：/snaɪd/\n` +
+              `- 例句：He made a snide remark about her outfit. — 他对她的穿着做了一个讽刺的评论。\n` +
+              `\n` +
+              `句子格式：\n` +
+              `- 整句翻译：整句翻译成${targetLabel}\n` +
+              `- 重点单词（拆出 2~4 个），每个单独列出：\n` +
+              `  - 单词 / 词性 + 释义\n` +
+              `  - 音标（仅译文为英文时给出）\n` +
+              `  - 例句：目标语言原文 — 中文翻译`,
+          },
+          { role: "user", content: text },
+        ],
+        temperature: 0.2,
+      }),
+      signal: controller.signal,
+    });
+
+    if (status < 200 || status >= 300) {
+      throw new Error(`LLM API error: ${status} ${responseText.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(responseText) as { choices?: Array<{ message?: { content?: unknown } }> };
+    const translated = stripLeadingThinking(String(parsed.choices?.[0]?.message?.content ?? "").trim());
+    if (!translated) throw new Error("LLM returned empty translation");
+    return { text: translated, elapsedMs: Date.now() - requestStartedAt };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 setLlmQueueConfigReader(() => {
   const concurrency = Number(String(getSettingValue("llm", "max_concurrency") || "").trim());
   const capacity = Number(String(getSettingValue("llm", "queue_capacity") || "").trim());
