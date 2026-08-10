@@ -55,7 +55,7 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
             <div
               key={m.id}
               onClick={() => onSelect(m)}
-              className={`group mb-1 rounded-lg border-l-2 px-3 py-2 transition ${
+              className={`group mb-1 cursor-pointer select-none rounded-lg border-l-2 px-3 py-2 transition ${
                 selectedId === m.id
                   ? "border-brand bg-brand/5"
                   : "border-transparent hover:bg-slate-100"
