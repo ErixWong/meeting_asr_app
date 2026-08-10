@@ -106,8 +106,8 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
     return (
       <div className="flex h-full flex-col items-center justify-center text-slate-400">
         <div className="mb-4 text-6xl">🎙</div>
-        <p className="text-lg">点击 &quot;开始录音&quot; 即可开始</p>
-        <p className="mt-1 text-sm">系统将自动识别语音并转写为文字</p>
+        <p className="text-lg">点击「开始录音」录制新会议</p>
+        <p className="mt-1 text-sm">或「上传音频」转写已有录音，系统将自动识别语音并转写为文字</p>
       </div>
     );
   }

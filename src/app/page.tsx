@@ -21,9 +21,9 @@ import {
   updateTranscriptSegments,
   type TranscriptResult,
 } from "@/lib/transcript-state";
-import DeviceSelector from "@/components/main/DeviceSelector";
 import MarkdownPreview from "@/components/main/MarkdownPreview";
 import RecordingControls from "@/components/main/RecordingControls";
+import RecordSetupModal from "@/components/main/RecordSetupModal";
 import TranscriptView from "@/components/main/TranscriptView";
 import TranslationView, { TranslationBlock } from "@/components/main/TranslationView";
 import HistoryList from "@/components/main/HistoryList";
@@ -101,6 +101,7 @@ class ApiRequestError extends Error {
 export default function MeetingPage() {
   const [status, setStatus] = useState<RecordStatus>("idle");
   const [micMuted, setMicMuted] = useState(false);
+  const [setupModalOpen, setSetupModalOpen] = useState(false);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string | null>(null);
   const [micRefreshing, setMicRefreshing] = useState(false);
@@ -2133,33 +2134,9 @@ export default function MeetingPage() {
                     <h2 className="text-xl font-semibold text-slate-800">新增录音</h2>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
-                    <DeviceSelector
-                      devices={devices}
-                      micDeviceId={micDeviceId}
-                      onMicChange={setMicDeviceId}
-                      onRequestMicRefresh={refreshMicDevices}
-                      micRefreshing={micRefreshing}
-                      speakerEnabled={speakerEnabled}
-                      onSpeakerChange={setSpeakerEnabled}
-                      asrLang={asrLang}
-                      onLangChange={handleAsrLangChange}
-                      translationEnabled={translationEnabled}
-                      onTranslationChange={handleTranslationChange}
-                      targetLang={targetLang}
-                      onTargetLangChange={handleTargetLangChange}
-                      disabled={status === "recording" || status === "paused" || status === "connecting"}
-                    />
-                    {status === "recording" && (
-                      <div className="flex items-center gap-1 text-xs text-slate-400">
-                        <span>音量</span>
-                        <div className="h-2 w-28 overflow-hidden rounded-full bg-slate-200">
-                          <div className="h-full w-3/5 animate-pulse bg-green-500" />
-                        </div>
-                      </div>
-                    )}
                     <RecordingControls
                       status={status}
-                      onStart={startRecording}
+                      onStart={() => setSetupModalOpen(true)}
                       onPause={pauseRecording}
                       onResume={resumeRecording}
                       onStop={stopRecording}
@@ -2167,79 +2144,61 @@ export default function MeetingPage() {
                       micEnabled={Boolean(micDeviceId)}
                       onToggleMute={toggleMuteMic}
                     />
-                    <div className="hidden h-6 w-px bg-slate-200 sm:block" />
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="audio/*"
-                      className="hidden"
-                      onChange={handleUpload}
-                    />
-                    <button
-                      onClick={() => fileInputRef.current?.click()}
-                      disabled={status !== "idle" && status !== "done"}
-                      className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      上传音频
-                    </button>
-                  </div>
-                 </div>
-                {(status === "idle" || status === "done") && (
-                  <div className="border-b border-slate-100 bg-amber-50 px-4 py-2 text-xs text-amber-600">
-                    <div className="font-medium">采集说明：</div>
-                    <ul className="ml-4 list-disc">
-                      <li>🎤 麦克风：录制本地声音（你自己的发言）</li>
-                      <li>
-                        🔊 系统声音：录制扬声器播放的声音。网络会议中对方说话的声音在扬声器里，
-                        要采集对方的声音，请选择录制系统声音
-                      </li>
-                    </ul>
-                    {speakerEnabled && (
+                    {(status === "idle" || status === "done") && (
                       <>
-                        <div className="mt-1 font-medium">系统声音开启：</div>
-                        <ol className="ml-4 list-decimal">
-                          <li>开始录音时会弹出共享窗口</li>
-                          <li>请选择「整个屏幕」（可采到所有应用的声音）</li>
-                          <li>并确认共享声音</li>
-                        </ol>
+                        <div className="hidden h-6 w-px bg-slate-200 sm:block" />
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="audio/*"
+                          className="hidden"
+                          onChange={handleUpload}
+                        />
+                        <button
+                          onClick={() => fileInputRef.current?.click()}
+                          className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50"
+                        >
+                          上传音频
+                        </button>
                       </>
                     )}
                   </div>
-                )}
-                {status === "recording" || status === "paused" || status === "connecting" ? (
-                   <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-2 text-sm">
-                     <span
-                       className={
-                         status === "recording"
-                           ? "rec-dot"
-                           : status === "paused"
-                           ? "h-3 w-3 rounded-full bg-amber-400"
-                          : "h-3 w-3 rounded-full bg-amber-400"
-                      }
-                    />
-                    <span className="min-w-0 truncate text-slate-600" title={asrErrorMessage ?? undefined}>
-                      {status === "recording"
-                        ? `录音中 ${formatTime(elapsed)}`
-                        : status === "paused"
-                         ? asrErrorMessage
-                           ? `ASR 已暂停：${asrErrorMessage}`
-                           : `已暂停 ${formatTime(elapsed)}`
-                         : savingMeeting
-                        ? "保存会议中..."
-                        : "连接中..."}
+                 </div>
+                {(status === "recording" || status === "paused" || status === "connecting") && (
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-slate-100 px-4 py-2 text-sm">
+                    <span className="flex items-center gap-2">
+                      <span
+                        className={
+                          status === "recording"
+                            ? "rec-dot"
+                            : "h-3 w-3 rounded-full bg-amber-400"
+                        }
+                      />
+                      <span className="font-medium text-slate-700" title={asrErrorMessage ?? undefined}>
+                        {status === "recording"
+                          ? `录音中 ${formatTime(elapsed)}`
+                          : status === "paused"
+                            ? asrErrorMessage
+                              ? `ASR 已暂停：${asrErrorMessage}`
+                              : `已暂停 ${formatTime(elapsed)}`
+                            : savingMeeting
+                              ? "保存会议中..."
+                              : "连接中..."}
+                      </span>
                     </span>
-                    <span className="ml-auto text-slate-400">
+                    <span className="text-slate-400">
                       FunASR:{" "}
-                        {status === "recording" ? (
-                          <span className="text-green-600">已连接</span>
-                        ) : status === "paused" && asrErrorMessage ? (
-                          <span className="text-red-600">连接异常</span>
-                        ) : (
-                          "连接中"
+                      {status === "recording" ? (
+                        <span className="text-green-600">已连接</span>
+                      ) : status === "paused" && asrErrorMessage ? (
+                        <span className="text-red-600">连接异常</span>
+                      ) : (
+                        "连接中"
                       )}
                     </span>
+                    <span className="ml-auto min-w-0 truncate text-slate-400">设备: {selectedDeviceLabel}</span>
                   </div>
-                ) : null}
+                )}
                 <div className="flex min-h-0 flex-1 flex-col">
                   <div className="min-h-0 flex-1">
                     <TranscriptView segments={liveSegments} />
@@ -2274,13 +2233,30 @@ export default function MeetingPage() {
               </div>
             )}
           </div>
-
-          {!selected && (
-            <div className="border-t border-slate-100 bg-slate-50 px-6 py-1 text-xs text-slate-400">
-              FunASR: {status === "recording" || status === "paused" ? asrErrorMessage ? "连接异常" : "已连接" : "待连接"} | 设备: {selectedDeviceLabel}
-            </div>
-          )}
         </main>
+
+        {setupModalOpen && (
+          <RecordSetupModal
+            devices={devices}
+            micDeviceId={micDeviceId}
+            onMicChange={setMicDeviceId}
+            onRequestMicRefresh={refreshMicDevices}
+            micRefreshing={micRefreshing}
+            speakerEnabled={speakerEnabled}
+            onSpeakerChange={setSpeakerEnabled}
+            asrLang={asrLang}
+            onLangChange={handleAsrLangChange}
+            translationEnabled={translationEnabled}
+            onTranslationChange={handleTranslationChange}
+            targetLang={targetLang}
+            onTargetLangChange={handleTargetLangChange}
+            onClose={() => setSetupModalOpen(false)}
+            onConfirm={() => {
+              setSetupModalOpen(false);
+              void startRecording();
+            }}
+          />
+        )}
 
         {sendModalOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
