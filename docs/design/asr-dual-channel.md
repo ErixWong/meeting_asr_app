@@ -40,3 +40,4 @@ interface TranscriptSegment {
 - 每路 = 一个 `FunASRClient` 实例（`asrClientsRef: Map<deviceId, FunASRClient>`）；网关天然多会话，`captureSessionId` 区分
 - 错误策略（v1）：任一路失败 → 停止全部 + checkpoint 暂停；单路恢复重建留待后续
 - 录音期间 `DeviceSelector` 禁用勾选，勾选集合仅在下次开始录音时生效
+- **单路静音**（任务 `feat-260810-01-add-mic-mute`）：`FunASRClient.pause()/resume()` 以"路"为单位控制 `onaudioprocess` 是否发送音频（不断会话、不关连接）。因此"静音"是**对特定路的暂停**，与整体"暂停"（全部路 + 状态机 `paused`）是不同层级：静音只对 `key !== "speaker"` 的 mic 路调 `pause()`，speaker 路不受影响，整体 `status` 保持 `recording`。speaker 的 Map key 恒为字符串 `"speaker"`，与真实 mic deviceId 不会冲突，是静音路由的判定依据。
