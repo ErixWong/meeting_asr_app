@@ -11,7 +11,7 @@
 
 - 并发上限 = `llm:max_concurrency`（默认 2，admin 可调，入队时读取即改即生效）
 - 排队容量 = `llm:queue_capacity`（默认 10），超出直接拒绝（浅队列快速失败）
-- 排队等待上限：translate/test 30s、summary 180s（异步长任务，超时返回"LLM 繁忙"）
+- 排队等待上限：translate/test 30s、summary 300s（异步长任务，超时返回"LLM 繁忙"）
 - 单例挂 `globalThis`（防 dev HMR 重置）；槽位持有到 SSE 流结束（`finally` 释放）
 - 纪要生成（fire-and-forget + 写库轮询）接队列零返回路径改动；手动触发路径排队超时恢复会议状态（`llm_failed`）
 
