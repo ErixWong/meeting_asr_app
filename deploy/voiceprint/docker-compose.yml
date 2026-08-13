@@ -23,7 +23,8 @@ services:
       # 默认识别阈值 0.35（可经 PUT /config 或 admin 后台调整）
       VOICEPRINT_THRESHOLD: "0.35"
     ports:
-      - "10097:10097"
+      # 仅绑定宿主回环：声纹服务无鉴权，只允许本机主应用代理访问
+      - "127.0.0.1:10097:10097"
     volumes:
       # 模型目录（与 funasr-online / funasr-online-sense 同源，容器重建不丢模型）
       - /docker/funasr/models:/workspace/models

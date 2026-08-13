@@ -33,5 +33,7 @@ export function base64Float32ToInt16Pcm(b64: string, sampleRate: number): { pcmB
   }
 
   const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? Math.round(sampleRate) : 16000;
-  return { pcmBase64: out.toString("base64"), sampleRate: rate };
+  // 采样率限制在声纹服务支持范围（8000~96000），防极端值触发服务端重采样 OOM
+  const clampedRate = Math.min(96000, Math.max(8000, rate));
+  return { pcmBase64: out.toString("base64"), sampleRate: clampedRate };
 }

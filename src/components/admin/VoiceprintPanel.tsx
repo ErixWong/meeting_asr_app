@@ -95,9 +95,13 @@ export default function VoiceprintPanel() {
       };
       const currentThreshold = Number(threshold);
       if (Number.isFinite(currentThreshold)) patch.threshold = currentThreshold;
-      await saveVoiceprintConfig(patch);
+      const result = await saveVoiceprintConfig(patch);
       await refresh();
-      showSuccess("配置已保存");
+      if (result.messages.some((message) => message.startsWith("threshold not updated"))) {
+        showError("设置已保存，但阈值未同步到声纹服务（服务不可达？）");
+      } else {
+        showSuccess("配置已保存");
+      }
     } catch (error) {
       showError(error instanceof Error ? error.message : "保存失败");
     } finally {

@@ -5,7 +5,6 @@ import {
   getVoiceprintEndpoint,
   isVoiceprintEnabled,
   proxyVoiceprint,
-  VoiceprintUnavailableError,
 } from "@/lib/voiceprint-server";
 
 export const dynamic = "force-dynamic";
@@ -91,10 +90,8 @@ export async function PUT(req: NextRequest) {
           });
           messages.push("threshold updated");
         } catch (error) {
-          if (error instanceof VoiceprintUnavailableError) {
-            return NextResponse.json({ error: error.message }, { status: 503 });
-          }
-          throw error;
+          // enabled/endpoint 已保存成功，阈值同步失败不能回滚设置——如实告知（部分成功）
+          messages.push(`threshold not updated: ${error instanceof Error ? error.message : "unknown error"}`);
         }
       }
 

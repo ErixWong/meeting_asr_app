@@ -859,7 +859,8 @@ export default function MeetingPage() {
                   timeSeconds: elapsedRef.current,
                 },
                 // 服务端声纹识别：仅 final 且有句音频时提交异步识别（不阻塞、先聚类后更新）
-                isFinal && audioData && audioData.length > 1000
+                // 门槛 3200 样本(0.2s) 与服务端 MIN_AUDIO_SAMPLES 对齐，过短音频不调识别（避免误触发降级冷却）
+                isFinal && audioData && audioData.length >= 3200
                   ? (next) => {
                       const targetKey = `${source}:${source === "mic" ? deviceId : ""}`;
                       for (let i = next.length - 1; i >= 0; i--) {

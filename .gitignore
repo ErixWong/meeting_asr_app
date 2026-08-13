@@ -11,3 +11,5 @@ dev.log
 .DS_Store
 docs/tasks/
 .playwright-mcp/
+deploy/voiceprint/__pycache__/
+deploy/voiceprint/data/

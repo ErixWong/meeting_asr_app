@@ -9,7 +9,7 @@ export const DEFAULT_VOICEPRINT_ENDPOINT = "http://127.0.0.1:10097";
 const PROXY_TIMEOUT_MS = 5000;
 
 export function getVoiceprintEndpoint(): string {
-  return getSettingValue("voiceprint", "endpoint") || DEFAULT_VOICEPRINT_ENDPOINT;
+  return (getSettingValue("voiceprint", "endpoint") || DEFAULT_VOICEPRINT_ENDPOINT).replace(/\/+$/, "");
 }
 
 export function isVoiceprintEnabled(): boolean {
@@ -45,6 +45,10 @@ export async function proxyVoiceprint<T>(
 
   const data = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (!res.ok) {
+    // 声纹服务 5xx（模型推理失败等）对调用方同样是“服务不可用”语义，统一映射为可降级错误
+    if (res.status >= 500) {
+      throw new VoiceprintUnavailableError(data?.error || `voiceprint service returned ${res.status}`);
+    }
     throw new Error(data?.error || `voiceprint service returned ${res.status}`);
   }
   return data;

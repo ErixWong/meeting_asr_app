@@ -61,6 +61,8 @@ DEFAULT_THRESHOLD = float(os.environ.get("VOICEPRINT_THRESHOLD", "0.35"))
 TARGET_FS = 16000            # CAM++ 要求 16k
 EMB_DIM = 192                # CAM++ embedding 维度
 MIN_AUDIO_SAMPLES = int(TARGET_FS * 0.2)   # 最短有效音频 0.2s
+MIN_SAMPLE_RATE = 8000       # 采样率校验下限（防 Resample 极端上采样 OOM）
+MAX_SAMPLE_RATE = 96000      # 采样率校验上限
 MAX_BODY_BYTES = 8 * 1024 * 1024           # 请求体上限 8MB（句级音频足够）
 NAME_RE = re.compile(r"^[\w\-\u4e00-\u9fa5 ]{1,64}$")
 
@@ -88,8 +90,8 @@ def decode_audio(payload):
     fmt = payload.get("format") or "wav"
     if fmt == "pcm":
         fs = int(payload.get("sample_rate") or 0)
-        if fs <= 0:
-            raise ValueError("sample_rate is required when format=pcm")
+        if not (MIN_SAMPLE_RATE <= fs <= MAX_SAMPLE_RATE):
+            raise ValueError(f"sample_rate must be between {MIN_SAMPLE_RATE} and {MAX_SAMPLE_RATE}")
         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
     elif fmt == "wav":
         try:
@@ -109,6 +111,10 @@ def decode_audio(payload):
             samples = samples.reshape(-1, channels)[:, 0]
     else:
         raise ValueError(f"unsupported format: {fmt}")
+
+    # WAV 头里的采样率同样要防极端值（重采样 OOM）
+    if not (MIN_SAMPLE_RATE <= fs <= MAX_SAMPLE_RATE):
+        raise ValueError(f"sample_rate must be between {MIN_SAMPLE_RATE} and {MAX_SAMPLE_RATE}")
 
     if samples.size < MIN_AUDIO_SAMPLES:
         raise ValueError(f"audio too short: {samples.size / fs:.2f}s (min {MIN_AUDIO_SAMPLES / TARGET_FS:.1f}s)")
@@ -233,6 +239,9 @@ class VoicePrintStore:
                 old = np.array(json.loads(row[0]), dtype=np.float64)
                 n = row[1]
                 mean = (old * n + embedding) / (n + 1)
+                norm = np.linalg.norm(mean)  # 均值向量重新归一化为单位向量（保证 1:N 余弦阈值语义一致）
+                if norm > 0:
+                    mean = mean / norm
                 samples = n + 1
                 self.conn.execute(
                     "UPDATE speakers SET embedding=?, samples=?, updated_at=? WHERE name=?",
@@ -327,7 +336,10 @@ class VoicePrintHandler(BaseHTTPRequestHandler):
 
     def _error(self, exc):
         logger.warning("request failed: %s", exc)
-        self._send_json({"error": str(exc)}, status=400 if not isinstance(exc, RuntimeError) else 500)
+        # 不向客户端透传内部异常细节（路径/模块版本等），统一收敛
+        status = 500 if isinstance(exc, (RuntimeError, OSError)) else 400
+        message = "internal error" if status == 500 else str(exc)
+        self._send_json({"error": message}, status=status)
 
     # ---- 路由 ----
     def do_GET(self):
