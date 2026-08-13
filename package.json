@@ -8,14 +8,19 @@
     "probe:service": "node scripts/probe-service.mjs",
     "build": "next build",
     "start": "node server/app-server.mjs",
-    "lint": "next lint"
+    "lint": "next lint",
+    "db:smoke": "node scripts/db-smoke.mjs"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "knex": "^3.3.0",
+    "mysql2": "^3.23.3",
     "next": "^15.5.16",
     "node-fetch": "^3.3.2",
     "nodemailer": "^9.0.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "tedious": "^20.0.0",
     "ws": "^8.21.2",
     "zustand": "^4.5.4"
   },

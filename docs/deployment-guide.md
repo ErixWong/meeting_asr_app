@@ -59,10 +59,22 @@ AUTH_COOKIE_SECURE=false
 # 引导管理员（首次启动创建）
 BOOTSTRAP_ADMIN_ACCOUNT=admin
 BOOTSTRAP_ADMIN_PASSWORD=<强密码，勿用默认值>
+
+# —— 数据库（可选，默认 SQLite 零配置）——
+# 生产需要对接外部 MySQL / MSSQL 实例时：
+# DB_TYPE=mysql          # 或 mssql
+# DB_HOST=10.0.0.5       # 外部实例地址
+# DB_PORT=3306           # MySQL 默认 3306；MSSQL 默认 1433
+# DB_NAME=meeting_asr    # 实例上需先创建同名数据库/库
+# DB_USER=meeting_app
+# DB_PASSWORD=<数据库密码>
+# DB_ENCRYPT=false       # MSSQL 启用 TLS 时设 true
 EOF
 ```
 
-> 应用业务配置（ASR/LLM/SMTP/模板等）不在 .env 中，通过后台管理页面保存到 SQLite，首次部署后需在 `http://<host>:3123/admin` 完成初始化配置。
+> 应用业务配置（ASR/LLM/SMTP/模板等）不在 .env 中，通过后台管理页面保存到数据库（SQLite 或外部实例），首次部署后需在 `http://<host>:3123/admin` 完成初始化配置。
+
+> 数据库对接验证：`DB_TYPE=mysql DB_HOST=... DB_NAME=... node scripts/db-smoke.mjs` 可提前连通性与方言兼容性冒烟测试，无需启动整套应用。
 
 ### 3.4 启动
 

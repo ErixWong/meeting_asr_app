@@ -20,6 +20,15 @@ services:
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       BOOTSTRAP_ADMIN_ACCOUNT: ${BOOTSTRAP_ADMIN_ACCOUNT:-admin}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
+      # 数据库类型：sqlite（默认，本地零配置）| mysql | mssql（连接外部实例）
+      # 外部实例连接参数：DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_HOST: ${DB_HOST:-}
+      DB_PORT: ${DB_PORT:-}
+      DB_NAME: ${DB_NAME:-}
+      DB_USER: ${DB_USER:-}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_ENCRYPT: ${DB_ENCRYPT:-false}
     ports:
       - "3123:3123"
     volumes:

@@ -155,11 +155,14 @@ server/
 
 ## 数据存储
 
-本地 SQLite 数据库文件位于：
+默认使用本地 SQLite 数据库，文件位于：
 
 ```text
 data/meeting-asr-app.db
 ```
+
+同时支持 MySQL / MSSQL 外部实例（通过 `DB_TYPE` 切换，见下方环境变量表），
+用于生产环境多实例部署或对接既有数据库。
 
 包含以下核心表：`app_settings`、`llm_prompt_templates`、`asr_hotwords`、`users`、`roles`、`user_roles`、`auth_sessions`、`meetings`、`meeting_asr_results`、`meeting_llm_results`、`meeting_send_records`、`asr_capture_sessions`、`asr_capture_events`、`audit_logs`
 
@@ -217,6 +220,13 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | `BOOTSTRAP_ADMIN_ACCOUNT` | 引导管理员账号 | `admin` |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 引导管理员密码 | `admin123`（仅开发） |
 | `DEV_ACTOR_ACCOUNT` | 开发环境自动登录账号 | — |
+| `DB_TYPE` | 数据库类型：`sqlite`（默认，零配置）\| `mysql` \| `mssql` | `sqlite` |
+| `DB_HOST` / `DB_PORT` | 外部数据库地址 / 端口（MySQL 默认 3306，MSSQL 默认 1433） | `127.0.0.1` |
+| `DB_NAME` | 外部数据库名 | `meeting_asr` |
+| `DB_USER` / `DB_PASSWORD` | 外部数据库账号 / 密码 | — |
+| `DB_ENCRYPT` | MSSQL 是否启用 TLS 加密（`true`/`false`） | `false` |
+
+> 数据库切换冒烟验证：`npm run db:smoke`（默认连 SQLite；`DB_TYPE=mysql` 或 `DB_TYPE=mssql` 加连接参数可连外部实例验证）
 
 ## NPM 脚本
 
@@ -227,6 +237,7 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | `npm start` | 启动统一的生产服务（port 3123） |
 | `npm run lint` | 代码检查 |
 | `npm run probe:service` | 检测 ASR 服务连通性（TCP/HTTP/WS） |
+| `npm run db:smoke` | 跨库冒烟测试（sqlite/mysql/mssql 基础能力验证） |
 
 ## 页面一览
 
