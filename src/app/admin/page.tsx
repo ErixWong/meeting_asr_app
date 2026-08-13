@@ -3,8 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useAuthSession } from "@/lib/use-auth-session";
+import VoiceprintPanel from "@/components/admin/VoiceprintPanel";
 
-type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit";
+type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit" | "voiceprint";
 
 type SettingItem = {
   itemSection: string;
@@ -172,6 +173,7 @@ function SectionTabs({
     { key: "mail", label: "邮件配置" },
     { key: "templates", label: "模板管理" },
     { key: "hotwords", label: "热词管理" },
+    { key: "voiceprint", label: "声纹管理" },
     { key: "users", label: "用户与权限" },
     { key: "audit", label: "审计日志" },
   ];
@@ -1458,8 +1460,7 @@ export default function AdminPage() {
           </>
         )}
 
-        {!loading && activeTab === "hotwords" && (
-          <>
+        {!loading && activeTab === "hotwords" && (          <>
             <Card title="热词管理" icon="🔥">
               <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-700">
                 热词会在新建 FunASR WebSocket 连接时被拼装进首帧 `hotwords` JSON。这里只维护管理员热词表，主页面不再单独编辑热词。
@@ -1585,6 +1586,8 @@ export default function AdminPage() {
             )}
           </>
         )}
+
+        {!loading && activeTab === "voiceprint" && <VoiceprintPanel />}
 
         {!loading && activeTab === "users" && (
           <>

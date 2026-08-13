@@ -17,6 +17,11 @@ import { FunASRClient, getAudioDevices } from "@/lib/funasr";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import {
+  identifyVoiceprint,
+  getVoiceprintConfig,
+  VoiceprintApiError,
+} from "@/lib/voiceprint-api";
+import {
   finalizeTranscriptSegments,
   updateTranscriptSegments,
   type TranscriptResult,
@@ -171,6 +176,8 @@ export default function MeetingPage() {
   const summaryGeneratingMeetingIdRef = useRef<string | null>(null);
   const voiceprintFeaturesRef = useRef<Map<string, VoiceprintFeature[]>>(new Map());
   const speakerIdsRef = useRef<Map<string, number[]>>(new Map());
+  const voiceprintEnabledRef = useRef(true);
+  const voiceprintCooldownUntilRef = useRef(0);
   const partialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPartialRef = useRef<PendingPartial | null>(null);
   const transcriptGenerationRef = useRef(0);
@@ -447,6 +454,49 @@ export default function MeetingPage() {
       resetTranslateRef.current();
     };
   }, [resetTranscriptScheduler]);
+
+  // 加载声纹服务配置（enabled 决定是否在每句 final 后调用服务端识别）
+  useEffect(() => {
+    let cancelled = false;
+    getVoiceprintConfig()
+      .then((config) => {
+        if (!cancelled) voiceprintEnabledRef.current = config.enabled;
+      })
+      .catch(() => {
+        // 服务不可达/未部署：保持默认启用，识别失败时自动冷却降级
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * 服务端声纹识别（CAM++）：命中则用人名覆盖段 speaker 字段，不阻塞录音主流程。
+   * 服务不可用 → 冷却 30s 静默降级，前端启发式聚类照常工作。
+   */
+  const scheduleVoiceprintIdentify = useCallback((segmentId: string, audioData: Float32Array) => {
+    if (!voiceprintEnabledRef.current) return;
+    if (Date.now() < voiceprintCooldownUntilRef.current) return;
+
+    identifyVoiceprint(audioData, 16000)
+      .then((result) => {
+        if (!result.matched || !result.speaker) return;
+        setLiveSegments((prev) =>
+          prev.map((seg) =>
+            seg.id === segmentId ? { ...seg, speaker: result.speaker as string } : seg
+          )
+        );
+      })
+      .catch((error) => {
+        if (error instanceof VoiceprintApiError) {
+          // 声纹服务不可用：冷却 30s，期间不再发起请求，录音/聚类不受影响
+          voiceprintCooldownUntilRef.current = Date.now() + 30000;
+          console.warn("[Voiceprint] server voiceprint unavailable, fallback to clustering:", error.message);
+        } else {
+          console.warn("[Voiceprint] identify failed:", error);
+        }
+      });
+  }, []);
 
   const requestJson = useCallback(async <T = unknown,>(input: RequestInfo | URL, init?: RequestInit) => {
     const res = await fetch(input, init);
@@ -798,15 +848,34 @@ export default function MeetingPage() {
                 }
               }
 
-              handleTranscriptResult({
-                text,
-                isFinal,
-                speakerId: clusterSpeakerId,
-                source,
-                deviceId: source === "mic" ? deviceId : undefined,
-                time: formatTime(elapsedRef.current),
-                timeSeconds: elapsedRef.current,
-              });
+              handleTranscriptResult(
+                {
+                  text,
+                  isFinal,
+                  speakerId: clusterSpeakerId,
+                  source,
+                  deviceId: source === "mic" ? deviceId : undefined,
+                  time: formatTime(elapsedRef.current),
+                  timeSeconds: elapsedRef.current,
+                },
+                // 服务端声纹识别：仅 final 且有句音频时提交异步识别（不阻塞、先聚类后更新）
+                isFinal && audioData && audioData.length > 1000
+                  ? (next) => {
+                      const targetKey = `${source}:${source === "mic" ? deviceId : ""}`;
+                      for (let i = next.length - 1; i >= 0; i--) {
+                        const seg = next[i];
+                        if (
+                          seg.isFinal &&
+                          seg.text === text &&
+                          `${seg.source ?? "mic"}:${seg.deviceId ?? ""}` === targetKey
+                        ) {
+                          scheduleVoiceprintIdentify(seg.id, audioData);
+                          break;
+                        }
+                      }
+                    }
+                  : undefined
+              );
             },
             onError: (error) => {
               console.error("FunASR error:", error);

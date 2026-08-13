@@ -1,0 +1,44 @@
+# FunASR 声纹识别服务（独立容器）
+#
+# 部署：
+#   cd deploy/voiceprint
+#   docker compose up -d
+#
+# 说明：
+#   - 复用宿主机已有 funasr-runtime-sdk 镜像（内含 Python SDK + funasr + torch）
+#   - 与 ASR 服务共享宿主模型目录挂载（CAM++ 模型已就位于 /docker/funasr/models/iic/...）
+#   - 声纹库持久化到宿主 ./data/voiceprints.db（WAL）
+#   - 纯 CPU 推理，内存上限 1G（实测运行 ~450MB）
+services:
+  voiceprint:
+    # 复用宿主机已有镜像（内含 Python SDK + funasr + torch）；用完整 registry 名避免误拉 docker.io
+    image: registry.cn-hangzhou.aliyuncs.com/funasr_repo/funasr:funasr-runtime-sdk-online-cpu-0.1.13
+    container_name: funasr-voiceprint
+    restart: unless-stopped
+    command: ["python3", "/app/voiceprint-server.py"]
+    environment:
+      VOICEPRINT_MODEL_DIR: /workspace/models/iic/speech_campplus_sv_zh-cn_16k-common
+      VOICEPRINT_DB_PATH: /data/voiceprints.db
+      VOICEPRINT_PORT: "10097"
+      # 默认识别阈值 0.35（可经 PUT /config 或 admin 后台调整）
+      VOICEPRINT_THRESHOLD: "0.35"
+    ports:
+      - "10097:10097"
+    volumes:
+      # 模型目录（与 funasr-online / funasr-online-sense 同源，容器重建不丢模型）
+      - /docker/funasr/models:/workspace/models
+      # 服务代码（bind mount，便于升级）
+      - ./voiceprint-server.py:/app/voiceprint-server.py:ro
+      # 声纹库数据持久化
+      - ./data:/data
+    init: true
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:10097/health')); raise SystemExit(0 if d.get('modelLoaded') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

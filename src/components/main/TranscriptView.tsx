@@ -13,6 +13,7 @@ interface MergedParagraph {
   time: string;
   timeSeconds: number;
   speakerId: number | null;
+  speaker: string;
   source: "mic" | "speaker" | undefined;
   deviceId?: string;
   text: string;
@@ -35,10 +36,11 @@ function stripSenseVoiceTokens(text: string): string {
   return text.replace(/<\|[^|]*\|>/g, "").trim();
 }
 
-function getSpeakerLabel(speakerId: number | null): string {
-  if (speakerId === null || speakerId === undefined) return "";
+function getSpeakerLabel(seg: Pick<MergedParagraph, "speaker" | "speakerId">): string {
+  if (seg.speaker?.trim()) return seg.speaker.trim();
+  if (seg.speakerId === null || seg.speakerId === undefined) return "";
   const labels = "ABCDEFGH";
-  return `说话人 ${labels[speakerId] || speakerId}`;
+  return `说话人 ${labels[seg.speakerId] || seg.speakerId}`;
 }
 
 function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
@@ -57,6 +59,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
       current &&
       segSource === current.source &&
       seg.deviceId === current.deviceId &&
+      (seg.speaker ?? "") === current.speaker &&
       segSpeakerId !== null &&
       current.speakerId === segSpeakerId &&
       current.isFinal
@@ -72,6 +75,7 @@ function mergeSegments(segments: TranscriptSegment[]): MergedParagraph[] {
         time: seg.time,
         timeSeconds: seg.timeSeconds,
         speakerId: segSpeakerId,
+        speaker: seg.speaker ?? "",
         source: segSource,
         deviceId: seg.deviceId,
         text: cleanText,
@@ -139,9 +143,9 @@ export default function TranscriptView({ segments, autoScroll = true }: Props) {
                     {para.source === "speaker" ? "🔊 系统声音" : "🎤 麦克风"}
                   </span>
                 )}
-                {para.speakerId !== null && (
-                  <span className={`font-medium ${SPEAKER_COLORS[para.speakerId % SPEAKER_COLORS.length]}`}>
-                    {getSpeakerLabel(para.speakerId)}
+                {getSpeakerLabel(para) && (
+                  <span className={`font-medium ${SPEAKER_COLORS[(para.speakerId ?? 0) % SPEAKER_COLORS.length]}`}>
+                    {getSpeakerLabel(para)}
                   </span>
                 )}
                 {para.deviceId && (

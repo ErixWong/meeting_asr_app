@@ -450,6 +450,22 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "自动生成首版结果时使用",
     validate: textSetting("Default prompt template", 128),
   },
+  "voiceprint:enabled": {
+    itemTitle: "服务端声纹识别",
+    itemDescription: "录音时对每句 final 转写调用声纹服务识别说话人（开启后说话人显示为人名，关闭则回退前端启发式聚类）",
+    validate: (value) => {
+      const normalized = textSetting("Voiceprint enabled", 8)(value);
+      if (!(["true", "false"] as string[]).includes(normalized)) {
+        throw new Error("Voiceprint enabled must be true or false");
+      }
+      return normalized;
+    },
+  },
+  "voiceprint:endpoint": {
+    itemTitle: "声纹服务地址",
+    itemDescription: "FunASR 声纹服务（独立容器，默认 http://127.0.0.1:10097）",
+    validate: urlSetting("Voiceprint endpoint", ["http:", "https:"]),
+  },
 };
 
 let dbSeeded = false;
@@ -710,6 +726,20 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "允许的收件邮箱域名",
         itemDescription: "逗号分隔，限制纪要只能发送到这些域名；留空则不限制",
         itemValue: "",
+      },
+      {
+        itemSection: "voiceprint",
+        itemMark: "enabled",
+        itemTitle: "服务端声纹识别",
+        itemDescription: "录音时对每句 final 转写调用声纹服务识别说话人",
+        itemValue: "true",
+      },
+      {
+        itemSection: "voiceprint",
+        itemMark: "endpoint",
+        itemTitle: "声纹服务地址",
+        itemDescription: "FunASR 声纹服务地址（独立容器，默认 http://127.0.0.1:10097）",
+        itemValue: "http://127.0.0.1:10097",
       },
       {
         itemSection: "system",
