@@ -84,6 +84,21 @@ docker compose exec app node -e "fetch('http://127.0.0.1:3123/login').then(r=>co
 
 浏览器访问 `http://<host>:3123`，使用引导管理员登录，进入 `/admin` 配置 ASR / LLM / SMTP。
 
+### 3.6 声纹识别服务（可选）
+
+需要说话人识别（转写显示人名）时，额外部署声纹独立容器：
+
+```bash
+cd deploy/voiceprint && docker compose up -d
+curl http://127.0.0.1:10097/health   # 期望 modelLoaded:true
+```
+
+- 前置：与 ASR 共享镜像与模型（`funasr-runtime-sdk` 镜像 + CAM++ 16k 模型），部署 ASR 后即有
+- 配置：admin 后台「声纹管理」tab（端点默认 `http://127.0.0.1:10097`、阈值 0.35、启停开关）
+- **双容器双模型**：中文版（10097）+ 中英双语版（10098，英文会议），「识别模型」下拉切换，两库独立
+- 降级：声纹服务不可用时主应用自动回退前端启发式聚类，录音主流程不受影响
+- 完整部署/运维/备份说明：见 [funasr-voiceprint-deployment.md](funasr-voiceprint-deployment.md)
+
 ## 4. 代码更新
 
 源码为 bind mount，代码改动即时可见；容器启动时会自动检测源码是否比 `.next` 构建新，是则重建。更新流程：

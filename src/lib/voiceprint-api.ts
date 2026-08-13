@@ -19,8 +19,22 @@ export interface VoiceprintSpeaker {
   updatedAt: string;
 }
 
+export interface VoiceprintServiceStatus {
+  reachable: boolean;
+  status: string | null;
+  threshold: number | null;
+  speakers: number | null;
+  endpoint: string;
+}
+
 export interface VoiceprintConfig {
   enabled: boolean;
+  model: "zh" | "zh_en";
+  models: {
+    zh: VoiceprintServiceStatus;
+    zh_en: VoiceprintServiceStatus;
+  };
+  // 兼容字段（当前模型）
   endpoint: string;
   threshold: number | null;
   serviceReachable: boolean;
@@ -89,8 +103,14 @@ export function deleteVoiceprintSpeaker(name: string): Promise<{ ok: boolean; na
   });
 }
 
-export function saveVoiceprintConfig(patch: { enabled?: boolean; endpoint?: string; threshold?: number }) {
-  return api<{ ok: boolean; enabled: boolean; messages: string[] }>("/api/voiceprint/config", {
+export function saveVoiceprintConfig(patch: {
+  enabled?: boolean;
+  model?: "zh" | "zh_en";
+  endpoint_zh?: string;
+  endpoint_zh_en?: string;
+  threshold?: number;
+}) {
+  return api<{ ok: boolean; enabled: boolean; model: "zh" | "zh_en"; messages: string[] }>("/api/voiceprint/config", {
     method: "PUT",
     body: JSON.stringify(patch),
   });

@@ -17,7 +17,9 @@ export default function VoiceprintPanel() {
   const [config, setConfig] = useState<VoiceprintConfig | null>(null);
   const [speakers, setSpeakers] = useState<VoiceprintSpeaker[]>([]);
   const [enabled, setEnabled] = useState(true);
-  const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState<"zh" | "zh_en">("zh");
+  const [endpointZh, setEndpointZh] = useState("");
+  const [endpointZhEn, setEndpointZhEn] = useState("");
   const [threshold, setThreshold] = useState("0.35");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -47,7 +49,9 @@ export default function VoiceprintPanel() {
       ]);
       setConfig(configData);
       setEnabled(configData.enabled);
-      setEndpoint(configData.endpoint);
+      setModel(configData.model ?? "zh");
+      setEndpointZh(configData.models?.zh?.endpoint ?? "");
+      setEndpointZhEn(configData.models?.zh_en?.endpoint ?? "");
       if (configData.threshold !== null) setThreshold(String(configData.threshold));
       setSpeakers(speakersData.speakers ?? []);
     } catch (error) {
@@ -76,8 +80,11 @@ export default function VoiceprintPanel() {
       const data = await getVoiceprintConfig();
       setConfig(data);
       if (data.threshold !== null) setThreshold(String(data.threshold));
+      const current = model === "zh_en" ? data.models?.zh_en : data.models?.zh;
       showSuccess(
-        data.serviceReachable ? `连接正常：${data.serviceStatus ?? "ready"}` : "服务不可达，请检查声纹容器"
+        current?.reachable
+          ? `连接正常：${current.status ?? "ready"}`
+          : "当前模型服务不可达，请检查声纹容器"
       );
     } catch (error) {
       showError(error instanceof Error ? error.message : "连接测试失败");
@@ -89,9 +96,17 @@ export default function VoiceprintPanel() {
   const saveConfig = async () => {
     setSaving(true);
     try {
-      const patch: { enabled?: boolean; endpoint?: string; threshold?: number } = {
+      const patch: {
+        enabled?: boolean;
+        model?: "zh" | "zh_en";
+        endpoint_zh?: string;
+        endpoint_zh_en?: string;
+        threshold?: number;
+      } = {
         enabled,
-        endpoint: endpoint.trim(),
+        model,
+        endpoint_zh: endpointZh.trim(),
+        endpoint_zh_en: endpointZhEn.trim(),
       };
       const currentThreshold = Number(threshold);
       if (Number.isFinite(currentThreshold)) patch.threshold = currentThreshold;
@@ -251,26 +266,18 @@ export default function VoiceprintPanel() {
         </div>
         <div className="mb-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <label className={fieldLabel}>服务状态</label>
-            <div className="text-sm">
-              {loading ? (
-                <span className="text-slate-400">加载中...</span>
-              ) : config?.serviceReachable ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
-                  <span className="text-emerald-600">正常</span>
-                  <span className="text-slate-400">
-                    （阈值 {config.threshold ?? "-"} · {config.serviceStatus ?? ""}）
-                  </span>
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-2">
-                  <span className="inline-block h-2 w-2 rounded-full bg-red-500" />
-                  <span className="text-red-600">不可达</span>
-                  <span className="text-slate-400">{config?.serviceStatus ?? ""}</span>
-                </span>
-              )}
-            </div>
+            <label className={fieldLabel}>识别模型（录音时使用）</label>
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value as "zh" | "zh_en")}
+              className={inputCls}
+            >
+              <option value="zh">中文版 CAM++（中文会议）</option>
+              <option value="zh_en">中英双语版 CAM++（英文会议）</option>
+            </select>
+            <p className="mt-1 text-xs text-slate-400">
+              两模型声纹库各自独立，切换后需在对应库注册说话人
+            </p>
           </div>
           <div>
             <label className={fieldLabel}>启用服务端声纹识别</label>
@@ -294,9 +301,60 @@ export default function VoiceprintPanel() {
               </span>
             </div>
           </div>
+        </div>
+
+        {/* 双服务状态 */}
+        <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+          {(["zh", "zh_en"] as const).map((key) => {
+            const status = config?.models?.[key];
+            const active = model === key;
+            return (
+              <div
+                key={key}
+                className={`rounded-lg border p-3 ${
+                  active ? "border-brand bg-brand/5" : "border-slate-200"
+                }`}
+              >
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-sm font-medium text-slate-700">
+                    {key === "zh" ? "中文版" : "中英双语版"}
+                    {active && (
+                      <span className="ml-2 rounded bg-brand/10 px-1.5 py-0.5 text-xs text-brand">使用中</span>
+                    )}
+                  </span>
+                  {loading ? (
+                    <span className="text-xs text-slate-400">加载中...</span>
+                  ) : status?.reachable ? (
+                    <span className="inline-flex items-center gap-1.5 text-xs text-emerald-600">
+                      <span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />
+                      正常
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 text-xs text-red-600">
+                      <span className="inline-block h-2 w-2 rounded-full bg-red-500" />
+                      不可达
+                    </span>
+                  )}
+                </div>
+                {!loading && (
+                  <div className="text-xs text-slate-400">
+                    {status?.speakers != null && `${status.speakers} 位说话人 · `}
+                    阈值 {status?.threshold ?? "-"}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mb-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
-            <label className={fieldLabel}>服务地址（endpoint）</label>
-            <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} className={inputCls} placeholder="http://127.0.0.1:10097" />
+            <label className={fieldLabel}>中文版服务地址（endpoint_zh）</label>
+            <input value={endpointZh} onChange={(e) => setEndpointZh(e.target.value)} className={inputCls} placeholder="http://127.0.0.1:10097" />
+          </div>
+          <div>
+            <label className={fieldLabel}>双语版服务地址（endpoint_zh_en）</label>
+            <input value={endpointZhEn} onChange={(e) => setEndpointZhEn(e.target.value)} className={inputCls} placeholder="http://127.0.0.1:10098" />
           </div>
           <div>
             <label className={fieldLabel}>识别阈值（0~1，推荐 0.35）</label>
@@ -308,7 +366,7 @@ export default function VoiceprintPanel() {
               placeholder="0.35"
             />
             <p className="mt-1 text-xs text-slate-400">
-              越高越严格（误识少、漏识多）；同人相似度 ~0.7，异人 ~0.0
+              保存到当前模型服务；同人相似度 ~0.7，异人 ~0.0
             </p>
           </div>
         </div>
@@ -317,9 +375,14 @@ export default function VoiceprintPanel() {
         </button>
       </div>
 
-      {/* 注册新说话人 */}
+      {/* 注册新说话人（注册到当前模型 {model === "zh_en" ? "中英双语版" : "中文版"} 声纹库） */}
       <div className={cardCls}>
-        <h3 className="mb-4 text-sm font-semibold text-slate-700">注册说话人</h3>
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-slate-700">注册说话人</h3>
+          <span className="text-xs text-slate-400">
+            注册到当前模型（{model === "zh_en" ? "中英双语版" : "中文版"}）声纹库
+          </span>
+        </div>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
             <label className={fieldLabel}>姓名</label>

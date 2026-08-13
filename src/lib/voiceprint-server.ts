@@ -6,10 +6,31 @@ import { getSettingValue } from "@/lib/admin-store";
  */
 
 export const DEFAULT_VOICEPRINT_ENDPOINT = "http://127.0.0.1:10097";
+
+/** 声纹模型/服务清单（admin 面板选择，各容器独立部署独立声纹库） */
+export const VOICEPRINT_MODELS = {
+  zh: { label: "中文版 CAM++（中文会议）", defaultEndpoint: "http://127.0.0.1:10097" },
+  zh_en: { label: "中英双语版 CAM++（英文会议）", defaultEndpoint: "http://127.0.0.1:10098" },
+} as const;
+
+export type VoiceprintModelKey = keyof typeof VOICEPRINT_MODELS;
+
 const PROXY_TIMEOUT_MS = 5000;
 
+export function getVoiceprintModel(): VoiceprintModelKey {
+  const raw = getSettingValue("voiceprint", "model");
+  return raw === "zh_en" ? "zh_en" : "zh";
+}
+
 export function getVoiceprintEndpoint(): string {
-  return (getSettingValue("voiceprint", "endpoint") || DEFAULT_VOICEPRINT_ENDPOINT).replace(/\/+$/, "");
+  const model = getVoiceprintModel();
+  const key = model === "zh_en" ? "endpoint_zh_en" : "endpoint_zh";
+  // 兼容旧库：未配置 endpoint_zh 时回退旧的 voiceprint:endpoint（默认同为 10097）
+  const value =
+    getSettingValue("voiceprint", key) ||
+    (model === "zh" ? getSettingValue("voiceprint", "endpoint") : "") ||
+    VOICEPRINT_MODELS[model].defaultEndpoint;
+  return value.replace(/\/+$/, "");
 }
 
 export function isVoiceprintEnabled(): boolean {
@@ -27,9 +48,10 @@ export class VoiceprintUnavailableError extends Error {
 export async function proxyVoiceprint<T>(
   path: string,
   init?: RequestInit,
-  timeoutMs: number = PROXY_TIMEOUT_MS
+  timeoutMs: number = PROXY_TIMEOUT_MS,
+  endpointOverride?: string
 ): Promise<T> {
-  const endpoint = getVoiceprintEndpoint();
+  const endpoint = (endpointOverride ?? getVoiceprintEndpoint()).replace(/\/+$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;

@@ -79,7 +79,11 @@ funasr 容器内 Python 进程（deploy/voiceprint/voiceprint-server.py，端口
 | `src/components/admin/VoiceprintPanel.tsx` | admin「声纹管理」tab 组件 |
 | `src/app/page.tsx` | 录音 onResult：final 段提交后异步 identify，命中人名更新段 speaker |
 | `src/components/main/TranscriptView.tsx` | 段显示：优先 speaker 人名，无则回退“说话人 N” |
-| `src/lib/admin-store.ts` | app_settings 增加 `voiceprint:enabled` / `voiceprint:endpoint` 定义与默认值 |
+| `src/lib/admin-store.ts` | app_settings 增加 `voiceprint:enabled` / `voiceprint:model` / `voiceprint:endpoint_zh` / `voiceprint:endpoint_zh_en` 定义与默认值（旧 `voiceprint:endpoint` 保留兼容） |
+
+### 4.1.1 双模型支持（英文会议，2026-08-13）
+
+中文版 + 中英双语版 CAM++ 各部署独立容器（`funasr-voiceprint` 10097 / `funasr-voiceprint-en` 10098），admin「识别模型」下拉切换（`voiceprint:model`），代理按模型路由。两模型 embedding 空间不同 → **声纹库各自独立**（`data/voiceprints.db` / `data-en/voiceprints.db`），切换后需在对应库注册说话人。双语版实测（中文示例同人 0.67、内存 ~370MB、~125ms/句）；英文真实人声效果建议注册实测后微调阈值。
 
 ### 4.2 数据流
 
@@ -95,6 +99,7 @@ funasr 容器内 Python 进程（deploy/voiceprint/voiceprint-server.py，端口
 - 代理路由：admin 全可用；普通用户 identify 200、register/speakers 403 Forbidden；未登录 401
 - 降级保障：停容器后 identify 返回 503、config 报不可达；容器重启后自动恢复（health 检查通过后 ready）
 - 多段均值注册效果：张三追加 speaker1_b 后识别分数 0.69 → 0.80（均值更稳）
+- 双模型切换（2026-08-13）：PUT model=zh_en 后识别路由到 10098 命中双语库 Alice；切回 zh 命中中文库张三——切换即时生效
 - TypeScript 编译 + `next build` 通过；4 个 voiceprint API 路由进入构建产物
 
 ## 5. 关键约束（踩坑记录）

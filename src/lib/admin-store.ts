@@ -462,9 +462,30 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     },
   },
   "voiceprint:endpoint": {
-    itemTitle: "声纹服务地址",
-    itemDescription: "FunASR 声纹服务（独立容器，默认 http://127.0.0.1:10097）",
+    itemTitle: "声纹服务地址（已弃用）",
+    itemDescription: "旧版单一服务地址，已由 endpoint_zh / endpoint_zh_en 替代（保留以兼容旧库）",
     validate: urlSetting("Voiceprint endpoint", ["http:", "https:"]),
+  },
+  "voiceprint:model": {
+    itemTitle: "声纹识别模型",
+    itemDescription: "zh=中文版 CAM++（中文会议）；zh_en=中英双语版（英文/中英混合会议）",
+    validate: (value) => {
+      const normalized = textSetting("Voiceprint model", 8)(value);
+      if (!["zh", "zh_en"].includes(normalized)) {
+        throw new Error("Voiceprint model must be zh or zh_en");
+      }
+      return normalized;
+    },
+  },
+  "voiceprint:endpoint_zh": {
+    itemTitle: "中文版声纹服务地址",
+    itemDescription: "中文版 CAM++ 容器（默认 http://127.0.0.1:10097）",
+    validate: urlSetting("Voiceprint zh endpoint", ["http:", "https:"]),
+  },
+  "voiceprint:endpoint_zh_en": {
+    itemTitle: "双语版声纹服务地址",
+    itemDescription: "中英双语版 CAM++ 容器（默认 http://127.0.0.1:10098）",
+    validate: urlSetting("Voiceprint zh_en endpoint", ["http:", "https:"]),
   },
 };
 
@@ -736,10 +757,31 @@ function seedDefaults(database: DatabaseSync) {
       },
       {
         itemSection: "voiceprint",
+        itemMark: "model",
+        itemTitle: "声纹识别模型",
+        itemDescription: "zh=中文版（默认）；zh_en=中英双语版（英文会议）",
+        itemValue: "zh",
+      },
+      {
+        itemSection: "voiceprint",
         itemMark: "endpoint",
-        itemTitle: "声纹服务地址",
-        itemDescription: "FunASR 声纹服务地址（独立容器，默认 http://127.0.0.1:10097）",
+        itemTitle: "声纹服务地址（已弃用）",
+        itemDescription: "旧版单一服务地址，已由 endpoint_zh / endpoint_zh_en 替代",
         itemValue: "http://127.0.0.1:10097",
+      },
+      {
+        itemSection: "voiceprint",
+        itemMark: "endpoint_zh",
+        itemTitle: "中文版声纹服务地址",
+        itemDescription: "中文版 CAM++ 容器（默认 http://127.0.0.1:10097）",
+        itemValue: "http://127.0.0.1:10097",
+      },
+      {
+        itemSection: "voiceprint",
+        itemMark: "endpoint_zh_en",
+        itemTitle: "双语版声纹服务地址",
+        itemDescription: "中英双语版 CAM++ 容器（默认 http://127.0.0.1:10098）",
+        itemValue: "http://127.0.0.1:10098",
       },
       {
         itemSection: "system",
