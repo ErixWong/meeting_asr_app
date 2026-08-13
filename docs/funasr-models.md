@@ -167,6 +167,8 @@ Paraformer 中文实例（10095）+ SenseVoiceSmall 实例（10096），两个�
 
 **本系统声纹方案（与部署解耦）**：前端自实现——`src/app/page.tsx` 在 `transcript.final` 时用 `extractAudioSegment` 切出该句音频，本地提取声纹特征（`extractFeatures`）并聚类（`clusterSpeakers`）分配说话人。因此无论部署 Paraformer 还是 SenseVoice，现有说话人功能不受影响，**无需在服务端启用声纹**。
 
+> **2026-08 已验证的服务端声纹路径**（调研 + 容器实测）：现有 funasr 容器内可直接运行 CAM++（`iic/speech_campplus_sv_zh-cn_16k-common`，26.7MB/192 维/CPU 单句 ~110ms），支持注册制 1:N 说话人识别，作为前端启发式聚类的升级路径。详细结论与设计约束见 [docs/design/funasr-voiceprint.md](./design/funasr-voiceprint.md)。
+
 **如需服务端声纹**（仅 Python 服务支持）：
 
 | 服务 | 启用方式 | 备注 |

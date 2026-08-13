@@ -249,7 +249,7 @@ The ASR Gateway (`server/asr-gateway.mjs`) is the unified proxy layer between br
 | [Technical Design](./docs/technical-design.md) | Architecture & module design |
 | [UI Interaction Design](./docs/ui-interaction-design.md) | Pages & interaction design |
 | [Auth Productization](./docs/auth-productization.md) | Auth & permission productization |
-| [Design Docs](./docs/design/) | ADRs: data flow, dual-channel ASR, LLM pipeline, LLM queue & translation, tenant isolation, perf & storage |
+| [Design Docs](./docs/design/) | ADRs: data flow, dual-channel ASR, LLM pipeline, LLM queue & translation, tenant isolation, perf & storage, server-side voiceprint (CAM++) |
 
 ---
 

@@ -249,7 +249,7 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | [技术设计](./docs/technical-design.md) | 架构与模块设计 |
 | [UI 交互设计](./docs/ui-interaction-design.md) | 页面与交互设计 |
 | [认证产品化](./docs/auth-productization.md) | 认证与权限产品化方案 |
-| [设计决策](./docs/design/) | ADR：数据流、双路 ASR、LLM 生成管线、LLM 队列与翻译、权限隔离、性能与存储等 |
+| [设计决策](./docs/design/) | ADR：数据流、双路 ASR、LLM 生成管线、LLM 队列与翻译、权限隔离、性能与存储、服务端声纹（CAM++）方案等 |
 
 ---
 
