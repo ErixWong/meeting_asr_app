@@ -244,6 +244,8 @@ The ASR Gateway (`server/asr-gateway.mjs`) is the unified proxy layer between br
 | [Deployment Guide](./docs/deployment-guide.md) | Production deployment of this app (compose + .env + backup) |
 | [FunASR Deployment Guide](./docs/funasr-deployment.md) | Self-hosted FunASR online service setup & integration |
 | [FunASR Models](./docs/funasr-models.md) | FunASR model selection & language capability guide |
+| [Voiceprint Deployment](./docs/funasr-voiceprint-deployment.md) | Server-side voiceprint (CAM++) container deployment & ops |
+| [English Meeting Support](./docs/english-meeting-support.md) | Switch to English meetings: ASR + voiceprint + minutes template |
 | [FunASR Migration](./docs/funasr-migration.md) | DashScope → local FunASR adaptation notes |
 | [Nginx Config Sample](./docs/nginx-meeting-asr.conf) | Reverse-proxy config for the app / ASR WebSocket |
 | [Technical Design](./docs/technical-design.md) | Architecture & module design |

@@ -244,6 +244,8 @@ ASR Gateway (`server/asr-gateway.mjs`) 是浏览器与 ASR 服务之间的统一
 | [容器部署指南](./docs/deployment-guide.md) | 本应用的生产部署（compose + .env + 数据备份） |
 | [FunASR 本地部署指南](./docs/funasr-deployment.md) | 自建 FunASR 在线服务部署与接入 |
 | [FunASR 模型说明](./docs/funasr-models.md) | FunASR 模型选型与语种能力说明 |
+| [声纹服务部署](./docs/funasr-voiceprint-deployment.md) | 服务端声纹（CAM++）容器部署与运维 |
+| [英文会议支持](./docs/english-meeting-support.md) | 英文会议切换：ASR + 声纹 + 纪要模板 |
 | [FunASR 迁移记录](./docs/funasr-migration.md) | DashScope 迁移至本地 FunASR 的适配说明 |
 | [Nginx 配置示例](./docs/nginx-meeting-asr.conf) | 应用 / ASR WebSocket 反向代理配置 |
 | [技术设计](./docs/technical-design.md) | 架构与模块设计 |

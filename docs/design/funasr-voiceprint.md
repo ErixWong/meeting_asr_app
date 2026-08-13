@@ -112,6 +112,8 @@ funasr 容器内 Python 进程（deploy/voiceprint/voiceprint-server.py，端口
 
 ## 6. 相关文档
 
+- 英文会议全链路：[english-meeting-support.md](../english-meeting-support.md)（ASR + 声纹 + 纪要模板）
+- 部署指南：[funasr-voiceprint-deployment.md](../funasr-voiceprint-deployment.md)（双容器、模型选择、备份、FAQ）
 - 任务与调研笔记：`~/tasks/funasr-voiceprint/`（research/01 容器盘点、02 网络验证、03 本地实测）
 - 模型选型背景：`docs/funasr-models.md` §4.6（服务端声纹支持说明）
 - 前端现状：`src/lib/voiceprint.ts`；UI 声纹管理设计：`docs/ui-interaction-design.md` §4.5

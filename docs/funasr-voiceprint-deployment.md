@@ -154,6 +154,7 @@ docker compose up -d --force-recreate   # 容器重建即生效
 
 ## 10. 相关文档
 
+- 英文会议全链路：[english-meeting-support.md](english-meeting-support.md)（ASR + 声纹 + 纪要模板）
 - 设计文档：[design/funasr-voiceprint.md](design/funasr-voiceprint.md)（决策、约束、踩坑记录）
 - 服务本地说明：[deploy/voiceprint/README.md](../deploy/voiceprint/README.md)（API 表）
 - ASR 部署：[funasr-deployment.md](funasr-deployment.md)
