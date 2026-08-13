@@ -104,7 +104,9 @@ export function createKnexInstance(dbType = getDbType()) {
   const db = knex(CONFIG_BUILDERS[dbType]());
 
   if (dbType === "sqlite") {
-    // SQLite 连接级优化：WAL + busy_timeout
+    // SQLite 连接级优化：WAL + busy_timeout + 外键约束
+    // （better-sqlite3 每连接默认外键关闭，必须在连接上开启）
+    db.raw("PRAGMA foreign_keys = ON").catch(() => {});
     db.raw("PRAGMA journal_mode = WAL").catch((error) => {
       console.error(
         `[DB] WAL mode 开启失败（${error instanceof Error ? error.message : String(error)}），` +
