@@ -22,6 +22,13 @@ function getHeaderConfig(pathname: string): HeaderConfig | null {
     };
   }
 
+  if (pathname === "/chat" || pathname.startsWith("/chat/")) {
+    return {
+      title: "🗣 语音对话",
+      action: { href: "/", label: "← 返回主界面" },
+    };
+  }
+
   if (pathname === "/admin" || pathname.startsWith("/admin/")) {
     return {
       title: "⚙ 系统管理",
@@ -37,7 +44,7 @@ export default function AppHeader() {
   const router = useRouter();
 
   const isLoginPage = pathname === "/login";
-  const isProtectedPage = pathname === "/" || pathname === "/admin" || pathname.startsWith("/admin/") || pathname === "/change-password";
+  const isProtectedPage = pathname === "/" || pathname === "/chat" || pathname === "/admin" || pathname.startsWith("/admin/") || pathname === "/change-password";
   const headerConfig = useMemo(() => getHeaderConfig(pathname), [pathname]);
   const { user, loading, setUser } = useAuthSession(isProtectedPage);
   const isAdmin = Boolean(user?.roles?.includes("system_admin"));
