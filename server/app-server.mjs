@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import next from "next";
 import { attachAsrGateway } from "./asr-gateway.mjs";
+import { createTtsGateway } from "./tts-gateway.mjs";
 import { cleanupExpiredAuditLogs } from "./db-shared.mjs";
 import { cleanupExpiredCaptureSessions, closeCaptureStore, startCaptureFlushTimer } from "./runtime-store.mjs";
 
@@ -16,7 +17,10 @@ await app.prepare();
 
 const handleUpgrade = app.getUpgradeHandler();
 
+const ttsGateway = createTtsGateway({ path: process.env.TTS_GATEWAY_PATH || "/api/tts" });
+
 const server = createServer((request, response) => {
+  if (ttsGateway.handle(request, response)) return;
   handle(request, response);
 });
 const gateway = attachAsrGateway(server, {
@@ -24,6 +28,7 @@ const gateway = attachAsrGateway(server, {
   devMode: dev,
   onUnhandledUpgrade: handleUpgrade,
 });
+
 
 startCaptureFlushTimer();
 
