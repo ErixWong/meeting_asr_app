@@ -1,4 +1,4 @@
-export type LlmTaskType = "translate" | "summary" | "test";
+export type LlmTaskType = "translate" | "summary" | "test" | "chat";
 
 export interface LlmQueueStatus {
   inFlight: number;
@@ -24,6 +24,7 @@ const DEFAULT_WAIT_MS: Record<LlmTaskType, number> = {
   translate: 30_000,
   test: 30_000,
   summary: 300_000,
+  chat: 60_000,
 };
 
 let configReader: ConfigReader = () => DEFAULT_CONFIG;
