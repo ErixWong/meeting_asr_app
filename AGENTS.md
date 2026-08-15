@@ -1,5 +1,7 @@
 # Project Instructions (meeting_asr_app)
 
+> ⚠ **上级约定必读**：`~/projects/AGENTS.md`（共享约定：MCP 工具使用说明 / 测试规矩 / 容器发布规矩 / 凭据安全）。pi 会自动加载，请先读它再读本文；本文只含本项目特有规则。
+
 ## Git 工作流强制要求
 
 - **禁止直接推送代码到 main/master 分支。**
