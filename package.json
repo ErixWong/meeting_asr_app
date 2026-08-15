@@ -9,7 +9,8 @@
     "build": "next build",
     "start": "node server/app-server.mjs",
     "lint": "next lint",
-    "db:smoke": "node scripts/db-smoke.mjs"
+    "db:smoke": "node scripts/db-smoke.mjs",
+    "db:test-schema": "node scripts/db-schema-test.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
