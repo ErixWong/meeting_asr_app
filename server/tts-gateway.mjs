@@ -10,6 +10,8 @@ import { getDb } from "./db-shared.mjs";
 
 const DEFAULT_ENDPOINT = "http://localhost:8010";
 const DEFAULT_VOICE = "中文女";
+const DEFAULT_PROVIDER = "cosyvoice";
+const DEFAULT_MODEL = "tts-1";
 const CONFIG_TTL_MS = 10_000;
 const MAX_SENTENCE_CHARS = 80;
 const SENTENCE_TIMEOUT_MS = 60_000;
@@ -29,6 +31,8 @@ function readSetting(db, section, mark) {
 function loadTtsConfig() {
   const envEndpoint = process.env.TTS_ENDPOINT;
   const envVoice = process.env.TTS_DEFAULT_VOICE;
+  const envProvider = process.env.TTS_PROVIDER;
+  const envModel = process.env.TTS_MODEL;
   let db = null;
   try {
     db = getDb();
@@ -38,10 +42,14 @@ function loadTtsConfig() {
 
   const dbEndpoint = db ? readSetting(db, "tts", "endpoint") : "";
   const dbVoice = db ? readSetting(db, "tts", "default_voice") : "";
+  const dbProvider = db ? readSetting(db, "tts", "provider") : "";
+  const dbModel = db ? readSetting(db, "tts", "model") : "";
 
   return {
     endpoint: (envEndpoint || dbEndpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ""),
     defaultVoice: envVoice || dbVoice || DEFAULT_VOICE,
+    provider: (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase(),
+    model: envModel || dbModel || DEFAULT_MODEL,
   };
 }
 
@@ -173,8 +181,9 @@ async function listContainerVoices(config) {
   return voicesCache ?? [];
 }
 
-/** 按文本自动选择音色；容器没有该音色时回退默认音色 */
+/** 按文本自动选择音色；容器没有该音色时回退默认音色（openai 协议无语言音色概念，直接返回默认） */
 export async function pickVoiceForText(config, text) {
+  if (config.provider === "openai") return config.defaultVoice;
   const lang = detectTextLang(text);
   const candidate = LANG_VOICE_MAP[lang];
   if (!candidate) return config.defaultVoice;
@@ -196,9 +205,58 @@ function enqueue(task) {
 
 // ---------- 容器调用 ----------
 
+// 协议分发：cosyvoice（私有 inference_sft + PCM）| openai（标准 /v1/audio/speech + wav）
+async function callTts(config, text, voice, { stream = false, signal } = {}) {
+  if (config.provider === "openai") return callOpenAi(config, text, voice, { signal });
+  return callCosyVoice(config, text, voice, { stream, signal });
+}
+
+// CosyVoice 私有协议：multipart form + 裸 PCM（16bit mono 22.05kHz）
+async function callCosyVoice(config, text, voice, { stream = false, signal } = {}) {
+  const form = new FormData();
+  form.append("tts_text", text);
+  form.append("spk_id", voice);
+  form.append("stream", stream ? "true" : "false");
+
+  const response = await fetch(`${config.endpoint}/inference_sft`, {
+    method: "POST",
+    body: form,
+    signal,
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`TTS container error ${response.status}: ${detail.slice(0, 200)}`);
+  }
+  const pcm = Buffer.from(await response.arrayBuffer());
+  if (pcm.length === 0) throw new Error("TTS container returned empty audio");
+  return pcm;
+}
+
+// OpenAI 兼容标准协议：JSON body + 音频字节（wav；服务商不支持时可在错误里带 hint）
+async function callOpenAi(config, text, voice, { signal } = {}) {
+  const response = await fetch(`${config.endpoint}/v1/audio/speech`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: config.model,
+      input: text,
+      voice,
+      response_format: "wav",
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`OpenAI TTS error ${response.status}: ${detail.slice(0, 300)}`);
+  }
+  const audio = Buffer.from(await response.arrayBuffer());
+  if (audio.length === 0) throw new Error("OpenAI TTS returned empty audio");
+  return audio;
+}
+
 function buildWavHeader(pcmLength, sampleRate = 22050, channels = 1, bitsPerSample = 16) {
-  const byteRate = sampleRate * channels * bitsPerSample / 8;
-  const blockAlign = channels * bitsPerSample / 8;
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
   const header = Buffer.alloc(44);
   header.write("RIFF", 0);
   header.writeUInt32LE(36 + pcmLength, 4);
@@ -220,34 +278,19 @@ function pcmToWav(pcmBuffer) {
   return Buffer.concat([buildWavHeader(pcmBuffer.length), pcmBuffer]);
 }
 
-async function callContainer(endpoint, text, voice, { stream = false, signal } = {}) {
-  const form = new FormData();
-  form.append("tts_text", text);
-  form.append("spk_id", voice);
-  form.append("stream", stream ? "true" : "false");
-
-  const response = await fetch(`${endpoint}/inference_sft`, {
-    method: "POST",
-    body: form,
-    signal,
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`TTS container error ${response.status}: ${detail.slice(0, 200)}`);
-  }
-  const pcm = Buffer.from(await response.arrayBuffer());
-  if (pcm.length === 0) throw new Error("TTS container returned empty audio");
-  return pcm;
-}
-
 // 按句切分 + 逐句合成（串行），返回 [{ text, wav }]
+// cosyvoice：逐句 PCM→wav（降低首音延迟）；openai：整段一次调用（标准协议无逐句/多音色语义）
 async function synthesizeSentences(config, text, voice, { signal } = {}) {
+  if (config.provider === "openai") {
+    const audio = await callOpenAi(config, text, voice, { signal });
+    return [{ text, wav: audio }];
+  }
   const sentences = splitSentences(text);
   if (sentences.length === 0) throw new Error("Empty TTS text");
 
   const chunks = [];
   for (const sentence of sentences) {
-    const pcm = await callContainer(config.endpoint, sentence, voice, { signal });
+    const pcm = await callCosyVoice(config, sentence, voice, { signal });
     chunks.push({ text: sentence, wav: pcmToWav(pcm) });
   }
   return chunks;
@@ -340,11 +383,18 @@ async function handleSynthesize(request, response) {
     response.write(`event: start\ndata: ${JSON.stringify({ voice, sentenceCount: splitSentences(text).length })}\n\n`);
 
     await enqueue(async () => {
+      if (config.provider === "openai") {
+        // 标准协议：整段一次合成（无逐句语义），单 chunk 输出
+        const audio = await callOpenAi(config, text, voice, { signal: controller.signal });
+        const payload = JSON.stringify({ text, voice, wav: audio.toString("base64") });
+        response.write(`event: chunk\ndata: ${payload}\n\n`);
+        return;
+      }
       const sentences = splitSentences(text);
       for (const sentence of sentences) {
         // 逐句自动选音色（支持中英混说），显式指定则始终用指定音色
         const sentenceVoice = explicitVoice || (await pickVoiceForText(config, sentence));
-        const pcm = await callContainer(config.endpoint, sentence, sentenceVoice, { signal: controller.signal });
+        const pcm = await callCosyVoice(config, sentence, sentenceVoice, { signal: controller.signal });
         const wav = pcmToWav(pcm);
         const payload = JSON.stringify({ text: sentence, voice: sentenceVoice, wav: wav.toString("base64") });
         response.write(`event: chunk\ndata: ${payload}\n\n`);
@@ -415,6 +465,11 @@ async function handleOpenAiSpeech(request, response) {
 
 async function handleVoices(request, response) {
   const config = getTtsRuntimeConfig();
+  if (config.provider === "openai") {
+    // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）
+    sendJson(response, 200, { voices: [] });
+    return;
+  }
   try {
     const res = await fetch(`${config.endpoint}/voices`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`container /voices ${res.status}`);
@@ -427,10 +482,12 @@ async function handleVoices(request, response) {
 
 async function handleHealth(request, response) {
   const config = getTtsRuntimeConfig();
+  // cosyvoice 用私有 /health；openai 标准协议无 health，用 /v1/models 探测可达性
+  const probe = config.provider === "openai" ? "/v1/models" : "/health";
   try {
-    const res = await fetch(`${config.endpoint}/health`, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`container /health ${res.status}`);
-    const data = await res.json();
+    const res = await fetch(`${config.endpoint}${probe}`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`${probe} ${res.status}`);
+    const data = await res.json().catch(() => ({}));
     sendJson(response, 200, { ok: true, container: data });
   } catch (error) {
     sendJson(response, 200, { ok: false, container: { error: error.message } });

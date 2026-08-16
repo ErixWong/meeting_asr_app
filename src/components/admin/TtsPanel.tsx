@@ -2,9 +2,11 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-/** 服务端 TTS 配置（tts-gateway 段：endpoint / default_voice） */
+/** 服务端 TTS 配置（tts-gateway 段：provider / endpoint / model / default_voice） */
 export default function TtsPanel() {
+  const [provider, setProvider] = useState("cosyvoice");
   const [endpoint, setEndpoint] = useState("");
+  const [model, setModel] = useState("");
   const [defaultVoice, setDefaultVoice] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -25,7 +27,9 @@ export default function TtsPanel() {
       const settings = data.settings ?? [];
       const get = (section: string, mark: string, fallback = "") =>
         settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? fallback;
+      setProvider(get("tts", "provider", "cosyvoice"));
       setEndpoint(get("tts", "endpoint", "http://localhost:8010"));
+      setModel(get("tts", "model", ""));
       setDefaultVoice(get("tts", "default_voice", "中文女"));
     } catch (error) {
       showError(`加载配置失败: ${(error as Error).message}`);
@@ -53,9 +57,17 @@ export default function TtsPanel() {
       const ok = Boolean(healthData.ok);
       setHealth({ ok, detail: ok ? undefined : healthData.container?.error });
       if (ok) {
-        showSuccess(`连接正常：${list.length} 个可用音色`);
+        showSuccess(
+          provider === "openai"
+            ? `连接正常：OpenAI 兼容服务可达（音色列表取决于服务商，未拉取）`
+            : `连接正常：${list.length} 个可用音色`
+        );
       } else {
-        showError("TTS 容器不可达，请检查服务是否启动（建议 http://localhost:8010）");
+        showError(
+          provider === "openai"
+            ? "OpenAI 兼容服务不可达，请检查 endpoint 是否指向标准 /v1/audio/speech 服务"
+            : "TTS 容器不可达，请检查服务是否启动（建议 http://localhost:8010）"
+        );
       }
     } catch (error) {
       setHealth({ ok: false, detail: (error as Error).message });
@@ -75,10 +87,24 @@ export default function TtsPanel() {
           settings: [
             {
               itemSection: "tts",
+              itemMark: "provider",
+              itemTitle: "TTS 协议",
+              itemDescription: "cosyvoice 私有协议 / openai 标准协议",
+              itemValue: provider.trim(),
+            },
+            {
+              itemSection: "tts",
               itemMark: "endpoint",
               itemTitle: "TTS 服务地址",
-              itemDescription: "CosyVoice 容器地址（10 秒缓存生效）",
+              itemDescription: "CosyVoice 容器或 OpenAI 兼容服务地址（10 秒缓存生效）",
               itemValue: endpoint.trim(),
+            },
+            {
+              itemSection: "tts",
+              itemMark: "model",
+              itemTitle: "TTS 模型",
+              itemDescription: "OpenAI 兼容服务的模型名，cosyvoice 协议下忽略",
+              itemValue: model.trim(),
             },
             {
               itemSection: "tts",
@@ -135,22 +161,54 @@ export default function TtsPanel() {
         </div>
         <div className="mb-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>
+            <label className={fieldLabel}>协议（provider）</label>
+            <select
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              className={inputCls}
+            >
+              <option value="cosyvoice">cosyvoice（私有协议，本地 CosyVoice 容器）</option>
+              <option value="openai">openai（OpenAI 兼容标准协议 /v1/audio/speech）</option>
+            </select>
+            <p className="mt-1 text-xs text-slate-400">
+              openai 协议可对接任意 OpenAI 兼容 TTS（官方 / OneAPI 中转 / 国产服务）
+            </p>
+          </div>
+          <div>
             <label className={fieldLabel}>服务地址（endpoint）</label>
             <input
               value={endpoint}
               onChange={(e) => setEndpoint(e.target.value)}
               className={inputCls}
-              placeholder="http://localhost:8010"
+              placeholder={
+                provider === "openai" ? "https://api.openai.com/v1" : "http://localhost:8010"
+              }
             />
-            <p className="mt-1 text-xs text-slate-400">本地 CosyVoice 容器（默认 http://localhost:8010）</p>
+            <p className="mt-1 text-xs text-slate-400">
+              {provider === "openai"
+                ? "OpenAI 兼容服务根地址（网关自动拼接 /v1/audio/speech）"
+                : "本地 CosyVoice 容器（默认 http://localhost:8010）"}
+            </p>
           </div>
+          {provider === "openai" && (
+            <div>
+              <label className={fieldLabel}>模型（model）</label>
+              <input
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className={inputCls}
+                placeholder="tts-1 / gpt-4o-mini-tts"
+              />
+              <p className="mt-1 text-xs text-slate-400">服务商支持的 TTS 模型名，如 tts-1</p>
+            </div>
+          )}
           <div>
             <label className={fieldLabel}>默认音色</label>
             <input
               value={defaultVoice}
               onChange={(e) => setDefaultVoice(e.target.value)}
               className={inputCls}
-              placeholder="中文女"
+              placeholder={provider === "openai" ? "alloy" : "中文女"}
               list="tts-voice-options"
             />
             <datalist id="tts-voice-options">
@@ -159,7 +217,9 @@ export default function TtsPanel() {
               ))}
             </datalist>
             <p className="mt-1 text-xs text-slate-400">
-              语音对话按回复语言自动切换音色（中/英/日/韩/粤），识别失败时才用此默认值
+              {provider === "openai"
+                ? "OpenAI 兼容服务没有音色列表 API，需按服务商文档手填（官方 6 个：alloy/echo/fable/onyx/nova/shimmer）"
+                : "语音对话按回复语言自动切换音色（中/英/日/韩/粤），识别失败时才用此默认值"}
             </p>
           </div>
         </div>
@@ -203,9 +263,10 @@ export default function TtsPanel() {
       <div className={cardCls}>
         <h3 className="mb-3 text-sm font-semibold text-slate-700">说明</h3>
         <ul className="list-inside list-disc space-y-1.5 text-sm text-slate-500">
-          <li>对话页（/chat）逐句合成，未指定音色时按句子语言自动选择（中文女 / 英文女 / 日语男 / 韩语女 / 粤语女）。</li>
+          <li>协议：cosyvoice = 本地 CosyVoice 容器（逐句合成 + 按语言自动选音色）；openai = 任意 OpenAI 兼容 TTS（整段合成，音色固定用默认值）。</li>
+          <li>OpenAI 标准协议没有音色列表 API，可用音色以服务商文档为准（OpenAI 官方：alloy/echo/fable/onyx/nova/shimmer）。</li>
           <li>配置保存后约 10 秒生效（tts-gateway 缓存）。</li>
-          <li>容器不可用时对话仍可进行，仅语音合成失败（消息旁会标注），不影响文字回复。</li>
+          <li>服务不可用时对话仍可进行，仅语音合成失败（消息旁会标注），不影响文字回复。</li>
         </ul>
       </div>
     </div>
