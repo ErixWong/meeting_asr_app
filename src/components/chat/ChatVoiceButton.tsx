@@ -24,6 +24,8 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   const partialRef = useRef("");
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const releasingRef = useRef(false);
+  // 启动竞态：startRecording 完成前用户已松手时标记，等连接就绪后立即结束
+  const pendingReleaseRef = useRef(false);
 
   const cleanup = useCallback(() => {
     if (holdTimerRef.current) {
@@ -47,6 +49,7 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   const beginHold = useCallback(async () => {
     if (disabled || releasingRef.current || clientRef.current) return;
     releasingRef.current = true;
+    pendingReleaseRef.current = false;
     finalsRef.current = [];
     partialRef.current = "";
     setPartial("");
@@ -78,6 +81,10 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
       holdTimerRef.current = setTimeout(() => {
         void finishHold();
       }, MAX_HOLD_MS);
+      // 若启动期间用户已松开，立即结束（避免录音永不停止）
+      if (pendingReleaseRef.current) {
+        void finishHold();
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       cleanup();
@@ -116,13 +123,24 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
         onPointerDown={(e) => {
           if (e.button !== 0) return;
           e.preventDefault();
+          // 捕获指针：按住期间轻微移动/按钮尺寸变化/触屏漂移不会触发 pointerleave 而误结束
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+            /* 部分浏览器/场景不支持捕获，忽略 */
+          }
           void beginHold();
         }}
         onPointerUp={() => {
-          if (!clientRef.current) return;
+          if (!clientRef.current) {
+            // 录音还在启动中：标记待释放，由 beginHold 收尾
+            pendingReleaseRef.current = true;
+            return;
+          }
           void finishHold();
         }}
-        onPointerLeave={() => {
+        onLostPointerCapture={() => {
+          // 指针捕获被系统强制释放（如浏览器中断），兜底结束
           if (!clientRef.current) return;
           void finishHold();
         }}
@@ -133,6 +151,7 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
             : "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
         }`}
         title="按住说话（松开后自动识别发送）"
+        style={{ minWidth: "9rem" }}
       >
         {holding ? "🎙 正在听…（松开发送）" : "🎙 按住说话"}
       </button>

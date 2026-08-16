@@ -487,6 +487,32 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "中英双语版 CAM++ 容器（默认 http://127.0.0.1:10098）",
     validate: urlSetting("Voiceprint zh_en endpoint", ["http:", "https:"]),
   },
+  "tts:provider": {
+    itemTitle: "TTS 协议",
+    itemDescription: "cosyvoice（私有协议）/ openai（OpenAI 兼容标准协议）",
+    validate: (value: string) => {
+      const normalized = String(value ?? "").trim().toLowerCase();
+      if (normalized && !["cosyvoice", "openai"].includes(normalized)) {
+        throw new Error("TTS provider must be cosyvoice or openai");
+      }
+      return normalized;
+    },
+  },
+  "tts:model": {
+    itemTitle: "TTS 模型",
+    itemDescription: "OpenAI 兼容服务的模型名（如 tts-1 / gpt-4o-mini-tts），cosyvoice 协议下忽略",
+    validate: textSetting("TTS model", 128, false),
+  },
+  "tts:endpoint": {
+    itemTitle: "TTS 服务地址",
+    itemDescription: "CosyVoice 容器地址（默认 http://localhost:8010）",
+    validate: urlSetting("TTS endpoint", ["http:", "https:"]),
+  },
+  "tts:default_voice": {
+    itemTitle: "默认音色",
+    itemDescription: "语音对话按回复语言自动选音色；识别失败时使用此默认值",
+    validate: textSetting("TTS default voice", 64),
+  },
 };
 
 let dbSeeded = false;
