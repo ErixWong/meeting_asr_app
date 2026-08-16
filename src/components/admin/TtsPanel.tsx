@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+/** OpenAI 官方标准音色（标准协议无列表 API，预置官方 6 个；国产兼容服务音色名可能不同，可自定义） */
+const OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+
 /** 服务端 TTS 配置（tts-gateway 段：provider / endpoint / model / default_voice） */
 export default function TtsPanel() {
   const [provider, setProvider] = useState("cosyvoice");
@@ -31,6 +34,14 @@ export default function TtsPanel() {
       setEndpoint(get("tts", "endpoint", "http://localhost:8010"));
       setModel(get("tts", "model", ""));
       setDefaultVoice(get("tts", "default_voice", "中文女"));
+      // 自动拉取 CosyVoice 容器音色列表（下拉数据源，cosyvoice 协议实时从 /voices 获取；openai 协议返回空）
+      fetch("/api/tts/voices")
+        .then((r) => r.json())
+        .then((d) => {
+          const list = Array.isArray(d) ? d : d.voices ?? [];
+          setVoices(list.map(String));
+        })
+        .catch(() => {});
     } catch (error) {
       showError(`加载配置失败: ${(error as Error).message}`);
     } finally {
@@ -204,22 +215,16 @@ export default function TtsPanel() {
           )}
           <div>
             <label className={fieldLabel}>默认音色</label>
-            <input
+            <VoiceSelect
+              provider={provider}
+              containerVoices={voices}
               value={defaultVoice}
-              onChange={(e) => setDefaultVoice(e.target.value)}
-              className={inputCls}
-              placeholder={provider === "openai" ? "alloy" : "中文女"}
-              list="tts-voice-options"
+              onChange={setDefaultVoice}
             />
-            <datalist id="tts-voice-options">
-              {voices.map((voice) => (
-                <option key={voice} value={voice} />
-              ))}
-            </datalist>
             <p className="mt-1 text-xs text-slate-400">
               {provider === "openai"
-                ? "OpenAI 兼容服务没有音色列表 API，需按服务商文档手填（官方 6 个：alloy/echo/fable/onyx/nova/shimmer）"
-                : "语音对话按回复语言自动切换音色（中/英/日/韩/粤），识别失败时才用此默认值"}
+                ? "OpenAI 官方 6 个标准音色；国产兼容服务音色名不同时可选择「自定义…」手填"
+                : "下拉为 CosyVoice 容器实际音色（测试连接后刷新）；语音对话按回复语言自动切换，识别失败才用此默认值"}
             </p>
           </div>
         </div>
@@ -264,11 +269,68 @@ export default function TtsPanel() {
         <h3 className="mb-3 text-sm font-semibold text-slate-700">说明</h3>
         <ul className="list-inside list-disc space-y-1.5 text-sm text-slate-500">
           <li>协议：cosyvoice = 本地 CosyVoice 容器（逐句合成 + 按语言自动选音色）；openai = 任意 OpenAI 兼容 TTS（整段合成，音色固定用默认值）。</li>
-          <li>OpenAI 标准协议没有音色列表 API，可用音色以服务商文档为准（OpenAI 官方：alloy/echo/fable/onyx/nova/shimmer）。</li>
+          <li>OpenAI 标准协议没有音色列表 API，下拉为官方 6 个标准音色，服务商音色不同可选「自定义…」手填。</li>
           <li>配置保存后约 10 秒生效（tts-gateway 缓存）。</li>
           <li>服务不可用时对话仍可进行，仅语音合成失败（消息旁会标注），不影响文字回复。</li>
         </ul>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 默认音色下拉：cosyvoice 用容器实际音色列表；openai 用官方标准音色。
+ * 当前值不在候选列表时自动落到「自定义…」并显示输入框手填（兼容国产服务自定义音色名）。
+ */
+function VoiceSelect({
+  provider,
+  containerVoices,
+  value,
+  onChange,
+}: {
+  provider: string;
+  containerVoices: string[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const options = provider === "openai" ? OPENAI_VOICES : containerVoices;
+  const current = value.trim();
+  const known = options.includes(current);
+  const selectValue = known ? current : "__custom__";
+
+  const selectCls =
+    "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand";
+
+  return (
+    <div className="space-y-1.5">
+      <select
+        value={selectValue}
+        onChange={(e) => {
+          if (e.target.value === "__custom__") return; // 保持当前值，输入框接管
+          onChange(e.target.value);
+        }}
+        className={selectCls}
+      >
+        {options.length === 0 && (
+          <option value="__custom__" disabled>
+            {provider === "openai" ? "（无音色选项）" : "（先测试连接拉取音色列表）"}
+          </option>
+        )}
+        {options.map((voice) => (
+          <option key={voice} value={voice}>
+            {voice}
+          </option>
+        ))}
+        {options.length > 0 && <option value="__custom__">自定义…</option>}
+      </select>
+      {!known && (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-1 focus:ring-brand"
+          placeholder={provider === "openai" ? "输入自定义音色名（如 dashvoice）" : "输入自定义音色名"}
+        />
+      )}
     </div>
   );
 }
