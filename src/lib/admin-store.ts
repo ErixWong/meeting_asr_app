@@ -487,6 +487,16 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "中英双语版 CAM++ 容器（默认 http://127.0.0.1:10098）",
     validate: urlSetting("Voiceprint zh_en endpoint", ["http:", "https:"]),
   },
+  "tts:endpoint": {
+    itemTitle: "TTS 服务地址",
+    itemDescription: "CosyVoice 容器地址（默认 http://localhost:8010）",
+    validate: urlSetting("TTS endpoint", ["http:", "https:"]),
+  },
+  "tts:default_voice": {
+    itemTitle: "默认音色",
+    itemDescription: "语音对话按回复语言自动选音色；识别失败时使用此默认值",
+    validate: textSetting("TTS default voice", 64),
+  },
 };
 
 let dbSeeded = false;

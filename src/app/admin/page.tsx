@@ -4,8 +4,9 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useAuthSession } from "@/lib/use-auth-session";
 import VoiceprintPanel from "@/components/admin/VoiceprintPanel";
+import TtsPanel from "@/components/admin/TtsPanel";
 
-type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit" | "voiceprint";
+type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit" | "voiceprint" | "tts";
 
 type SettingItem = {
   itemSection: string;
@@ -174,6 +175,7 @@ function SectionTabs({
     { key: "templates", label: "模板管理" },
     { key: "hotwords", label: "热词管理" },
     { key: "voiceprint", label: "声纹管理" },
+    { key: "tts", label: "TTS 配置" },
     { key: "users", label: "用户与权限" },
     { key: "audit", label: "审计日志" },
   ];
@@ -1588,6 +1590,7 @@ export default function AdminPage() {
         )}
 
         {!loading && activeTab === "voiceprint" && <VoiceprintPanel />}
+        {!loading && activeTab === "tts" && <TtsPanel />}
 
         {!loading && activeTab === "users" && (
           <>
