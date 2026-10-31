@@ -111,6 +111,43 @@ test("splitSentences: 空输入返回空数组", () => {
   assert.deepEqual(splitSentences(null), []);
 });
 
+test("splitSentences: 无标点超长串按字符硬切（P3-4）", () => {
+  const long = "啊".repeat(200);
+  const out = splitSentences(long);
+  assert.deepEqual(
+    out.map((s) => s.length),
+    [80, 80, 40],
+    `硬切长度不对: ${JSON.stringify(out.map((s) => s.length))}`
+  );
+  assert.equal(out.join(""), long, "硬切不应丢字/增字");
+});
+
+test("splitSentences: 有逗号的长句优先按逗号切，切完仍超长再硬切", () => {
+  // 单个「词段」就超 80 字（词段之间用空格），强制走硬切分支
+  const longWord = "a".repeat(100);
+  const out = splitSentences(`${longWord} ${longWord}`);
+  assert.ok(out.length >= 3, `应切成多段，实际 ${JSON.stringify(out)}`);
+  for (const s of out) assert.ok(s.length <= 80, `段超长: ${s.length}`);
+  assert.equal(out.join("").replace(/\s/g, ""), `${longWord}${longWord}`);
+
+  // 正常带逗号的中文长句：每段不超 80
+  const sentence = `${Array.from({ length: 12 }, () => "这是一个小分句").join("，")}。`;
+  const parts = splitSentences(sentence);
+  assert.ok(parts.length > 1, `应切成多段，实际 ${JSON.stringify(parts)}`);
+  for (const s of parts) assert.ok(s.length <= 80, `段超长: ${s.length}`);
+  assert.equal(parts.join(""), sentence);
+});
+
+test("splitSentences: 硬切按码点，不劈开 emoji（代理对）", () => {
+  const emoji = "🎙".repeat(100); // 每个占 2 个 UTF-16 单元
+  const out = splitSentences(emoji);
+  assert.equal(out.join(""), emoji);
+  for (const s of out) {
+    assert.equal(Array.from(s).length <= 80, true, "段超长");
+    assert.equal(s.includes("\uFFFD"), false, "出现了代理对被劈开的替换字符");
+  }
+});
+
 // ---------- extractCompleteSentences（流式增量） ----------
 
 test("extractCompleteSentences: 只切出完整句，尾巴原样留作 rest", () => {

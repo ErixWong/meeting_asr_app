@@ -48,6 +48,9 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   const releasingRef = useRef(false);
   // 启动竞态：startRecording 完成前用户已松手时标记，等连接就绪后立即结束
   const pendingReleaseRef = useRef(false);
+  // finishHold 存 ref：beginHold 里要用它收尾，但直接引变量会进依赖数组（与 cleanup/startTick 互指成环），
+  // 存 ref 后 beginHold 只依赖稳定引用，stale closure 也拿到最新实现
+  const finishHoldRef = useRef<(() => Promise<void>) | null>(null);
 
   const stopTick = useCallback(() => {
     if (tickRef.current) {
@@ -124,11 +127,11 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
       startTick();
       // 超时保护：长按住自动结束
       holdTimerRef.current = setTimeout(() => {
-        void finishHold();
+        void finishHoldRef.current?.();
       }, MAX_HOLD_MS);
       // 若启动期间用户已松开，立即结束（避免录音永不停止）
       if (pendingReleaseRef.current) {
-        void finishHold();
+        void finishHoldRef.current?.();
       }
     } catch (err) {
       // 启动失败：显式停止并给出醒目错误（按钮不闪回无反馈状态）
@@ -165,6 +168,11 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
     const text = finalText || partialText || "";
     if (text) onUtterance(text);
   }, [onUtterance, stopTick]);
+
+  // 每次渲染后把最新的 finishHold 写进 ref（beginHold / 定时器通过 ref 调用，避开依赖循环）
+  useEffect(() => {
+    finishHoldRef.current = finishHold;
+  }, [finishHold]);
 
   const label =
     phase === "holding"

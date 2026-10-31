@@ -109,6 +109,17 @@ function splitByEndMarks(text) {
   return parts.map((part) => part.replaceAll(ABBR_DOT, "."));
 }
 
+// 字符级硬切（按码点，避免把代理对/emoji 劈成两半）：无标点长串也不会一次性丢给 TTS 容器
+function hardSplitByChars(text, limit = MAX_SENTENCE_CHARS) {
+  const chars = Array.from(text);
+  if (chars.length <= limit) return [text];
+  const chunks = [];
+  for (let i = 0; i < chars.length; i += limit) {
+    chunks.push(chars.slice(i, i + limit).join(""));
+  }
+  return chunks;
+}
+
 export function splitSentences(text) {
   const raw = String(text ?? "").trim();
   if (!raw) return [];
@@ -118,18 +129,18 @@ export function splitSentences(text) {
     const trimmed = sentence.trim();
     if (!trimmed) continue;
     if (trimmed.length > MAX_SENTENCE_CHARS) {
-      // 长句按逗号/空格再切，仍超长则硬切
+      // 长句按逗号/顿号/空格再切；单段仍超长则按字符硬切（否则无标点长串会整段丢给容器）
       const parts = trimmed.match(/[^，,、\s]+[，,、]?/g) || [];
       let buffer = "";
       for (const part of parts) {
         if (buffer.length + part.length > MAX_SENTENCE_CHARS && buffer) {
-          result.push(buffer);
+          result.push(...hardSplitByChars(buffer));
           buffer = part;
         } else {
           buffer += part;
         }
       }
-      if (buffer) result.push(buffer);
+      if (buffer) result.push(...hardSplitByChars(buffer));
     } else {
       result.push(trimmed);
     }
@@ -223,11 +234,8 @@ function enqueue(task) {
 
 // ---------- 容器调用 ----------
 
-// 协议分发：cosyvoice（私有 inference_sft + PCM）| openai（标准 /v1/audio/speech + wav）
-async function callTts(config, text, voice, { stream = false, signal } = {}) {
-  if (config.provider === "openai") return callOpenAi(config, text, voice, { signal });
-  return callCosyVoice(config, text, voice, { stream, signal });
-}
+// 协议分发在 synthesizeSentences / handleSynthesize 里直接按 config.provider 分支
+// （openai 是整段一次调用，cosyvoice 是逐句合成，两者形状不同，无法用同一个薄封装收敛）。
 
 // CosyVoice 私有协议：multipart form + 裸 PCM（16bit mono 22.05kHz）
 async function callCosyVoice(config, text, voice, { stream = false, signal } = {}) {
