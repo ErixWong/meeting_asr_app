@@ -209,6 +209,7 @@ const SECRET_SETTING_KEYS = new Set([
   "asr:api_key",
   "llm:api_key",
   "mail:smtp_password",
+  "tts:api_key",
 ]);
 
 type SettingDefinition = {
@@ -505,8 +506,14 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   },
   "tts:endpoint": {
     itemTitle: "TTS 服务地址",
-    itemDescription: "CosyVoice 容器地址（默认 http://localhost:8010）",
+    itemDescription:
+      "cosyvoice：CosyVoice 容器地址（默认 http://localhost:8010）；openai：服务根地址（如 https://api.openai.com，不要带 /v1，网关自动拼 /v1/audio/speech）",
     validate: urlSetting("TTS endpoint", ["http:", "https:"]),
+  },
+  "tts:api_key": {
+    itemTitle: "TTS API Key",
+    itemDescription: "openai 协议的鉴权 key（Authorization: Bearer）；免鉴权服务留空",
+    validate: secretSetting("TTS api key", 512),
   },
   "tts:default_voice": {
     itemTitle: "默认音色",

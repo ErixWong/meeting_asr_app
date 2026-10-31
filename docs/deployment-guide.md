@@ -111,6 +111,29 @@ curl http://127.0.0.1:10097/health   # 期望 modelLoaded:true
 - 降级：声纹服务不可用时主应用自动回退前端启发式聚类，录音主流程不受影响
 - 完整部署/运维/备份说明：见 [funasr-voiceprint-deployment.md](funasr-voiceprint-deployment.md)
 
+### 3.7 TTS 语音合成服务（可选）
+
+对话页的「语音回复」由主应用内置的 TTS 网关（`server/tts-gateway.mjs`）提供：对前端暴露 `/api/tts/health`、`/api/tts/voices`、`/api/tts/synthesize`（SSE 流式），同时对外提供 OpenAI 兼容的 `POST /v1/audio/speech`。上游可以是本地 CosyVoice 容器，也可以是任意 OpenAI 兼容 TTS 服务。
+
+- **端口**：CosyVoice 容器默认 `8010`（`/inference_sft` 合成、`/voices` 音色列表、`/health` 探活）；容器内访问宿主机上的服务一律用 `host.docker.internal`（compose 已配 `extra_hosts: host.docker.internal:host-gateway`，把宿主网关 IP 注入容器；没有它容器里的 `host.docker.internal` 无法解析）。
+- **配置位置**：后台 `/admin` →「TTS 配置」页，保存进数据库 `app_settings` 的 `tts:*` 段。
+
+| 环境变量 | 对应 DB 设置 | 说明 |
+|:---|:---|:---|
+| `TTS_ENDPOINT` | `tts:endpoint` | 服务地址。cosyvoice：容器地址（如 `http://host.docker.internal:8010`）；openai：**服务根地址**（如 `https://api.openai.com`，**不要带 `/v1`**，网关自动拼 `/v1/audio/speech`；历史配置里带 `/v1` 的值会被自动规范化掉） |
+| `TTS_PROVIDER` | `tts:provider` | `cosyvoice`（默认）/ `openai` |
+| `TTS_MODEL` | `tts:model` | openai 协议的模型名（如 `tts-1` / `gpt-4o-mini-tts`），cosyvoice 协议下忽略 |
+| `TTS_API_KEY` | `tts:api_key` | openai 协议的鉴权 key，以 `Authorization: Bearer` 发送；免鉴权的兼容服务留空即可 |
+
+- **优先级**：环境变量**非空则压过数据库**；环境变量为空串或未设置时用数据库值，再兜底内置默认值（`http://localhost:8010` / `cosyvoice` / `tts-1`）。compose 里这四个变量默认都是空串（`${TTS_ENDPOINT:-}`），所以默认行为是**以后台配置为准**；只有在确实要锁死配置时才在 `.env` 里给它们赋值。
+  - ⚠ 若这里给了非空默认值（例如 `TTS_ENDPOINT: ${TTS_ENDPOINT:-http://host.docker.internal:8011}`），env 会永久压住数据库值，表现为「后台改了地址不生效」。
+- **生效延迟**：网关对配置做 10 秒缓存（`CONFIG_TTL_MS`），后台保存后约 10 秒生效，**无需重启容器**。
+- **两种协议的差异**：
+  - `cosyvoice`（私有协议）：按标点逐句合成（降低首音延迟），并**按回复语言自动切换音色**（zh / yue / en / ja / ko；容器没有该音色时回退默认音色）；音色下拉从容器 `/voices` 实时拉取。
+  - `openai`（标准协议）：整段一次合成（标准协议无逐句/多音色语义），音色固定用默认值（官方 6 个标准音色，或「自定义…」手填服务商音色名）；音色列表 API 不存在，故下拉为空。
+- **连通性自检**：后台「TTS 配置」→「测试连接」。openai 协议用 `GET /v1/models` 探活（带 `Authorization`），cosyvoice 用容器 `/health`。
+- **降级**：TTS 不可用时对话仍可进行，仅语音合成失败（消息旁标注），不影响文字回复。
+
 ## 4. 代码更新
 
 源码为 bind mount，代码改动即时可见；容器启动时会自动检测源码是否比 `.next` 构建新，是则重建。更新流程：

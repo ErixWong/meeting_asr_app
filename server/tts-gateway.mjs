@@ -33,6 +33,7 @@ function loadTtsConfig() {
   const envVoice = process.env.TTS_DEFAULT_VOICE;
   const envProvider = process.env.TTS_PROVIDER;
   const envModel = process.env.TTS_MODEL;
+  const envApiKey = process.env.TTS_API_KEY;
   let db = null;
   try {
     db = getDb();
@@ -44,12 +45,22 @@ function loadTtsConfig() {
   const dbVoice = db ? readSetting(db, "tts", "default_voice") : "";
   const dbProvider = db ? readSetting(db, "tts", "provider") : "";
   const dbModel = db ? readSetting(db, "tts", "model") : "";
+  const dbApiKey = db ? readSetting(db, "tts", "api_key") : "";
+
+  const provider = (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase();
+
+  let endpoint = (envEndpoint || dbEndpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+  // openai 协议：下方统一拼 /v1/...，这里把「按旧提示填成 .../v1」的地址规范化掉，
+  // 否则会拼成 /v1/v1/audio/speech（P1-1 兼容已按旧文案配置过的部署）。
+  if (provider === "openai") endpoint = endpoint.replace(/\/v1\/?$/, "");
 
   return {
-    endpoint: (envEndpoint || dbEndpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ""),
+    endpoint,
     defaultVoice: envVoice || dbVoice || DEFAULT_VOICE,
-    provider: (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase(),
+    provider,
     model: envModel || dbModel || DEFAULT_MODEL,
+    // 仅 openai 协议使用；留空表示目标服务免鉴权
+    apiKey: (envApiKey || dbApiKey || "").trim(),
   };
 }
 
@@ -98,6 +109,17 @@ function splitByEndMarks(text) {
   return parts.map((part) => part.replaceAll(ABBR_DOT, "."));
 }
 
+// 字符级硬切（按码点，避免把代理对/emoji 劈成两半）：无标点长串也不会一次性丢给 TTS 容器
+function hardSplitByChars(text, limit = MAX_SENTENCE_CHARS) {
+  const chars = Array.from(text);
+  if (chars.length <= limit) return [text];
+  const chunks = [];
+  for (let i = 0; i < chars.length; i += limit) {
+    chunks.push(chars.slice(i, i + limit).join(""));
+  }
+  return chunks;
+}
+
 export function splitSentences(text) {
   const raw = String(text ?? "").trim();
   if (!raw) return [];
@@ -107,18 +129,18 @@ export function splitSentences(text) {
     const trimmed = sentence.trim();
     if (!trimmed) continue;
     if (trimmed.length > MAX_SENTENCE_CHARS) {
-      // 长句按逗号/空格再切，仍超长则硬切
+      // 长句按逗号/顿号/空格再切；单段仍超长则按字符硬切（否则无标点长串会整段丢给容器）
       const parts = trimmed.match(/[^，,、\s]+[，,、]?/g) || [];
       let buffer = "";
       for (const part of parts) {
         if (buffer.length + part.length > MAX_SENTENCE_CHARS && buffer) {
-          result.push(buffer);
+          result.push(...hardSplitByChars(buffer));
           buffer = part;
         } else {
           buffer += part;
         }
       }
-      if (buffer) result.push(buffer);
+      if (buffer) result.push(...hardSplitByChars(buffer));
     } else {
       result.push(trimmed);
     }
@@ -131,23 +153,33 @@ export function splitSentences(text) {
 // 常见粤语用字（用于把粤语回复映射到粤语女声）
 const YUE_CHARS_RE = /[唔嘅咗喺哋喇噉㗎啲乜嘢嚟]/g;
 
-/** 简单语言检测：ja / ko / yue / en / zh（按字符占比，返回保守结果） */
+/**
+ * 简单语言检测：ja / ko / yue / en / zh（保守判定，宁可判 zh 也不乱切音色）
+ *
+ * 为什么按「拉丁词数」而不是字符数算英文占比：中文一字一票、英文一词五六票，
+ * 按字符算时「我们 review 一下 PR 的 deploy 流程」会被判成 en（M4 主卖点是中英混说）。
+ * 所以 en 只在「零汉字、零假名、零韩文」且拉丁词数 >= 3 时成立，其余一律 zh。
+ */
 export function detectTextLang(text) {
   const raw = String(text ?? "");
   const ja = (raw.match(/[\u3040-\u30ff\u31f0-\u31ff]/g) || []).length;
   const ko = (raw.match(/[\uac00-\ud7af\u1100-\u11ff]/g) || []).length;
   const han = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
   const latin = (raw.match(/[A-Za-z]/g) || []).length;
+  // 允许单字母成词：单字母词（I / U.S. 的 U 与 S / A）必须计入，
+  // 否则 "The U.S. deal"、"I agree wholeheartedly" 这类纯英文短句只数到 2 票 → 掉回 zh → 派中文音色。
+  // 放宽词形不会把中英夹杂打回 en：中英混说的闸是下面的 han/ja/ko === 0，有汉字就轮不到词数判定。
+  const latinWords = (raw.match(/[A-Za-z][A-Za-z'’-]*/g) || []).length;
   const yue = (raw.match(YUE_CHARS_RE) || []).length;
   const total = ja + ko + han + latin;
   if (total === 0) return "zh";
   const jaRatio = ja / total;
   const koRatio = ko / total;
-  const latinRatio = latin / total;
   if (jaRatio > 0.2) return "ja";
   if (koRatio > 0.2) return "ko";
-  if (latinRatio > 0.6) return "en";
   if (yue > 0 && han > 0 && yue / han > 0.03) return "yue";
+  // 纯拉丁（无汉字/假名/韩文）且至少 3 个词才算英文；中英夹杂一律 zh
+  if (han === 0 && ja === 0 && ko === 0 && latinWords >= 3) return "en";
   return "zh";
 }
 
@@ -205,11 +237,8 @@ function enqueue(task) {
 
 // ---------- 容器调用 ----------
 
-// 协议分发：cosyvoice（私有 inference_sft + PCM）| openai（标准 /v1/audio/speech + wav）
-async function callTts(config, text, voice, { stream = false, signal } = {}) {
-  if (config.provider === "openai") return callOpenAi(config, text, voice, { signal });
-  return callCosyVoice(config, text, voice, { stream, signal });
-}
+// 协议分发在 synthesizeSentences / handleSynthesize 里直接按 config.provider 分支
+// （openai 是整段一次调用，cosyvoice 是逐句合成，两者形状不同，无法用同一个薄封装收敛）。
 
 // CosyVoice 私有协议：multipart form + 裸 PCM（16bit mono 22.05kHz）
 async function callCosyVoice(config, text, voice, { stream = false, signal } = {}) {
@@ -232,11 +261,17 @@ async function callCosyVoice(config, text, voice, { stream = false, signal } = {
   return pcm;
 }
 
+// openai 协议的鉴权头：有 key 才带，避免给免鉴权服务发空 Authorization。
+// 注意：只把 header 交给 fetch，任何日志/错误信息都不许带出 apiKey。
+function openAiAuthHeaders(config) {
+  return config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {};
+}
+
 // OpenAI 兼容标准协议：JSON body + 音频字节（wav；服务商不支持时可在错误里带 hint）
 async function callOpenAi(config, text, voice, { signal } = {}) {
   const response = await fetch(`${config.endpoint}/v1/audio/speech`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...openAiAuthHeaders(config) },
     body: JSON.stringify({
       model: config.model,
       input: text,
@@ -466,7 +501,8 @@ async function handleOpenAiSpeech(request, response) {
 async function handleVoices(request, response) {
   const config = getTtsRuntimeConfig();
   if (config.provider === "openai") {
-    // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）
+    // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）。
+    // 这里不发任何上游请求，因此没有需要带 Authorization 的调用。
     sendJson(response, 200, { voices: [] });
     return;
   }
@@ -484,8 +520,12 @@ async function handleHealth(request, response) {
   const config = getTtsRuntimeConfig();
   // cosyvoice 用私有 /health；openai 标准协议无 health，用 /v1/models 探测可达性
   const probe = config.provider === "openai" ? "/v1/models" : "/health";
+  const headers = config.provider === "openai" ? openAiAuthHeaders(config) : {};
   try {
-    const res = await fetch(`${config.endpoint}${probe}`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${config.endpoint}${probe}`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
     if (!res.ok) throw new Error(`${probe} ${res.status}`);
     const data = await res.json().catch(() => ({}));
     sendJson(response, 200, { ok: true, container: data });

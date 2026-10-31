@@ -19,7 +19,12 @@ services:
       PORT: 3123
       APP_HOST: 0.0.0.0
       # 容器内通过 host.docker.internal 访问宿主机上的 llama.cpp/FunASR/声纹/TTS 容器端口
-      TTS_ENDPOINT: ${TTS_ENDPOINT:-http://host.docker.internal:8011}
+      # TTS：这里默认留空 ⇒ 后台「TTS 配置」页（app_settings）的值生效；
+      # env 非空时优先级高于数据库（TTS_ENDPOINT > tts:endpoint）。
+      TTS_ENDPOINT: ${TTS_ENDPOINT:-}
+      TTS_PROVIDER: ${TTS_PROVIDER:-}
+      TTS_MODEL: ${TTS_MODEL:-}
+      TTS_API_KEY: ${TTS_API_KEY:-}
       # 线上通过域名/IP 访问时，必须把实际 Origin 加进来，否则 WebSocket 握手被拒
       ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-http://localhost:3123}
       # 直接通过 HTTP 访问时必须为 false；HTTPS 反向代理部署时设为 true
