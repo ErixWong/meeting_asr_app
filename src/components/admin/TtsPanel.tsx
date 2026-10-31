@@ -9,6 +9,8 @@ const OPENAI_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
 export default function TtsPanel() {
   const [provider, setProvider] = useState("cosyvoice");
   const [endpoint, setEndpoint] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [hasApiKey, setHasApiKey] = useState(false);
   const [model, setModel] = useState("");
   const [defaultVoice, setDefaultVoice] = useState("");
   const [saving, setSaving] = useState(false);
@@ -25,7 +27,12 @@ export default function TtsPanel() {
     try {
       const res = await fetch("/api/admin/settings");
       const data = (await res.json()) as {
-        settings?: Array<{ itemSection: string; itemMark: string; itemValue: string }>;
+        settings?: Array<{
+          itemSection: string;
+          itemMark: string;
+          itemValue: string;
+          hasValue?: boolean;
+        }>;
       };
       const settings = data.settings ?? [];
       const get = (section: string, mark: string, fallback = "") =>
@@ -34,6 +41,12 @@ export default function TtsPanel() {
       setEndpoint(get("tts", "endpoint", "http://localhost:8010"));
       setModel(get("tts", "model", ""));
       setDefaultVoice(get("tts", "default_voice", "中文女"));
+      // secret 项不回传明文，只告知是否已存过（空输入表示保留旧值）
+      setHasApiKey(
+        Boolean(
+          settings.find((item) => item.itemSection === "tts" && item.itemMark === "api_key")?.hasValue
+        )
+      );
       // 自动拉取 CosyVoice 容器音色列表（下拉数据源，cosyvoice 协议实时从 /voices 获取；openai 协议返回空）
       fetch("/api/tts/voices")
         .then((r) => r.json())
@@ -76,7 +89,7 @@ export default function TtsPanel() {
       } else {
         showError(
           provider === "openai"
-            ? "OpenAI 兼容服务不可达，请检查 endpoint 是否指向标准 /v1/audio/speech 服务"
+            ? "OpenAI 兼容服务不可达，请检查 endpoint（服务根地址，不要带 /v1）与 API Key 是否正确"
             : "TTS 容器不可达，请检查服务是否启动（建议 http://localhost:8010）"
         );
       }
@@ -107,8 +120,16 @@ export default function TtsPanel() {
               itemSection: "tts",
               itemMark: "endpoint",
               itemTitle: "TTS 服务地址",
-              itemDescription: "CosyVoice 容器或 OpenAI 兼容服务地址（10 秒缓存生效）",
+              itemDescription:
+                "cosyvoice：CosyVoice 容器地址；openai：服务根地址（不要带 /v1，网关自动拼 /v1/audio/speech）（10 秒缓存生效）",
               itemValue: endpoint.trim(),
+            },
+            {
+              itemSection: "tts",
+              itemMark: "api_key",
+              itemTitle: "TTS API Key",
+              itemDescription: "openai 协议的鉴权 key（Authorization: Bearer）；免鉴权服务留空",
+              itemValue: apiKey.trim(),
             },
             {
               itemSection: "tts",
@@ -131,6 +152,9 @@ export default function TtsPanel() {
       if (!res.ok || data.error) {
         throw new Error(data.error ?? `HTTP ${res.status}`);
       }
+      // secret 项留空表示保留旧值；保存后清空输入框并刷新「已保存」状态
+      if (apiKey.trim()) setHasApiKey(true);
+      setApiKey("");
       showSuccess("TTS 配置已保存（约 10 秒后生效）");
     } catch (error) {
       showError(`保存失败: ${(error as Error).message}`);
@@ -182,7 +206,8 @@ export default function TtsPanel() {
               <option value="openai">openai（OpenAI 兼容标准协议 /v1/audio/speech）</option>
             </select>
             <p className="mt-1 text-xs text-slate-400">
-              openai 协议可对接任意 OpenAI 兼容 TTS（官方 / OneAPI 中转 / 国产服务）
+              openai 协议需服务支持 <code>Authorization: Bearer</code>（官方 / OneAPI 中转 / 国产兼容服务）；
+              不支持鉴权的服务把 API Key 留空即可
             </p>
           </div>
           <div>
@@ -192,15 +217,34 @@ export default function TtsPanel() {
               onChange={(e) => setEndpoint(e.target.value)}
               className={inputCls}
               placeholder={
-                provider === "openai" ? "https://api.openai.com/v1" : "http://localhost:8010"
+                provider === "openai" ? "https://api.openai.com" : "http://localhost:8010"
               }
             />
             <p className="mt-1 text-xs text-slate-400">
               {provider === "openai"
-                ? "OpenAI 兼容服务根地址（网关自动拼接 /v1/audio/speech）"
+                ? "填服务根地址，网关自动拼 /v1/audio/speech；不要带 /v1"
                 : "本地 CosyVoice 容器（默认 http://localhost:8010）"}
             </p>
+            <p className="mt-1 text-xs text-slate-400">
+              若设置了环境变量 TTS_ENDPOINT，则以环境变量为准（环境变量优先于此处配置）
+            </p>
           </div>
+          {provider === "openai" && (
+            <div>
+              <label className={fieldLabel}>API Key（可选）</label>
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                className={inputCls}
+                placeholder={hasApiKey ? "已保存，留空保持原值" : "留空表示目标服务免鉴权"}
+                autoComplete="new-password"
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                以 Authorization: Bearer 发送；免鉴权服务留空即可
+              </p>
+            </div>
+          )}
           {provider === "openai" && (
             <div>
               <label className={fieldLabel}>模型（model）</label>
@@ -268,7 +312,8 @@ export default function TtsPanel() {
       <div className={cardCls}>
         <h3 className="mb-3 text-sm font-semibold text-slate-700">说明</h3>
         <ul className="list-inside list-disc space-y-1.5 text-sm text-slate-500">
-          <li>协议：cosyvoice = 本地 CosyVoice 容器（逐句合成 + 按语言自动选音色）；openai = 任意 OpenAI 兼容 TTS（整段合成，音色固定用默认值）。</li>
+          <li>协议：cosyvoice = 本地 CosyVoice 容器（逐句合成 + 按语言自动选音色）；openai = 支持 <code>Authorization: Bearer</code> 的 OpenAI 兼容 TTS（整段合成，音色固定用默认值）。</li>
+          <li>openai 协议的 endpoint 填服务根地址（如 https://api.openai.com），网关自动拼 <code>/v1/audio/speech</code>；已带 <code>/v1</code> 的旧配置会自动容错去掉。</li>
           <li>OpenAI 标准协议没有音色列表 API，下拉为官方 6 个标准音色，服务商音色不同可选「自定义…」手填。</li>
           <li>配置保存后约 10 秒生效（tts-gateway 缓存）。</li>
           <li>服务不可用时对话仍可进行，仅语音合成失败（消息旁会标注），不影响文字回复。</li>

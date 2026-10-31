@@ -33,6 +33,7 @@ function loadTtsConfig() {
   const envVoice = process.env.TTS_DEFAULT_VOICE;
   const envProvider = process.env.TTS_PROVIDER;
   const envModel = process.env.TTS_MODEL;
+  const envApiKey = process.env.TTS_API_KEY;
   let db = null;
   try {
     db = getDb();
@@ -44,12 +45,22 @@ function loadTtsConfig() {
   const dbVoice = db ? readSetting(db, "tts", "default_voice") : "";
   const dbProvider = db ? readSetting(db, "tts", "provider") : "";
   const dbModel = db ? readSetting(db, "tts", "model") : "";
+  const dbApiKey = db ? readSetting(db, "tts", "api_key") : "";
+
+  const provider = (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase();
+
+  let endpoint = (envEndpoint || dbEndpoint || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+  // openai 协议：下方统一拼 /v1/...，这里把「按旧提示填成 .../v1」的地址规范化掉，
+  // 否则会拼成 /v1/v1/audio/speech（P1-1 兼容已按旧文案配置过的部署）。
+  if (provider === "openai") endpoint = endpoint.replace(/\/v1\/?$/, "");
 
   return {
-    endpoint: (envEndpoint || dbEndpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ""),
+    endpoint,
     defaultVoice: envVoice || dbVoice || DEFAULT_VOICE,
-    provider: (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase(),
+    provider,
     model: envModel || dbModel || DEFAULT_MODEL,
+    // 仅 openai 协议使用；留空表示目标服务免鉴权
+    apiKey: (envApiKey || dbApiKey || "").trim(),
   };
 }
 
@@ -232,11 +243,17 @@ async function callCosyVoice(config, text, voice, { stream = false, signal } = {
   return pcm;
 }
 
+// openai 协议的鉴权头：有 key 才带，避免给免鉴权服务发空 Authorization。
+// 注意：只把 header 交给 fetch，任何日志/错误信息都不许带出 apiKey。
+function openAiAuthHeaders(config) {
+  return config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {};
+}
+
 // OpenAI 兼容标准协议：JSON body + 音频字节（wav；服务商不支持时可在错误里带 hint）
 async function callOpenAi(config, text, voice, { signal } = {}) {
   const response = await fetch(`${config.endpoint}/v1/audio/speech`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...openAiAuthHeaders(config) },
     body: JSON.stringify({
       model: config.model,
       input: text,
@@ -466,7 +483,8 @@ async function handleOpenAiSpeech(request, response) {
 async function handleVoices(request, response) {
   const config = getTtsRuntimeConfig();
   if (config.provider === "openai") {
-    // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）
+    // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）。
+    // 这里不发任何上游请求，因此没有需要带 Authorization 的调用。
     sendJson(response, 200, { voices: [] });
     return;
   }
@@ -484,8 +502,12 @@ async function handleHealth(request, response) {
   const config = getTtsRuntimeConfig();
   // cosyvoice 用私有 /health；openai 标准协议无 health，用 /v1/models 探测可达性
   const probe = config.provider === "openai" ? "/v1/models" : "/health";
+  const headers = config.provider === "openai" ? openAiAuthHeaders(config) : {};
   try {
-    const res = await fetch(`${config.endpoint}${probe}`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${config.endpoint}${probe}`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
     if (!res.ok) throw new Error(`${probe} ${res.status}`);
     const data = await res.json().catch(() => ({}));
     sendJson(response, 200, { ok: true, container: data });
