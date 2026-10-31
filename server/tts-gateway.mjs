@@ -166,7 +166,10 @@ export function detectTextLang(text) {
   const ko = (raw.match(/[\uac00-\ud7af\u1100-\u11ff]/g) || []).length;
   const han = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
   const latin = (raw.match(/[A-Za-z]/g) || []).length;
-  const latinWords = (raw.match(/[A-Za-z][A-Za-z'’-]+/g) || []).length;
+  // 允许单字母成词：单字母词（I / U.S. 的 U 与 S / A）必须计入，
+  // 否则 "The U.S. deal"、"I agree wholeheartedly" 这类纯英文短句只数到 2 票 → 掉回 zh → 派中文音色。
+  // 放宽词形不会把中英夹杂打回 en：中英混说的闸是下面的 han/ja/ko === 0，有汉字就轮不到词数判定。
+  const latinWords = (raw.match(/[A-Za-z][A-Za-z'’-]*/g) || []).length;
   const yue = (raw.match(YUE_CHARS_RE) || []).length;
   const total = ja + ko + han + latin;
   if (total === 0) return "zh";

@@ -77,6 +77,17 @@ test("detectTextLang: 空串/纯标点/纯数字回退 zh", () => {
   assert.equal(detectTextLang("123 ，。！"), "zh");
 });
 
+test("detectTextLang: 单字母词（I / U.S. 的 U、S）计入拉丁词数", () => {
+  // 回归：旧词形 /[A-Za-z][A-Za-z'’-]+/ 要求至少两个字母，单字母词一票不算，
+  // 于是 "The U.S. deal" 只数到 The / deal = 2 < 3 → 误判 zh（纯英文短句被派中文音色）。
+  assert.equal(detectTextLang("The U.S. deal"), "en"); // The / U / S / deal = 4
+  assert.equal(detectTextLang("I agree wholeheartedly"), "en"); // I / agree / wholeheartedly = 3
+  assert.equal(detectTextLang("OK"), "zh"); // 单词仍然不算（阈值仍是 3）
+  // 下面两条证明「放宽词形」没有把中英夹杂打回 en（han/ja/ko === 0 的闸门先挡）
+  assert.equal(detectTextLang("我们 review 一下 PR 的 deploy 流程"), "zh");
+  assert.equal(detectTextLang("hello 你好"), "zh");
+});
+
 // ---------- splitSentences ----------
 
 test("splitSentences: 中文标点分句", () => {
