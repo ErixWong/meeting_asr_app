@@ -106,30 +106,37 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
 
 // ---------- 增量断句 ----------
 
-const SENTENCE_END_RE = /[。！？…；\n]+/g;
+// 中文标点 / 半角 !?; 直接断句；英文句点 . 先保护常见缩写（Mr. / U.S. / e.g. 等），
+// 再要求其前字符不是数字（避免 3.14 / v1.2.3）且后随空白/行尾时才断句。
+const ABBR_DOT = "\u0001";
+const ABBR_RE = /\b(?:Mr|Mrs|Ms|Dr|Prof|St|Sr|Jr|vs|etc|Inc|Ltd|Co|Corp|e\.g|i\.e|a\.m|p\.m|U\.S|U\.K)\./gi;
+const SENTENCE_END_RE = /[。！？…；!?;]|(?<![0-9])\.(?=\s|$)|[\n]+/g;
+
+function protectAbbreviations(text: string): string {
+  return text.replace(ABBR_RE, (m) => m.replace(/\.$/, ABBR_DOT));
+}
 
 /**
  * 从流式累积文本中提取完整句子（含结束标点）。
  * 返回完整句列表与残余（未成句的尾巴）。
  */
 export function extractCompleteSentences(buffer: string): { sentences: string[]; rest: string } {
+  const protectedBuffer = protectAbbreviations(buffer);
   const sentences: string[] = [];
-  let rest = buffer;
+  let rest = protectedBuffer;
   let match: RegExpExecArray | null;
-  let lastIndex = 0;
   SENTENCE_END_RE.lastIndex = 0;
   while ((match = SENTENCE_END_RE.exec(rest)) !== null) {
     const end = match.index + match[0].length;
     const sentence = rest.slice(0, end);
     // 过滤纯标点/空句
-    if (sentence.replace(/[。！？…；\s]/g, "").length > 0) {
-      sentences.push(sentence);
+    if (sentence.replace(/[。！？…；.!?;\s]/g, "").length > 0) {
+      sentences.push(sentence.replaceAll(ABBR_DOT, "."));
     }
     rest = rest.slice(end);
-    lastIndex = 0;
     SENTENCE_END_RE.lastIndex = 0;
   }
-  return { sentences, rest };
+  return { sentences, rest: rest.replaceAll(ABBR_DOT, ".") };
 }
 
 // ---------- TTS 播放队列 ----------

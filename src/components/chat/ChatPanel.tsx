@@ -27,6 +27,8 @@ export default function ChatPanel() {
   const [busy, setBusy] = useState(false);
   const [playerState, setPlayerState] = useState<"idle" | "playing">("idle");
   const [notice, setNotice] = useState("");
+  // 错误降级：TTS 容器健康状态（不可用时仅显示文字并提示）
+  const [ttsOk, setTtsOk] = useState<boolean | null>(null);
   const conversationIdRef = useRef<string>("");
   const playerRef = useRef<TtsPlayer | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -44,6 +46,22 @@ export default function ChatPanel() {
   useEffect(() => {
     listEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    // 进入对话页即探测 TTS 容器可用性（错误降级提示）
+    let cancelled = false;
+    fetch("/api/tts/health")
+      .then((res) => res.json())
+      .then((data: { ok?: boolean }) => {
+        if (!cancelled) setTtsOk(Boolean(data.ok));
+      })
+      .catch(() => {
+        if (!cancelled) setTtsOk(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -198,6 +216,7 @@ export default function ChatPanel() {
           <span>多轮语音对话</span>
           {busy && <span className="text-brand">· 生成中</span>}
           {playerState === "playing" && <span className="text-emerald-600">· 🔊 语音播放中</span>}
+          {ttsOk === false && <span className="text-rose-500">· TTS 服务不可用，仅显示文字</span>}
           {notice && <span className="text-amber-600">· {notice}</span>}
         </div>
         {messages.length > 0 && (
@@ -216,7 +235,12 @@ export default function ChatPanel() {
           <div className="mt-16 text-center text-sm text-slate-400">
             <p className="mb-2 text-2xl">🗣</p>
             <p>按住下方按钮说话，或输入文字与语音助手对话</p>
-            <p className="mt-1 text-xs">支持多轮上下文；回复会边生成边朗读（本地 TTS 合成）</p>
+            <p className="mt-1 text-xs">支持多轮上下文；回复会边生成边朗读（本地 TTS 合成，按语言自动选音色）</p>
+            {ttsOk === false && (
+              <p className="mt-2 inline-block rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-700">
+                ⚠ 语音合成服务（TTS）当前不可用，对话仍可进行但不会朗读回复
+              </p>
+            )}
           </div>
         )}
         {messages.map((item) => (

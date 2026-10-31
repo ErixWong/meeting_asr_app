@@ -8,16 +8,24 @@ services:
     image: node:24-slim
     working_dir: /app
     command: >
-      sh -c "test -f node_modules/next/package.json || npm ci --no-audit --no-fund;
+      sh -c "
+      if ! test -f node_modules/next/package.json; then
+        apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*;
+        npm ci --no-audit --no-fund;
+      fi;
       if ! test -f .next/BUILD_ID || find src server public tailwind.config.* postcss.config.* tsconfig.json -newer .next/BUILD_ID -print -quit | grep -q .; then npm run build; fi;
       exec node server/app-server.mjs"
     environment:
       PORT: 3123
       APP_HOST: 0.0.0.0
+      # 容器内通过 host.docker.internal 访问宿主机上的 llama.cpp/FunASR/声纹/TTS 容器端口
+      TTS_ENDPOINT: ${TTS_ENDPOINT:-http://host.docker.internal:8011}
       # 线上通过域名/IP 访问时，必须把实际 Origin 加进来，否则 WebSocket 握手被拒
       ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-http://localhost:3123}
       # 直接通过 HTTP 访问时必须为 false；HTTPS 反向代理部署时设为 true
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      # 反向代理身份透传（如 nginx auth_request / 统一登录），未设时禁用它
+      AUTH_PROXY_SHARED_SECRET: ${AUTH_PROXY_SHARED_SECRET:-}
       BOOTSTRAP_ADMIN_ACCOUNT: ${BOOTSTRAP_ADMIN_ACCOUNT:-admin}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-admin123}
       # 数据库类型：sqlite（默认，本地零配置）| mysql | mssql（连接外部实例）
@@ -31,6 +39,9 @@ services:
       DB_ENCRYPT: ${DB_ENCRYPT:-false}
     ports:
       - "3123:3123"
+    extra_hosts:
+      # 容器内访问宿主机映射端口的统一入口（llama.cpp 8008 / FunASR 10095 / 声纹 10097-98 / TTS 8011）
+      - "host.docker.internal:host-gateway"
     volumes:
       # 源码 bind mount
       - .:/app

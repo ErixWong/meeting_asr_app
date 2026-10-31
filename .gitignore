@@ -4,6 +4,7 @@ data/
 data.db-shm
 data.db-wal
 .docker/
+.env
 .env.local
 *.tsbuildinfo
 dev.err
