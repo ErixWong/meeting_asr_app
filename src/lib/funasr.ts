@@ -29,6 +29,10 @@ export class FunASRClient {
   private options: FunASROptions | null = null;
   private isRecording = false;
   private isPaused = false;
+  // 停止标志：startRecording / transcribeFile 可能卡在 getUserMedia / decodeAudioData /
+  // connectWebSocket 里，此时 stopRecording 看到的 mediaStream/ws 全是 null，什么都停不掉。
+  // 所以 stopRecording 置位它，启动流程在每个 await 之后检查并就地释放已拿到的资源。
+  private stopRequested = false;
   private sessionId: string = "";
   private captureSessionId: string = "";
   private audioBuffer: Float32Array[] = [];
@@ -47,7 +51,10 @@ export class FunASRClient {
     onProgress?: (progress: number) => void,
     lang?: string
   ): Promise<void> {
+    this.stopRequested = false; // 每次调用重置：上一次的取消不该影响这一次
     const arrayBuffer = await file.arrayBuffer();
+    if (this.stopRequested) return;
+
     const ctx = new AudioContext({ sampleRate: 16000 });
     if (ctx.state === "suspended") await ctx.resume();
 
@@ -56,6 +63,12 @@ export class FunASRClient {
 
     const resampled = this.resample(rawData, audioBuffer.sampleRate, 16000);
     const pcmData = this.convertFloat32ToInt16(resampled);
+
+    if (this.stopRequested) {
+      // 解码期间被取消：只释放已建好的 AudioContext，不再建 WS
+      void ctx.close().catch(() => {});
+      return;
+    }
 
     const wsUrl = this.getWebSocketUrl();
     console.log("[FunASR] Transcribing file, connecting to:", wsUrl);
@@ -66,69 +79,90 @@ export class FunASRClient {
 
     const totalChunks = Math.ceil(pcmData.length / 3200);
 
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("连接超时")), 15000);
-
-      ws.onopen = () => {
-        console.log("[FunASR] WebSocket opened, starting ASR session");
-        ws.send(JSON.stringify({
-          type: "session.start",
-          sessionId,
-          audio: {
-            format: "pcm",
-            sampleRate: 16000,
-          },
-          svsLang: lang ?? "auto",
-        }));
-      };
-
-      ws.onmessage = (event) => {
-        if (typeof event.data !== "string") return;
-        const msg = JSON.parse(event.data);
-
-        if (msg.type === "session.started") {
-          this.captureSessionId = msg.captureSessionId || "";
-          console.log("[FunASR] Session started, sending audio...");
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const settle = (error?: Error) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve();
+        };
+        const timeout = setTimeout(() => settle(new Error("连接超时")), 15000);
 
-          (async () => {
-            for (let i = 0; i < totalChunks; i++) {
-              const start = i * 3200;
-              const end = Math.min(start + 3200, pcmData.length);
-              const chunk = pcmData.slice(start, end);
-              ws.send(chunk.buffer);
-              onProgress?.(Math.floor((i / totalChunks) * 100));
-              await new Promise((r) => setTimeout(r, 20));
+        ws.onopen = () => {
+          console.log("[FunASR] WebSocket opened, starting ASR session");
+          ws.send(JSON.stringify({
+            type: "session.start",
+            sessionId,
+            audio: {
+              format: "pcm",
+              sampleRate: 16000,
+            },
+            svsLang: lang ?? "auto",
+          }));
+        };
+
+        ws.onmessage = (event) => {
+          if (typeof event.data !== "string") return;
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === "session.started") {
+            this.captureSessionId = msg.captureSessionId || "";
+            console.log("[FunASR] Session started, sending audio...");
+            clearTimeout(timeout);
+
+            (async () => {
+              for (let i = 0; i < totalChunks; i++) {
+                // 取消（stopRecording）后立即停推，已建的 ws/ctx 由 finally 释放
+                if (this.stopRequested) {
+                  settle();
+                  return;
+                }
+                const start = i * 3200;
+                const end = Math.min(start + 3200, pcmData.length);
+                const chunk = pcmData.slice(start, end);
+                ws.send(chunk.buffer);
+                onProgress?.(Math.floor((i / totalChunks) * 100));
+                await new Promise((r) => setTimeout(r, 20));
+              }
+              if (this.stopRequested) {
+                settle();
+                return;
+              }
+              console.log("[FunASR] All audio sent, finishing ASR session");
+              ws.send(JSON.stringify({
+                type: "session.finish",
+                sessionId,
+              }));
+            })();
+
+          } else if (msg.type === "transcript.partial" || msg.type === "transcript.final") {
+            if (msg.text) {
+              onResult(msg.text, msg.type === "transcript.final", msg.speakerId ?? null);
             }
-            console.log("[FunASR] All audio sent, finishing ASR session");
-            ws.send(JSON.stringify({
-              type: "session.finish",
-              sessionId,
-            }));
-          })();
-
-        } else if (msg.type === "transcript.partial" || msg.type === "transcript.final") {
-          if (msg.text) {
-            onResult(msg.text, msg.type === "transcript.final", msg.speakerId ?? null);
+          } else if (msg.type === "session.finished") {
+            console.log("[FunASR] Session finished");
+            settle();
+          } else if (msg.type === "session.failed") {
+            const errMsg = msg.error || "ASR session failed";
+            console.error("[FunASR] Session failed:", errMsg);
+            settle(new Error(errMsg));
           }
-        } else if (msg.type === "session.finished") {
-          console.log("[FunASR] Session finished");
-          resolve();
-        } else if (msg.type === "session.failed") {
-          const errMsg = msg.error || "ASR session failed";
-          console.error("[FunASR] Session failed:", errMsg);
-          reject(new Error(errMsg));
-        }
-      };
+        };
 
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        reject(new Error("无法连接到语音识别服务，请确认应用服务已启动 (npm run dev)"));
-      };
-    });
+        ws.onerror = () => {
+          settle(new Error("无法连接到语音识别服务，请确认应用服务已启动 (npm run dev)"));
+        };
 
-    ws.close();
-    ctx.close();
+        // 连接被关闭（取消 / 服务端中断）：结束等待，不让 Promise 悬挂到超时
+        ws.onclose = () => settle();
+      });
+    } finally {
+      ws.close();
+      void ctx.close().catch(() => {});
+    }
   }
 
   private resample(data: Float32Array, fromRate: number, toRate: number): Float32Array {
@@ -153,6 +187,7 @@ export class FunASRClient {
   }
 
   async startRecording(options: FunASROptions, deviceId?: string): Promise<void> {
+    this.stopRequested = false; // 每次启动重置：上一次的取消不该影响这一次
     this.options = options;
     this.sessionId = generateUUID();
     this.captureSessionId = "";
@@ -167,15 +202,36 @@ export class FunASRClient {
         };
         this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
       }
+      // 启动期间用户已松手（stopRecording）：就地停掉刚拿到的麦克风轨道并退出，不进采集
+      if (this.stopRequested) {
+        this.releaseResources();
+        return;
+      }
+
       this.audioContext = new AudioContext({ sampleRate: 16000 });
       if (this.audioContext.state === "suspended") {
         await this.audioContext.resume();
       }
+      if (this.stopRequested) {
+        this.releaseResources();
+        return;
+      }
 
       await this.connectWebSocket();
+      if (this.stopRequested) {
+        this.releaseResources();
+        return;
+      }
+
       this.startAudioCapture();
       this.isRecording = true;
     } catch (error) {
+      // 启动中途被 stopRecording() 打断（连接被关 / 等 session.started 期间取消）：
+      // 安静收尾，不弹错误、不进采集（否则用户看到「超时」而实际是自己松手了）
+      if (this.stopRequested) {
+        this.releaseResources();
+        return;
+      }
       this.options.onError(error as Error);
       throw error;
     }
@@ -217,9 +273,18 @@ export class FunASRClient {
       this.ws = new WebSocket(url);
       this.ws.binaryType = "arraybuffer";
 
+      let settled = false;
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        this.sessionStartedReject = null;
+        reject(error);
+      };
+
       const timeout = setTimeout(() => {
         this.options?.onError(new Error("连接超时：未收到 session.started"));
-        reject(new Error("timeout"));
+        fail(new Error("timeout"));
       }, 15000);
 
       this.ws.onopen = () => {
@@ -234,8 +299,14 @@ export class FunASRClient {
           hotWords: this.options?.hotWords ?? [],
           svsLang: this.options?.lang ?? "auto",
         }));
-        this.sessionStartedResolve = () => { clearTimeout(timeout); resolve(); };
-        this.sessionStartedReject = (err) => { clearTimeout(timeout); reject(err); };
+        this.sessionStartedResolve = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          resolve();
+        };
+        // 允许 stopRecording() 在启动阶段直接结束等待（否则要干等 15s 超时）
+        this.sessionStartedReject = fail;
       };
 
       this.ws.onmessage = (event) => {
@@ -245,20 +316,20 @@ export class FunASRClient {
       };
 
       this.ws.onerror = (error) => {
-        clearTimeout(timeout);
         console.error("[FunASR] WebSocket error:", error);
         this.options?.onError(new Error("WebSocket connection failed"));
-        reject(error);
+        fail(error instanceof Error ? error : new Error("WebSocket connection failed"));
       };
 
       this.ws.onclose = (event) => {
-        clearTimeout(timeout);
         console.log("[FunASR] WebSocket closed:", event.code, event.reason);
         this.options?.onStatusChange?.("disconnected");
         if (this.sessionFinishedResolve) {
           this.sessionFinishedResolve();
           this.sessionFinishedResolve = null;
         }
+        // 启动阶段就被关掉（用户松手 / 页面卸载 / 服务不可用）：结束等待，不留悬挂 Promise
+        fail(new Error("连接已关闭"));
       };
     });
   }
@@ -415,18 +486,14 @@ export class FunASRClient {
     });
   }
 
-  async stopRecording(): Promise<void> {
-    this.isRecording = false;
-
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "session.finish", sessionId: this.sessionId }));
-
-      await this.waitForSessionFinished(3000);
-    }
-
+  /**
+   * 释放所有已持有的音频/连接资源（幂等）。
+   * 启动阶段被打断时用它，避免麦克风轨道/AudioContext/WS 泄漏。
+   */
+  private releaseResources(): void {
     this.scriptProcessor?.disconnect();
     this.sourceNode?.disconnect();
-    this.audioContext?.close();
+    if (this.audioContext) void this.audioContext.close().catch(() => {});
     this.mediaStream?.getTracks().forEach((track) => track.stop());
     this.ws?.close();
 
@@ -439,6 +506,26 @@ export class FunASRClient {
     this.audioBufferStartSample = 0;
     this.sessionFinishedResolve = null;
     this.sessionStarted = false;
+    this.isRecording = false;
+  }
+
+  async stopRecording(): Promise<void> {
+    // 先置取消标志：startRecording 可能还卡在 getUserMedia / connectWebSocket 里，
+    // 那一刻 mediaStream/ws 可能是 null（光置 isRecording 停不掉任何东西），
+    // 标志置位后 startRecording 会在下一个 await 后自行释放已拿到的资源。
+    this.stopRequested = true;
+    this.isRecording = false;
+    // 若 startRecording 正等 session.started，立刻结束等待（否则要干等 15s 超时）
+    this.sessionStartedReject?.(new Error("启动已取消"));
+    this.sessionStartedReject = null;
+
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "session.finish", sessionId: this.sessionId }));
+
+      await this.waitForSessionFinished(3000);
+    }
+
+    this.releaseResources();
   }
 }
 
