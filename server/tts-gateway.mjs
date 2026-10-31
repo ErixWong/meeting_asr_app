@@ -142,23 +142,30 @@ export function splitSentences(text) {
 // 常见粤语用字（用于把粤语回复映射到粤语女声）
 const YUE_CHARS_RE = /[唔嘅咗喺哋喇噉㗎啲乜嘢嚟]/g;
 
-/** 简单语言检测：ja / ko / yue / en / zh（按字符占比，返回保守结果） */
+/**
+ * 简单语言检测：ja / ko / yue / en / zh（保守判定，宁可判 zh 也不乱切音色）
+ *
+ * 为什么按「拉丁词数」而不是字符数算英文占比：中文一字一票、英文一词五六票，
+ * 按字符算时「我们 review 一下 PR 的 deploy 流程」会被判成 en（M4 主卖点是中英混说）。
+ * 所以 en 只在「零汉字、零假名、零韩文」且拉丁词数 >= 3 时成立，其余一律 zh。
+ */
 export function detectTextLang(text) {
   const raw = String(text ?? "");
   const ja = (raw.match(/[\u3040-\u30ff\u31f0-\u31ff]/g) || []).length;
   const ko = (raw.match(/[\uac00-\ud7af\u1100-\u11ff]/g) || []).length;
   const han = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
   const latin = (raw.match(/[A-Za-z]/g) || []).length;
+  const latinWords = (raw.match(/[A-Za-z][A-Za-z'’-]+/g) || []).length;
   const yue = (raw.match(YUE_CHARS_RE) || []).length;
   const total = ja + ko + han + latin;
   if (total === 0) return "zh";
   const jaRatio = ja / total;
   const koRatio = ko / total;
-  const latinRatio = latin / total;
   if (jaRatio > 0.2) return "ja";
   if (koRatio > 0.2) return "ko";
-  if (latinRatio > 0.6) return "en";
   if (yue > 0 && han > 0 && yue / han > 0.03) return "yue";
+  // 纯拉丁（无汉字/假名/韩文）且至少 3 个词才算英文；中英夹杂一律 zh
+  if (han === 0 && ja === 0 && ko === 0 && latinWords >= 3) return "en";
   return "zh";
 }
 
