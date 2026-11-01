@@ -28,6 +28,17 @@ import {
   requireNonEmpty,
 } from "@/lib/store-utils";
 import { llmQueue, setLlmQueueConfigReader } from "@/lib/llm-queue";
+import {
+  AiTitleError,
+  TITLE_FALLBACK_TITLE,
+  TITLE_RESULT_TYPE,
+  TITLE_TEMPLATE_CONTENT,
+  TITLE_TEMPLATE_ID,
+  TITLE_TEMPLATE_KEY,
+  buildTitlePrompt,
+  ensureTitleTemplate,
+  sanitizeMeetingTitle,
+} from "@/lib/ai-title";
 
 type SettingRow = {
   itemSection: string;
@@ -936,6 +947,13 @@ function seedDefaults(database: DatabaseSync) {
     status: "active",
     isSystem: true,
   });
+
+  // feat-261101-04（#44）：tpl-title **无条件**确保存在。
+  // 上面 tpl-1/tpl-2 的种子包在 `if (templateCount === 0)` 里，老库（已有任意模板）
+  // 那一整块不会跑 —— 只靠种子会拿不到标题模板。语义与 tpl-translate 的覆盖式 upsert
+  // 不同：**已有同名模板（id=tpl-title 或 template_key=system_title）就不覆盖**
+  // （用户可能改过内容），缺失才插入。见 src/lib/ai-title.ts ensureTitleTemplate。
+  ensureTitleTemplate(database, nowIso());
 }
 
 function insertMissingSetting(database: DatabaseSync, setting: SettingRow) {
@@ -2756,7 +2774,7 @@ export function listMeetings() {
         (
           SELECT result_markdown
           FROM meeting_llm_results lr
-          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type != 'translation'
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type NOT IN ('translation', 'title')
           ORDER BY lr.version_no DESC, lr.created_at DESC
           LIMIT 1
         ) as summary
@@ -2792,7 +2810,7 @@ function queryMeetingRowById(id: string) {
         (
           SELECT result_markdown
           FROM meeting_llm_results lr
-          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type != 'translation'
+          WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type NOT IN ('translation', 'title')
           ORDER BY lr.version_no DESC, lr.created_at DESC
           LIMIT 1
         ) as summary
@@ -2917,7 +2935,7 @@ function listMeetingLlmResultsByMeetingId(meetingId: string) {
         error_message as errorMessage,
         created_at as createdAt
       FROM meeting_llm_results
-      WHERE meeting_id = ?
+      WHERE meeting_id = ? AND result_type <> 'title'
       ORDER BY version_no DESC, created_at DESC
     `)
     .all<MeetingLlmResultRow>(meetingId);
@@ -2990,7 +3008,7 @@ export function listMeetingLlmResultSummaries(meetingId: string) {
         error_message as errorMessage,
         created_at as createdAt
       FROM meeting_llm_results
-      WHERE meeting_id = ?
+      WHERE meeting_id = ? AND result_type <> 'title'
       ORDER BY version_no DESC, created_at DESC
     `)
     .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "generationConfigSnapshot" | "errorMessage" | "createdAt">>(meetingId);
@@ -3104,6 +3122,21 @@ function llmRequest(
     req.end();
   });
 }
+
+type LlmTransport = typeof llmRequest;
+
+/**
+ * LLM 传输层注入口（feat-261101-04 / #44）。
+ *
+ * 默认真实 `llmRequest`（原生 http/https）；`scripts/ai-title-test.mjs` 用它在
+ * 不联网、不写死模型名/API key 的前提下跑完整链路（真实 sqlite + 真实队列 + 真实记账）。
+ * 传 `null` 恢复真实传输。**除测试外不要调用。**
+ */
+export function setLlmTransport(transport: LlmTransport | null) {
+  llmTransport = transport ?? llmRequest;
+}
+
+let llmTransport: LlmTransport = llmRequest;
 
 export function claimMeetingLlmGeneration(meetingId: string):
   { ok: true } | { ok: false; status: 404 | 409; error: string } {
@@ -3587,6 +3620,261 @@ function insertMeetingLlmResult(row: MeetingLlmResultRow) {
       row.errorMessage,
       nowIso()
     );
+}
+
+// ---------------------------------------------------------------------------
+// 会议 AI 标题（feat-261101-04 / GitHub #44）
+//
+// 链路：POST /api/meetings/[id]/ai-title → generateMeetingTitle
+//   → llmQueue.enqueue("title") → 取正文 → 窗口截断 → llmTransport（默认真实 http）
+//   → 清洗 → **同一个事务**内：UPDATE meetings.title + 插 meeting_llm_results 行 + 审计
+//
+// 设计取舍（见 docs/design/ai-title.md）：
+//   * 不走 `claimMeetingLlmGeneration`：那会把会议状态推到 `llm_processing`，
+//     而改标题不属于转写/生成生命周期，会跟「生成纪要」抢状态、在列表里闪「生成中」；
+//     并发点击的要求是「后者覆盖前者」，claim 反而会 409 把后者拒掉。
+//   * 失败不改标题、只落一条 status=failed 的记账行 + 审计（无半更新状态）。
+// ---------------------------------------------------------------------------
+
+export type MeetingTitleGeneration = {
+  title: string;
+  previousTitle: string;
+  llmResultId: string;
+  /** 与列表/详情**同一个投影函数**产出的会议对象（前端拿它同时更新列表行与详情） */
+  meeting: ReturnType<typeof getMeetingLightById>;
+  promptChars: number;
+  transcriptChars: number;
+  sentChars: number;
+  truncated: boolean;
+};
+
+export async function generateMeetingTitle(meetingId: string): Promise<MeetingTitleGeneration> {
+  // 沿用既有 llm 队列（并发上限/容量/排队超时都在队列里），任务类型 "title"
+  return llmQueue.enqueue("title", () => generateMeetingTitleInner(meetingId));
+}
+
+async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitleGeneration> {
+  if (!ensureMeetingOwned(meetingId)) {
+    throw new AiTitleError("Meeting not found", 404);
+  }
+
+  const previousTitle = String(queryMeetingRowById(meetingId)?.title ?? "").trim() || TITLE_FALLBACK_TITLE;
+  const transcript = getMergedMeetingTranscript(meetingId);
+  if (!transcript.trim()) {
+    throw new AiTitleError("会议还没有转写内容，无法生成标题", 409);
+  }
+
+  const settings = listSettings();
+  const get = (section: string, mark: string) =>
+    settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
+
+  const baseUrl = get("llm", "base_url");
+  const apiKey = get("llm", "api_key");
+  const model = get("llm", "model");
+  if (!baseUrl || !model) {
+    throw new AiTitleError("LLM config incomplete", 500);
+  }
+
+  // 模板可能被用户改过 → 优先用库里的。
+  // 若库里根本没有标题模板（老库种子没跑到 / 被删），运行期再补一次：
+  // `ensureTitleTemplate` 幂等（已有就不覆盖），而 `meeting_llm_results.prompt_template_id`
+  // 是 NOT NULL + 外键，记账行必须有真实模板 id 才能落库。
+  const findTitleTemplate = () =>
+    listPromptTemplates().find(
+      (item) => item.templateKey === TITLE_TEMPLATE_KEY || item.id === TITLE_TEMPLATE_ID
+    );
+  let template = findTitleTemplate();
+  if (!template) {
+    ensureTitleTemplate(getDb(), nowIso());
+    template = findTitleTemplate();
+  }
+  const built = buildTitlePrompt(template?.content || TITLE_TEMPLATE_CONTENT, transcript);
+  const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
+  const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 120_000;
+  const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
+  const startedAt = Date.now();
+  // 记账快照（与纪要同一个口径：baseUrl/model/参数；**不含 api_key**）
+  const generationConfigSnapshot = JSON.stringify({
+    source: "ai_title",
+    baseUrl,
+    model,
+    maxTokens,
+    timeoutMs,
+    templateId: template?.id ?? null,
+    transcriptChars: built.totalChars,
+    sentChars: built.sentChars,
+    truncated: built.truncated,
+  });
+
+  let rawText = "";
+  let title = "";
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response: { status: number; text: string };
+    try {
+      response = await llmTransport(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: "你是一个专业的会议标题助手。" },
+            { role: "user", content: built.prompt },
+          ],
+          temperature: 0.3,
+          ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
+          ...buildDisableThinkingParams(),
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    console.log(
+      `[LLM] title: meeting=${meetingId} status=${response.status} transcriptChars=${built.totalChars} ` +
+        `sentChars=${built.sentChars} truncated=${built.truncated} elapsed=${Date.now() - startedAt}ms`
+    );
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`LLM API error: ${response.status} ${String(response.text ?? "").slice(0, 500)}`);
+    }
+
+    rawText = String(response.text ?? "");
+    if (!rawText.trim()) {
+      throw new Error("LLM returned empty body");
+    }
+
+    let parsed: { choices?: Array<{ message?: Record<string, unknown> }> };
+    try {
+      parsed = JSON.parse(rawText) as typeof parsed;
+    } catch (parseError) {
+      throw new Error(`LLM returned non-JSON body (${String(parseError).slice(0, 200)})`);
+    }
+
+    const content = stripLeadingThinking(String(parsed.choices?.[0]?.message?.content ?? "").trim());
+    if (!content.trim()) {
+      throw new Error("LLM returned empty title");
+    }
+    // 清洗是硬要求：引号/换行/首尾标点/超长/空 都在 sanitizeMeetingTitle 里收口，
+    // 空兜底用会议原名（绝不允许把会议名改成空串）。
+    title = sanitizeMeetingTitle(content, previousTitle);
+  } catch (error) {
+    const elapsedMs = Date.now() - startedAt;
+    const isTimeout = error instanceof Error && error.name === "AbortError";
+    const baseMessage = isTimeout
+      ? `LLM timeout after ${timeoutMs}ms`
+      : error instanceof Error
+        ? error.message
+        : "LLM title generation failed";
+    const errorMessage = `${baseMessage} (elapsed=${elapsedMs}ms)`;
+    console.error(`[LLM] title failed: meeting=${meetingId} error=${errorMessage}`);
+
+    withTransaction(() => {
+      const row: MeetingLlmResultRow = {
+        id: newId("llm"),
+        meetingId,
+        inputTranscriptSnapshot: transcript,
+        llmSettingMark: "current",
+        promptTemplateId: template?.id ?? TITLE_TEMPLATE_ID,
+        generationConfigSnapshot,
+        generationMode: "manual_regenerate",
+        status: "failed",
+        versionNo: getNextLlmVersionNo(meetingId),
+        resultType: TITLE_RESULT_TYPE,
+        resultTitle: previousTitle,
+        rawPrompt: built.prompt,
+        rawResponse: rawText.slice(0, 4000),
+        resultMarkdown: "",
+        errorMessage,
+      };
+      insertMeetingLlmResult(row);
+      writeAuditLog({
+        actionType: "llm.title",
+        resourceType: "meeting",
+        resourceId: meetingId,
+        resourceName: previousTitle,
+        result: "failed",
+        errorMessage,
+        afterSnapshot: {
+          llmResultId: row.id,
+          versionNo: row.versionNo,
+          status: "failed",
+          transcriptChars: built.totalChars,
+          sentChars: built.sentChars,
+          truncated: built.truncated,
+        },
+      });
+    });
+
+    if (error instanceof AiTitleError) throw error;
+    throw new AiTitleError(errorMessage, 502);
+  }
+
+  return withTransaction(() => {
+    const database = getDb();
+    const updatedAt = nowIso();
+    // 改名 + 记账在同一个事务里：要么都生效、要么都不发生（不留半更新状态）。
+    // 并发点击时 title 是单条 UPDATE，天然原子，后者覆盖前者。
+    database
+      .prepare("UPDATE meetings SET title = ?, updated_at = ? WHERE id = ?")
+      .run(title, updatedAt, meetingId);
+
+    const row: MeetingLlmResultRow = {
+      id: newId("llm"),
+      meetingId,
+      inputTranscriptSnapshot: transcript,
+      llmSettingMark: "current",
+      promptTemplateId: template?.id ?? TITLE_TEMPLATE_ID,
+      generationConfigSnapshot,
+      generationMode: "manual_regenerate",
+      status: "succeeded",
+      versionNo: getNextLlmVersionNo(meetingId),
+      resultType: TITLE_RESULT_TYPE,
+      resultTitle: title,
+      rawPrompt: built.prompt,
+      rawResponse: rawText.slice(0, 4000),
+      resultMarkdown: title,
+      errorMessage: null,
+    };
+    insertMeetingLlmResult(row);
+
+    writeAuditLog({
+      actionType: "llm.title",
+      resourceType: "meeting",
+      resourceId: meetingId,
+      resourceName: title,
+      beforeSnapshot: { title: previousTitle },
+      afterSnapshot: {
+        llmResultId: row.id,
+        versionNo: row.versionNo,
+        title,
+        status: "succeeded",
+        transcriptChars: built.totalChars,
+        sentChars: built.sentChars,
+        truncated: built.truncated,
+      },
+    });
+
+    // 返回**与列表/详情同一个投影函数**的会议对象（#43 R2 教训：两处不能各拼一套）
+    const meeting = getMeetingLightById(meetingId);
+    return {
+      title,
+      previousTitle,
+      llmResultId: row.id,
+      meeting,
+      promptChars: built.prompt.length,
+      transcriptChars: built.totalChars,
+      sentChars: built.sentChars,
+      truncated: built.truncated,
+    };
+  });
 }
 
 export function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
