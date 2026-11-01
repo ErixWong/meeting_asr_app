@@ -90,11 +90,22 @@
 - ⚠ SQLite 的 `lower()` **只折叠 ASCII**：`LOWER('Ä')` → `'Ä'`（不变），而 mysql/mssql 会折叠成 `'ä'`。**中文不受影响**（`LOWER('管理员')` 三库都返回 `'管理员'`），所以 `LOWER()` 方案对中文检索安全，对非 ASCII 拉丁字母（德语/北欧姓名）仍不一致——需要精确检索时应改用 `COLLATE` 方案或应用侧规范化。
 - 本单**不改业务 SQL**（SQLite 现网行为必须逐条不变），只记录差异 + 留断言。
 
-### 4.6 已知缺口：嵌套事务在 sqlite/mysql 的 savepoint 分支
+### 4.6 已知缺口：#55 必须一并解决的「实例级事务状态」
 
-- 现象（独立缺陷，**本单不修**，归 #55）：嵌套 `withTransaction` 在 sqlite/mysql 上走 `SAVEPOINT sp_N` / `ROLLBACK TO SAVEPOINT sp_N` 分支，已知会报 `ROLLBACK TO SAVEPOINT sp_1 - no such savepoint`；根因方向是 `AsyncDb._txDepth` 为**实例级**状态、savepoint 名只由深度决定。
+`AsyncDb` 的事务状态是**实例级可变状态**，同一实例上并发开事务会互踩。本单登记两条，**都不修**（归 #55）：
+
+#### 4.6.1 嵌套事务在 sqlite/mysql 的 savepoint 分支
+
+- 现象（独立缺陷）：嵌套 `withTransaction` 在 sqlite/mysql 上走 `SAVEPOINT sp_N` / `ROLLBACK TO SAVEPOINT sp_N` 分支，已知会报 `ROLLBACK TO SAVEPOINT sp_1 - no such savepoint`；根因方向是 `AsyncDb._txDepth` 为**实例级**状态、savepoint 名只由深度决定。
 - 本单的取证边界：在 sqlite 上试了两种形态——① 内层抛错被外层吞掉（结果 `rows=[1,3]`，符合预期）；② 内层抛错穿透（整体回滚，符合预期）——**两种都正常**，缺陷的精确复现条件尚未收敛，需要 #55 重新定位。
 - 因此：**嵌套事务的断言只在 mssql 上跑**（mssql 分支已改走 `knex.transaction()`，提交/回滚语义必须真测，见 §6）。sqlite/mysql 的嵌套语义**未覆盖**，不要当成已验证。
+
+#### 4.6.2 mssql 分支的 `this.knex = trx` 与 `_txDepth` 同属实例级状态（并发即互踩）
+
+- 本单为修 `Msg 266`（§4.3）在 `server/db/async-db.mjs:92-116` 引入的实现是：事务期间把 `this.knex` 指向 `trx`、退出时指回 `outerKnex`，配合原有的 `this._txDepth` 计数。**两者都是实例级可变状态**，与 4.6.1 是同一性质的缺陷。
+- 触发条件（**不报错，只是语义错**，所以比崩溃更危险）：同一个 `AsyncDb` 实例上**并发**发起两个 `withTransaction`（例如 `Promise.all([db.withTransaction(a), db.withTransaction(b)])`，或共享单例 `AsyncDb` 的两个请求同时开事务）。后进入者会把 `this.knex` 改写成自己的 `trx`，先退出者又会把它指回**自己的** `outerKnex`——期间某些语句可能落在**事务之外**（自动提交），而调用方拿到的仍然是「成功」，`_txDepth` 也会被先退出者清零，导致嵌套判定错位。
+- 现状：本单的所有用例都是**串行**使用（`initializeSchema` 有 single-flight 保护，`db-schema-test` 的并发场景走的是两条独立连接/独立实例），因此**该并发形态没有被断言覆盖**——不要把它当成已验证。
+- 归 #55：正解是把事务句柄（`trx`）作为参数/上下文显式传递，而不是存在实例字段上；届时 4.6.1 与 4.6.2 应一并解决（同一根因：实例级事务状态）。
 
 ## 5. 裸 SQL 分布与方言点逐条
 
@@ -156,7 +167,12 @@ npm run db:test-parity
 # 单方言
 npm run db:test-semantic                     # 语义锁（默认 sqlite）
 DB_TYPE=mssql DB_HOST=... DB_USER=sa DB_PASSWORD=... npm run db:test-schema -- --dialect
+
+# 确认要放行 SKIP（例如本机暂时没有 mssql 靶子）
+npm run db:test-parity -- --allow-skip
 ```
+
+**参数只有三个**：`--matrix` / `--dialect` / `--allow-skip`。**未知参数不会被静默忽略**——直接报错退出（退出码 2）并打印可用参数列表（此前传 `--strict` 会什么都不发生，属于「沉默成功」类缺陷，已修）。
 
 - 宿主机 node 是 v22，跑不了 `node:sqlite` → 一律在 `node:24-slim` 容器里跑（完整命令见 `docs/tasks/active/feat-261101-03-db-dialect-parity-phase1/report.md`）。
 - **容器到宿主的可达性**：mssql 发布在 `0.0.0.0:1433`，容器用 `--add-host=host.docker.internal:host-gateway` + `host.docker.internal:1433`；**mariadb 只发布在 `127.0.0.1:3306`（loopback-only），`host.docker.internal` 打不通**，容器必须挂到 `prod` 网络并用容器名 `mariadb:3306`。
@@ -169,7 +185,10 @@ DB_TYPE=mssql DB_HOST=... DB_USER=sa DB_PASSWORD=... npm run db:test-schema -- -
 | mariadb 11.7 | 基线建表 → 建索引 → 迁移 → 记账单行 → 二次幂等 → v3/v4 迁移循环 | A/B/C 共 11 项 |
 | SQL Server 2025 | 同上 + 嵌套事务提交/回滚 | A/B/C 共 11 项 |
 
-- **SKIP 语义**：目标库不可达（连接被拒/认证失败）时，子进程打印 `SKIP: <原因>` 并以退出码 3 结束，矩阵汇总里显示 `⏭` 与原因，**不会静默算通过**。SKIP 不改变矩阵退出码（0），但会打印「存在 SKIP 项…未覆盖的方言不算通过」。
+- **SKIP 语义（默认严格）**：目标库不可达（连接被拒/认证失败）时，子进程打印 `SKIP: <原因>` 并以退出码 3 结束；矩阵汇总里显示 `⏭` 与原因，**并且退出码非 0**（`[matrix] ❌ 存在 SKIP 项，未覆盖的方言不算通过`，同时列出被跳过的具体项）。
+  - 为什么必须这样：外部靶子偶发不可达时，矩阵会打出 `PASS 2 / SKIP 4 / FAIL 0` —— 若退出码为 0，CI 会「绿着过关」但**实际只测了 sqlite**，是最难发现的沉默成功。默认严格就是为了掐死这一形态。
+  - 确需放行（本机暂时没有 mssql/mariadb 靶子）：显式追加 `--allow-skip`，此时退出码 0，汇总行改为 `⏭ 存在 SKIP 项，已由 --allow-skip 显式放行`。
+  - 矩阵**不向子进程透传 `--allow-skip`**：子进程的 SKIP 永远以退出码 3 上报，避免被误判成 PASS。
 - **安全边界**：mysql/mssql 目标只允许建/删 `meeting_asr_ci_*` 一次性库（`assertSafeDbName()` 强制前缀，越界直接抛错），跑完 `DROP DATABASE`。
 
 ## 7. 待办边界（#54 / #55）
@@ -187,5 +206,5 @@ DB_TYPE=mssql DB_HOST=... DB_USER=sa DB_PASSWORD=... npm run db:test-schema -- -
 2. `INSERT OR IGNORE` 3 处 → 同上。
 3. `PRAGMA table_info` 5 处 → `listTableColumns()`。
 4. 大小写语义落地：按 §4.4 给 `account_name` 等敏感列声明二进制排序规则（或在应用侧规范化账号名），并把 `LIKE` 检索改 `LOWER()` 方案（§4.5）。
-5. **嵌套 savepoint 缺陷**（§4.6）定位与修复。
+5. **实例级事务状态**（§4.6，两条同根因，必须一并解决）：① sqlite/mysql 的嵌套 savepoint 缺陷；② mssql 分支的 `this.knex = trx` / `_txDepth` 在并发事务下互踩（语句可能落在事务之外且不报错）。正解是把 `trx` 显式传递而不是存实例字段。
 6. 三库 CI：把 `npm run db:test-parity` 接进流水线（需要能起 mariadb/mssql 的 runner）。
