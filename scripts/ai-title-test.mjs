@@ -711,3 +711,61 @@ test("T10 标题模板被删 → 生成链路运行期补回，不因外键挂�
   store.setLlmTransport(null);
   console.log("[T10] 模板缺失自愈 OK");
 });
+
+// ---------------------------------------------------------------------------
+// T11 toast 撤销条必须「不自动消失」（feat-261101-04 R2 修 UX 缺陷）
+//
+// 背景（真机实测）：普通提示 3500ms 自动消失（浏览器里实测「撤销」条只存活 3509ms），
+// 而真实 LLM 调用延迟 4.2s～13.3s 浮动 —— 用户很可能根本没看见撤销条，
+// 「toast 允许一次撤销」就只是个装饰。修法：带 action 的 notice 不注册自动消失定时器。
+//
+// 断言（源码级，不起浏览器）：
+//   1. 自动消失的 useEffect 里，`notice.action` 的短路必须在 `window.setTimeout` **之前**；
+//   2. error/success 的原时长不变（7000 / 3500）；
+//   3. 撤销动作把 notice 换成**不带 action** 的普通提示（一次性撤销，不给第二次入口）。
+// ---------------------------------------------------------------------------
+
+test("T11 toast 撤销条：带 action 的提示不自动消失，撤销后降级为普通提示", () => {
+  const pageSource = readFileSync(join(repoRoot, "src", "app", "page.tsx"), "utf-8");
+
+  // 1) 自动消失 effect：action 短路在注册定时器之前
+  const autoDismiss = sliceBetween(
+    pageSource,
+    "    if (!notice) return;\n\n    // feat-261101-04（#44）R2",
+    "  }, [notice]);",
+    "page.tsx"
+  );
+  const guardAt = autoDismiss.indexOf("if (notice.action) return;");
+  const timerAt = autoDismiss.indexOf("window.setTimeout(");
+  assert.ok(guardAt >= 0, "自动消失的 effect 必须有 `if (notice.action) return;` 短路");
+  assert.ok(timerAt >= 0, "普通提示仍要自动消失（保留 window.setTimeout）");
+  assert.ok(guardAt < timerAt, "action 短路必须在注册定时器之前（否则撤销条照样 3.5s 消失）");
+  assert.match(autoDismiss, /notice\.type === "error" \? 7000 : 3500/, "error/success 原时长不许改");
+
+  // 2) 撤销动作：先换掉带 action 的提示，结果一律不带 action
+  const undoBody = sliceBetween(
+    pageSource,
+    "const handleUndoAiTitle = useCallback(",
+    "const handleGenerateAiTitle",
+    "page.tsx"
+  );
+  assert.doesNotMatch(undoBody, /action:/, "撤销链路不许再挂 action（一次性撤销，不给第二次入口）");
+  assert.match(undoBody, /setNotice\(\{ type: "info", message: "正在撤销…" \}\)/, "点撤销先摘掉按钮（防连点）");
+  assert.match(undoBody, /setNotice\(\{ type: "success", message: `已撤销/, "撤销成功要换成普通提示");
+  assert.match(undoBody, /setNotice\(\{ type: "error", message: "撤销失败" \}\)/, "撤销失败也要换成普通提示");
+
+  // 3) 只有 AI 标题成功路径挂 action
+  const generateBody = sliceBetween(
+    pageSource,
+    "const handleGenerateAiTitle = useCallback(",
+    "// R2 修 F2",
+    "page.tsx"
+  );
+  assert.equal(
+    (generateBody.match(/action:/g) ?? []).length,
+    1,
+    "AI 标题成功路径只应挂一个 action（撤销）"
+  );
+  assert.match(generateBody, /label: "撤销"/);
+  console.log("[T11] toast 撤销条不自动消失 + 撤销后降级 OK");
+});

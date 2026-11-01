@@ -675,6 +675,13 @@ export default function MeetingPage() {
   useEffect(() => {
     if (!notice) return;
 
+    // feat-261101-04（#44）R2：**带 action 的提示不参与自动消失**。
+    // 真实 LLM 延迟实测 4.2s～13.3s 浮动，而普通提示 3.5s 就自己没了 —— 撤销入口会变成装饰
+    // （浏览器实测「撤销」条只存活 3509ms，用户很可能根本没看见）。
+    // 只有用户点「撤销」/「关闭」才消失；撤销之后 notice 被换成**不带 action** 的普通提示，
+    // 那时按原时长（error 7000ms / 其余 3500ms）自动消失 —— 一次性撤销，不给第二次入口。
+    if (notice.action) return;
+
     const timer = window.setTimeout(() => {
       setNotice(null);
     }, notice.type === "error" ? 7000 : 3500);
@@ -1308,6 +1315,8 @@ export default function MeetingPage() {
 
   const handleUndoAiTitle = useCallback(
     async (meetingId: string, previousTitle: string) => {
+      // 先换掉带 action 的提示：既给反馈，也顺手把「撤销」按钮摘掉（防连点导致第二次撤销入口）
+      setNotice({ type: "info", message: "正在撤销…" });
       try {
         const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`, {
           method: "PATCH",
@@ -1315,6 +1324,7 @@ export default function MeetingPage() {
           body: JSON.stringify({ title: previousTitle }),
         });
         if (data.meeting) applyMeetingProjection(data.meeting);
+        // 撤销结果一律是**不带 action** 的普通提示 → 按原时长自动消失（一次性撤销）
         setNotice({ type: "success", message: `已撤销，标题恢复为「${previousTitle}」` });
       } catch (error) {
         console.error("Failed to undo ai title:", error);
