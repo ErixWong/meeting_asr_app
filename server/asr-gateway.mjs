@@ -12,19 +12,40 @@ import {
 } from "./runtime-store.mjs";
 import { createRecorder } from "./audio-recorder.mjs";
 import { enqueueAudioTranscode } from "./audio-transcode.mjs";
+import {
+  describeAsrOriginDecision,
+  evaluateAsrOrigin,
+  resolveAllowedOrigins,
+} from "./asr-origin.mjs";
 
 const APP_PORT = Number(process.env.PORT || 3123);
-const DEFAULT_ALLOWED_ORIGINS = `http://localhost:${APP_PORT},http://127.0.0.1:${APP_PORT}`;
-const allowedOrigins = new Set(
-  (process.env.ASR_GATEWAY_ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS)
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean)
-);
 
-function isAllowedClientOrigin(req) {
-  const origin = req.headers.origin;
-  return typeof origin === "string" && allowedOrigins.has(origin);
+/**
+ * 生效白名单（issue #61）。
+ *
+ * env 是热读的：按原始字符串做一次记忆化，值没变就不重复解析。这样
+ * 「改了 env 不用重启」且单测可以在同一进程里换白名单跑真实握手。
+ * env 为空时回落到网关内置的两值默认（localhost + 127.0.0.1），
+ * 与 `docker-compose.yml` 的留空默认配合，避免单值默认把内置默认整个覆盖掉。
+ */
+let allowedOriginsCache = { raw: undefined, list: resolveAllowedOrigins(undefined, { appPort: APP_PORT }) };
+function currentAllowedOrigins() {
+  const raw = process.env.ASR_GATEWAY_ALLOWED_ORIGINS;
+  if (raw !== allowedOriginsCache.raw) {
+    allowedOriginsCache = { raw, list: resolveAllowedOrigins(raw, { appPort: APP_PORT }) };
+  }
+  return allowedOriginsCache.list;
+}
+
+/** 判定一次握手的 Origin（纯函数在 asr-origin.mjs，这里只负责取白名单与日志）。 */
+function checkClientOrigin(req, { log = false } = {}) {
+  const result = evaluateAsrOrigin({
+    origin: req.headers.origin,
+    host: req.headers.host,
+    allowedOrigins: currentAllowedOrigins(),
+  });
+  if (log) console.log(`[ASR Gateway] Origin accepted: ${describeAsrOriginDecision(result)}`);
+  return result;
 }
 
 function readCookie(req, name) {
@@ -282,8 +303,10 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   const wss = new WebSocketServer({ noServer: true });
 
   wss.on("connection", async (clientWs, req) => {
-  if (!isAllowedClientOrigin(req)) {
-    console.warn(`[ASR Gateway] Rejected client origin: ${req.headers.origin || "(missing)"}`);
+  // 纵深防御：upgrade 阶段已经拦过一次，这里再判一次（同源 / 白名单同一套逻辑）。
+  const originCheck = checkClientOrigin(req);
+  if (!originCheck.allowed) {
+    console.warn(`[ASR Gateway] Rejected client origin (connection): ${describeAsrOriginDecision(originCheck)}`);
     clientWs.close(1008, "Origin is not allowed");
     return;
   }
@@ -664,11 +687,14 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       return;
     }
 
-    if (!isAllowedClientOrigin(req)) {
-      console.warn(`[ASR Gateway] Rejected client origin: ${req.headers.origin || "(missing)"}`);
+    // D4：拒绝日志必须打全（实际 Origin / 请求 Host / 生效白名单 / 同源还是白名单结论）
+    const originCheck = checkClientOrigin(req);
+    if (!originCheck.allowed) {
+      console.warn(`[ASR Gateway] Rejected client origin: ${describeAsrOriginDecision(originCheck)}`);
       rejectUpgrade(socket, 403, "Origin is not allowed");
       return;
     }
+    if (devMode) console.log(`[ASR Gateway] Origin accepted: ${describeAsrOriginDecision(originCheck)}`);
 
     const devAccountName = devMode ? process.env.DEV_ACTOR_ACCOUNT || "" : "";
     const authorization = await authorizeAsrGatewaySession(

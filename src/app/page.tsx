@@ -170,6 +170,10 @@ export default function MeetingPage() {
   const [selectionError, setSelectionError] = useState("");
   const [asrReady, setAsrReady] = useState(false);
   const [asrErrorMessage, setAsrErrorMessage] = useState<string | null>(null);
+  // issue #61：ASR 链路（WebSocket）不可用时的**持续**告警。
+  // 不用 toast（3.5s 就消失，用户以为还在录），而是常驻页面顶部，
+  // 直到连接恢复 / 重新开始录音 / 用户手动关闭。
+  const [asrLinkError, setAsrLinkError] = useState<string | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   // feat-261101-04（#44）：AI 起标题进行中的会议 id（按钮 loading 态）
@@ -206,6 +210,8 @@ export default function MeetingPage() {
   const transcriptSessionRef = useRef(0);
   const lastPartialRenderAtRef = useRef(0);
   const asrRecoveryRef = useRef(false);
+  // 用户主动停止（而非链路故障）时为 true：避免 stop 时的 onclose 被误判成「连接断开」告警
+  const asrStopIntentRef = useRef(false);
   const persistedMeetingIdRef = useRef<string | null>(null);
   const persistedSegmentCountRef = useRef(0);
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
@@ -830,6 +836,9 @@ export default function MeetingPage() {
 
     setStatus("connecting");
     setAsrErrorMessage(null);
+    // 新一轮录音：清掉上一轮的链路告警，并标记「非用户主动停止」
+    setAsrLinkError(null);
+    asrStopIntentRef.current = false;
     resetTranscriptScheduler();
     const recordingSession = transcriptSessionRef.current;
     asrRecoveryRef.current = false;
@@ -914,6 +923,8 @@ export default function MeetingPage() {
             },
             onError: (error) => {
               console.error("FunASR error:", error);
+              // issue #61：链路不可用时必须**持续可见**（不只是 toast），文案点明后果
+              setAsrLinkError(error.message);
               for (const activeClient of asrClientsRef.current.values()) {
                 activeClient.stopRecording().catch((e) => console.warn("Failed to stop ASR session:", e));
               }
@@ -947,6 +958,8 @@ export default function MeetingPage() {
             },
             onStatusChange: (s) => {
               if (s === "recording") {
+                // 连上了：自动收掉告警
+                setAsrLinkError(null);
                 setStatus("recording");
                 if (timerRef.current === null) {
                   if (!preserveTranscript) setElapsed(0);
@@ -955,6 +968,10 @@ export default function MeetingPage() {
                     1000
                   );
                 }
+              } else if (s === "disconnected" && !asrStopIntentRef.current) {
+                // 录音中链路被关掉（网络/服务重启）：以前这里只打 console，用户以为还在录。
+                // 握手失败已经带了更具体的原因（如 WebSocket connection failed），不覆盖它。
+                setAsrLinkError((prev) => prev ?? "与语音识别服务的连接已断开");
               }
             },
             lang: asrLang,
@@ -1012,6 +1029,7 @@ export default function MeetingPage() {
     if (asrClientsRef.current.size === 0) return;
     asrRecoveryRef.current = false;
     setAsrErrorMessage(null);
+    // 暂停是用户主动行为，不是链路故障；旧告警不再适用（但保留 asrLinkError 的实时值不影响这里）
     for (const activeClient of asrClientsRef.current.values()) {
       activeClient.pause();
     }
@@ -1056,6 +1074,9 @@ export default function MeetingPage() {
   }, [startRecording]);
 
   const stopRecording = useCallback(async () => {
+    // 用户主动停止：先置意图标志（stop 时的 onclose 不应报「连接断开」），并收掉链路告警
+    asrStopIntentRef.current = true;
+    setAsrLinkError(null);
     flushTranslateRef.current();
     if (checkpointPromiseRef.current) {
       await checkpointPromiseRef.current.catch((error) => {
@@ -1884,6 +1905,37 @@ export default function MeetingPage() {
           </div>
         )}
 
+        {/*
+          issue #61：ASR 链路不可用时的**常驻**告警（D6）。
+          - 不用 toast：3.5s 就消失，用户会以为还在录，结果整场会议什么都没录
+          - 点明后果 + 可行动线索；连接恢复 / 重新录音时自动消失（也允许手动关闭）
+        */}
+        {asrLinkError && (
+          <div
+            role="alert"
+            className="flex items-start justify-between gap-3 border-b border-red-300 bg-red-50 px-6 py-2 text-sm text-red-700"
+          >
+            <div className="min-w-0 space-y-0.5">
+              <p className="font-semibold">
+                实时转写连接失败：本次会议不会生成转写，也不会保存录音文件。
+              </p>
+              <p className="break-all text-xs text-red-600">原因：{asrLinkError}</p>
+              <p className="text-xs text-red-600">
+                请检查：① 浏览器地址与服务的实际访问地址是否一致（用局域网 IP / 域名访问时，
+                服务端 Origin 白名单需要允许该地址，见 ASR_GATEWAY_ALLOWED_ORIGINS）；
+                ② ASR 服务是否可连通。恢复连接或重新开始录音后本提示自动消失。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAsrLinkError(null)}
+              className="shrink-0 rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+            >
+              关闭
+            </button>
+          </div>
+        )}
+
         <div className="flex min-w-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex-1 overflow-y-auto">
@@ -2473,14 +2525,15 @@ export default function MeetingPage() {
                     <span className="flex items-center gap-2">
                       <span
                         className={
-                          status === "recording"
+                          status === "recording" && !asrLinkError
                             ? "rec-dot"
                             : "h-3 w-3 rounded-full bg-amber-400"
                         }
                       />
                       <span className="font-medium text-slate-700" title={asrErrorMessage ?? undefined}>
                         {status === "recording"
-                          ? `录音中 ${formatTime(elapsed)}`
+                          ? // 链路不通时不能只显示「录音中 00:xx」：用户会以为在录（D6）
+                            `录音中 ${formatTime(elapsed)}${asrLinkError ? "（实时转写未连接）" : ""}`
                           : status === "paused"
                             ? asrErrorMessage
                               ? `ASR 已暂停：${asrErrorMessage}`
@@ -2492,7 +2545,9 @@ export default function MeetingPage() {
                     </span>
                     <span className="text-slate-400">
                       FunASR:{" "}
-                      {status === "recording" ? (
+                      {asrLinkError ? (
+                        <span className="font-medium text-red-600">未连接</span>
+                      ) : status === "recording" ? (
                         <span className="text-green-600">已连接</span>
                       ) : status === "paused" && asrErrorMessage ? (
                         <span className="text-red-600">连接异常</span>

@@ -25,8 +25,12 @@ services:
       TTS_PROVIDER: ${TTS_PROVIDER:-}
       TTS_MODEL: ${TTS_MODEL:-}
       TTS_API_KEY: ${TTS_API_KEY:-}
-      # 线上通过域名/IP 访问时，必须把实际 Origin 加进来，否则 WebSocket 握手被拒
-      ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-http://localhost:3123}
+      # 线上通过域名/IP 访问时，网关会按「同源」自动放行（Origin 的 hostname+端口 == Host），
+      # 一般**不需要**配这一项。只有反向代理内外层 host 不一致（如外层 nginx 改写 Host）时
+      # 才在这里列出实际 Origin，多个用逗号分隔，例如 https://meeting.example.com
+      # 留空 ⇒ 网关内置默认（http://localhost:<PORT>,http://127.0.0.1:<PORT>）+ 同源判定生效。
+      # ⚠ 不要在 compose 里硬编码与机器相关的 origin：单值默认会覆盖网关内置的两值默认。
+      ASR_GATEWAY_ALLOWED_ORIGINS: ${ASR_GATEWAY_ALLOWED_ORIGINS:-}
       # 直接通过 HTTP 访问时必须为 false；HTTPS 反向代理部署时设为 true
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       # 反向代理身份透传（如 nginx auth_request / 统一登录），未设时禁用它
