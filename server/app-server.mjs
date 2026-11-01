@@ -3,7 +3,7 @@ import next from "next";
 import { attachAsrGateway } from "./asr-gateway.mjs";
 import { createTtsGateway } from "./tts-gateway.mjs";
 import { cleanupExpiredAuditLogs } from "./db-shared.mjs";
-import { cleanupExpiredCaptureSessions, closeCaptureStore, startCaptureFlushTimer } from "./runtime-store.mjs";
+import { cleanupExpiredCaptureSessions, cleanupExpiredAudioRecordings, closeCaptureStore, startCaptureFlushTimer } from "./runtime-store.mjs";
 
 const dev = process.argv.includes("--dev");
 const port = Number(process.env.PORT || 3123);
@@ -52,6 +52,21 @@ const captureCleanupTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 captureCleanupTimer.unref();
 
+// 孤儿录音清理（feat-261101-01）：未绑定会议且过期 → 删行 + 删文件。
+// 已绑定会议的录音 expires_at 为 NULL，永不被清。
+cleanupExpiredAudioRecordings();
+const audioCleanupTimer = setInterval(() => {
+  try {
+    const result = cleanupExpiredAudioRecordings();
+    if (result.rows > 0) {
+      console.log(`[App Server] audio cleanup: removed ${result.rows} row(s), ${result.files} file(s)`);
+    }
+  } catch (error) {
+    console.error("[App Server] audio cleanup failed:", error);
+  }
+}, 60 * 60 * 1000);
+audioCleanupTimer.unref();
+
 server.listen(port, hostname, () => {
   console.log(`[App Server] ${dev ? "Development" : "Production"} server running on http://${hostname}:${port}`);
   console.log(`[ASR Gateway] WebSocket endpoint: ws://localhost:${port}${gatewayPath}`);
@@ -61,6 +76,7 @@ function shutdown(signal) {
   console.log(`[App Server] Received ${signal}, shutting down`);
   clearInterval(auditCleanupTimer);
   clearInterval(captureCleanupTimer);
+  clearInterval(audioCleanupTimer);
   closeCaptureStore();
   gateway.close();
   server.close(() => process.exit(0));

@@ -545,7 +545,10 @@ export default function MeetingPage() {
   const saveAsrCheckpoint = useCallback(async (segments: TranscriptSegment[], errorMessage: string) => {
     if (segments.length === 0 || !segments.some((segment) => segment.text.trim())) return;
 
-    const captureSessionId = asrClientsRef.current.values().next().value?.getCaptureSessionId() || `capture-${Date.now()}`;
+    const captureSessionIds = Array.from(asrClientsRef.current.values())
+      .map((activeClient) => activeClient.getCaptureSessionId())
+      .filter((id): id is string => Boolean(id));
+    const captureSessionId = captureSessionIds[0] || `capture-${Date.now()}`;
     let meetingId = persistedMeetingIdRef.current;
 
     if (!meetingId) {
@@ -561,6 +564,7 @@ export default function MeetingPage() {
           sourceFileName: null,
           durationSeconds: elapsedRef.current,
           captureSessionId,
+          captureSessionIds,
           transcriptSegments: segments,
           triggerLlm: false,
         }),
@@ -582,6 +586,7 @@ export default function MeetingPage() {
           body: JSON.stringify({
             appendTranscriptSegments: appendedSegments,
             captureSessionId,
+            captureSessionIds,
           }),
         });
         persistedSegmentCountRef.current = segments.length;
@@ -1038,12 +1043,16 @@ export default function MeetingPage() {
     setMicMuted(false);
 
     let recordingCaptureSessionId = "";
+    let recordingCaptureSessionIds: string[] = [];
     if (asrClientsRef.current.size > 0) {
-      const firstClient = asrClientsRef.current.values().next().value;
+      // feat-261101-01：双通道要上报**全部** capture session id（音频每条一个）
+      recordingCaptureSessionIds = Array.from(asrClientsRef.current.values())
+        .map((activeClient) => activeClient.getCaptureSessionId())
+        .filter((id): id is string => Boolean(id));
       for (const activeClient of asrClientsRef.current.values()) {
         await activeClient.stopRecording();
       }
-      recordingCaptureSessionId = firstClient?.getCaptureSessionId() ?? "";
+      recordingCaptureSessionId = recordingCaptureSessionIds[0] ?? "";
       asrClientsRef.current = new Map();
     }
 
@@ -1074,6 +1083,7 @@ export default function MeetingPage() {
             body: JSON.stringify({
               appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: recordingCaptureSessionIds,
               title,
               status: "transcribed",
               lastErrorMessage: null,
@@ -1089,6 +1099,7 @@ export default function MeetingPage() {
               sourceFileName: null,
               durationSeconds: elapsedRef.current,
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: recordingCaptureSessionIds,
               transcriptSegments: finalSegments,
             }),
           });
@@ -1350,6 +1361,7 @@ export default function MeetingPage() {
         if (name !== null) {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
+          const uploadCaptureSessionId = client.getCaptureSessionId();
           const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1358,7 +1370,8 @@ export default function MeetingPage() {
               sourceType: "file_upload",
               sourceFileName: file.name,
               durationSeconds: null,
-              captureSessionId: client.getCaptureSessionId() || `capture-${Date.now()}`,
+              captureSessionId: uploadCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: uploadCaptureSessionId ? [uploadCaptureSessionId] : undefined,
               transcriptSegments: allSegments,
             }),
           });

@@ -5,10 +5,16 @@ import { request as httpsRequest } from "node:https";
 import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
 import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
 import {
+  bindAudioRecordingsToMeeting,
+  collectCaptureSessionIds,
+  deleteAudioRecordingRowsForMeeting,
   drainCaptureEvents,
   getCaptureSessionStats,
   invalidateAsrRuntimeConfig,
+  invalidateAudioRuntimeConfig,
+  listAudioRecordingsForMeeting,
   releaseCaptureSession,
+  removeAudioFilesForRows,
 } from "../../server/runtime-store.mjs";
 import type { TranscriptSegment } from "@/types";
 import {
@@ -134,6 +140,7 @@ type MeetingInput = {
   sourceFileName: string | null;
   durationSeconds: number | null;
   captureSessionId: string;
+  captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
 };
 
@@ -1235,6 +1242,7 @@ export function saveSettings(settings: unknown) {
       })),
     });
     invalidateAsrRuntimeConfig();
+    invalidateAudioRuntimeConfig();
   });
 }
 
@@ -2151,7 +2159,8 @@ export function createMeeting(input: MeetingInput) {
     throw new Error("transcriptSegments must include text");
   }
 
-  const captureSessionId = String(input.captureSessionId || "").trim();
+  const captureSessionIds = collectCaptureSessionIds(input);
+  const captureSessionId = String(input.captureSessionId || captureSessionIds[0] || "").trim();
   if (captureSessionId) {
     drainCaptureEvents(captureSessionId);
   }
@@ -2238,6 +2247,9 @@ export function createMeeting(input: MeetingInput) {
         .run(captureSessionId);
     }
 
+    // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
+    bindAudioRecordingsToMeeting({ meetingId, captureSessionIds });
+
     const meeting = getMeetingById(meetingId);
     writeAuditLog({
       actionType: "meeting.create",
@@ -2267,6 +2279,7 @@ export function createMeeting(input: MeetingInput) {
 export function appendMeetingTranscript(input: {
   meetingId: string;
   captureSessionId: string;
+  captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
 }) {
   const existing = getMeetingById(input.meetingId);
@@ -2343,6 +2356,12 @@ export function appendMeetingTranscript(input: {
     database
       .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
       .run(createdAt, input.meetingId);
+
+    // feat-261101-01：增量落定路径同样把录音绑定到会议（幂等，重复绑不报错）
+    bindAudioRecordingsToMeeting({
+      meetingId: input.meetingId,
+      captureSessionIds: collectCaptureSessionIds(input),
+    });
 
     return getMeetingById(input.meetingId);
   });
@@ -2454,15 +2473,19 @@ export function updateMeeting(id: string, patch: { title?: string }) {
 }
 
 export function deleteMeeting(id: string) {
-  return withTransaction(() => {
+  const { deleted, audioRows } = withTransaction(() => {
     const database = getDb();
     const actor = getCurrentActor();
     const before = getMeetingById(id);
+    // 先取录音行（meetings 删除后 meeting_audio_recordings 会被 FK 级联清掉）
+    const removedAudio = listAudioRecordingsForMeeting(id);
     const result = database
       .prepare("DELETE FROM meetings WHERE id = ? AND created_by_user_id = ?")
       .run(id, actor.id);
-    const deleted = Number(result.changes ?? 0) > 0;
-    if (deleted) {
+    const isDeleted = Number(result.changes ?? 0) > 0;
+    if (isDeleted) {
+      // 级联已清行；显式再删一次兜底（foreign_keys 未开时也不会留脏行）
+      deleteAudioRecordingRowsForMeeting(id);
       writeAuditLog({
         actionType: "meeting.delete",
         resourceType: "meeting",
@@ -2478,8 +2501,12 @@ export function deleteMeeting(id: string) {
           : null,
       });
     }
-    return deleted;
+    return { deleted: isDeleted, audioRows: isDeleted ? removedAudio : [] };
   });
+
+  // 文件删除放在事务提交之后：回滚时不会丢音频
+  removeAudioFilesForRows(audioRows);
+  return deleted;
 }
 
 function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {

@@ -365,3 +365,145 @@ test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键�
   assert.equal(Number(count), 1);
   console.log(`[L3] upsert OK: id=${first.id}`);
 });
+
+// ---------------------------------------------------------------------------
+// L4 绑定 / 孤儿清理 / 删除会议连带删文件
+// ---------------------------------------------------------------------------
+
+function seedMeetingRow(meetingId, userId = "user-audio-test") {
+  const database = getSharedDb();
+  const now = new Date().toISOString();
+  database
+    .prepare(`
+      INSERT INTO users (id, account_name, display_name, status, created_at, updated_at)
+      VALUES (?, ?, ?, 'active', ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `)
+    .run(userId, userId, "录音测试用户", now, now);
+  database
+    .prepare(`
+      INSERT INTO meetings (
+        id, title, source_type, duration_seconds, status, status_updated_at,
+        created_by_user_id, created_by_user_name, created_at, updated_at
+      ) VALUES (?, ?, 'live_recording', 2, 'transcribed', ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `)
+    .run(meetingId, "录音绑定测试", now, userId, "录音测试用户", now, now);
+  return meetingId;
+}
+
+test("bind: 双通道两个 captureSessionId 都绑定到会议且 expires_at 置空（永久）", () => {
+  const meetingId = seedMeetingRow("meeting-bind-1");
+  ensureAudioDirs();
+  for (const captureSessionId of ["capture-dual-mic", "capture-dual-spk"]) {
+    writeFileSync(rawAudioPath(captureSessionId), synthesizePcm({ seconds: 1 }));
+    runtimeStore.registerAudioRecording({
+      captureSessionId,
+      sampleRate: 16000,
+      rawFilePath: toStoredPath(rawAudioPath(captureSessionId)),
+    });
+  }
+  const beforeRow = runtimeStore.getAudioRecording("capture-dual-mic");
+  assert.ok(beforeRow.expiresAt, "绑定前应有 expires_at（孤儿 TTL）");
+
+  const bound = runtimeStore.bindAudioRecordingsToMeeting({
+    meetingId,
+    captureSessionIds: ["capture-dual-mic", "capture-dual-spk"],
+  });
+  assert.equal(bound.length, 2);
+  for (const row of bound) {
+    assert.equal(row.meetingId, meetingId);
+    assert.equal(row.expiresAt, null, "已绑定会议的录音 expires_at 必须为 NULL（永久保留）");
+  }
+  console.log(`[L4] 双通道绑定 OK: ${bound.map((row) => row.captureSessionId).join(", ")}`);
+});
+
+test("bind: 单数 captureSessionId 与复数取并集去重（向后兼容旧前端）", () => {
+  const meetingId = seedMeetingRow("meeting-bind-2");
+  runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-legacy-single",
+    sampleRate: 16000,
+    rawFilePath: "audio/raw/capture-legacy-single.pcm",
+  });
+  const bound = runtimeStore.bindAudioRecordingsToMeeting({
+    meetingId,
+    captureSessionId: "capture-legacy-single",
+    captureSessionIds: ["capture-legacy-single", "capture-legacy-single", ""],
+  });
+  assert.equal(bound.length, 1);
+  assert.equal(bound[0].captureSessionId, "capture-legacy-single");
+  assert.equal(runtimeStore.collectCaptureSessionIds({
+    captureSessionId: "a",
+    captureSessionIds: ["a", "b", "", null, "b"],
+  }).join(","), "a,b");
+  console.log("[L4] 单数/复数并集去重 OK");
+});
+
+test("cleanup: 只清 meeting_id IS NULL 且过期的孤儿，删行 + 删文件", () => {
+  const database = getSharedDb();
+  ensureAudioDirs();
+  const orphanId = "capture-orphan-expired";
+  const orphanMp3 = meetingAudioPath(orphanId);
+  writeFileSync(rawAudioPath(orphanId), synthesizePcm({ seconds: 1 }));
+  writeFileSync(orphanMp3, Buffer.from("mp3"));
+  runtimeStore.registerAudioRecording({
+    captureSessionId: orphanId,
+    sampleRate: 16000,
+    rawFilePath: toStoredPath(rawAudioPath(orphanId)),
+  });
+  database
+    .prepare("UPDATE meeting_audio_recordings SET file_path = ?, expires_at = ? WHERE capture_session_id = ?")
+    .run(toStoredPath(orphanMp3), new Date(Date.now() - 60_000).toISOString(), orphanId);
+
+  const result = runtimeStore.cleanupExpiredAudioRecordings();
+  assert.ok(result.rows >= 1, `应至少清掉 1 行孤儿，实际 ${result.rows}`);
+  assert.equal(runtimeStore.getAudioRecording(orphanId), null, "孤儿行应被删除");
+  assert.equal(existsSync(rawAudioPath(orphanId)), false, "孤儿 raw 文件应被删除");
+  assert.equal(existsSync(orphanMp3), false, "孤儿 mp3 文件应被删除");
+
+  // 已绑定会议的录音（expires_at IS NULL）绝不能被清
+  assert.notEqual(runtimeStore.getAudioRecording("capture-dual-mic"), null);
+  console.log(`[L4] 孤儿清理 OK: rows=${result.rows} files=${result.files}`);
+});
+
+test("cleanup: 未过期的孤儿不动", () => {
+  runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-orphan-fresh",
+    sampleRate: 16000,
+    rawFilePath: "audio/raw/capture-orphan-fresh.pcm",
+  });
+  const before = runtimeStore.getAudioRecording("capture-orphan-fresh");
+  runtimeStore.cleanupExpiredAudioRecordings();
+  assert.notEqual(runtimeStore.getAudioRecording("capture-orphan-fresh"), null);
+  assert.ok(new Date(before.expiresAt).getTime() > Date.now(), "默认 TTL 72h 应远未过期");
+  console.log("[L4] 未过期孤儿保留 OK");
+});
+
+test("delete: 删会议时音频行与文件一并清掉（含残留 pcm）", () => {
+  const meetingId = seedMeetingRow("meeting-delete-1");
+  const captureSessionId = "capture-del-1";
+  ensureAudioDirs();
+  writeFileSync(rawAudioPath(captureSessionId), synthesizePcm({ seconds: 1 }));
+  writeFileSync(meetingAudioPath(captureSessionId), Buffer.from("mp3"));
+  runtimeStore.registerAudioRecording({
+    captureSessionId,
+    sampleRate: 16000,
+    rawFilePath: toStoredPath(rawAudioPath(captureSessionId)),
+  });
+  runtimeStore.bindAudioRecordingsToMeeting({ meetingId, captureSessionIds: [captureSessionId] });
+  getSharedDb()
+    .prepare("UPDATE meeting_audio_recordings SET file_path = ?, status = 'ready' WHERE capture_session_id = ?")
+    .run(toStoredPath(meetingAudioPath(captureSessionId)), captureSessionId);
+
+  // deleteMeeting 的内部两步：事务内取行 + 删行，提交后删文件
+  const rows = runtimeStore.listAudioRecordingsForMeeting(meetingId);
+  assert.equal(rows.length, 1);
+  runtimeStore.deleteAudioRecordingRowsForMeeting(meetingId);
+  const { files } = runtimeStore.removeAudioFilesForRows(rows);
+
+  assert.equal(files, 2, `应删除 mp3 + pcm 两个文件，实际 ${files}`);
+  assert.equal(existsSync(meetingAudioPath(captureSessionId)), false);
+  assert.equal(existsSync(rawAudioPath(captureSessionId)), false);
+  assert.equal(runtimeStore.listAudioRecordingsForMeeting(meetingId).length, 0);
+  console.log("[L4] 删会议连带删文件 OK（mp3 + 残留 pcm）");
+});

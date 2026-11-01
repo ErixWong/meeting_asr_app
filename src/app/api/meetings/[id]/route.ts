@@ -39,6 +39,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
         meeting = appendMeetingTranscript({
           meetingId: id,
           captureSessionId: String(body.captureSessionId ?? `capture-${Date.now()}`),
+          captureSessionIds: Array.isArray(body.captureSessionIds) ? body.captureSessionIds : undefined,
           transcriptSegments: body.appendTranscriptSegments,
         });
       }

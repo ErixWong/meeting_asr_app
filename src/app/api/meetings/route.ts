@@ -20,6 +20,8 @@ export async function POST(req: NextRequest) {
         sourceFileName: body.sourceFileName ?? null,
         durationSeconds: body.durationSeconds ?? null,
         captureSessionId: body.captureSessionId ?? `capture-${Date.now()}`,
+        // feat-261101-01：双通道会传两个 session id；单数 captureSessionId 继续兼容
+        captureSessionIds: Array.isArray(body.captureSessionIds) ? body.captureSessionIds : undefined,
         transcriptSegments: body.transcriptSegments ?? [],
       });
 
