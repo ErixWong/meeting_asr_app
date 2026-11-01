@@ -7,11 +7,14 @@
  *   C 嵌套事务：内层 savepoint 抛错只回滚内层，外层继续提交（修 `no such savepoint: sp_1`）
  *   D **D2 运行期防线**：事务上下文中在普通 `db` 上调用 prepare / exec / withTransaction /
  *     listTableColumns 必须抛错；事务句柄 `tx` 不受影响（防线不破坏事务本身）
- *   E 并发两个顶层事务：都提交、互不丢写（#54 串行化语义保持）
- *   F affected-rows（D4）：INSERT/UPDATE/DELETE 的 `.run().changes` 在**三库**都必须准
+ *   E 并发两个顶层事务：都提交、互不丢写
+ *   F 顶层事务串行化（#54 语义保持）：并发事务不交错执行（sqlite 由 pool.max=1 天然串行，
+ *     真正的观测点是 mariadb / mssql）
+ *   G affected-rows（D4）：INSERT/UPDATE/DELETE 的 `.run().changes` 在**三库**都必须准
  *     —— 删 1 条=1、删不存在=0、更新 1 条=1、更新不存在=0；事务内同样成立。
  *     这是 `deleteHotword()` / `updateMeetingStatus()` 判「目标是否存在」的唯一依据，
  *     mssql 上曾恒 0（#54 §4.8），会静默判错。
+ *   H 回调签名兼容：`withTransaction(async () => …)`（不接收 tx）照常工作
  *
  * 运行模式（未知参数一律报错退出）：
  *   node scripts/db-tx-test.mjs              # sqlite（默认，临时库）
@@ -198,7 +201,37 @@ async function runSuite(db, dbType) {
         : `行 ${JSON.stringify(afterConcurrent)}`
     );
 
-    // ---------- F. affected-rows（D4）----------
+    // ---------- F. 串行化（#54 语义保持）----------
+    // D3 把串行锁的职责收窄为「跳事务互斥」：同一实例上的顶层事务排队执行，
+    // 等价于同步驱动时代的串行语义。用「写入序号」观测是否交错：
+    //   串行化 ⇒ a1,a2,b1（B 在 A 提交后才开始）；不串行化 ⇒ b1 可能插在 a1/a2 之间。
+    // 注：sqlite 的 pool.max=1 本身也会把并发事务排到同一条连接上，所以本用例在 sqlite 上
+    // 关掉串行锁也看不出差别；真正的观测点是连接池 > 1 的 mariadb / mssql（矩阵里覆盖）。
+    await db.prepare(`DELETE FROM ${TABLE}`).run();
+    let seqCounter = 0;
+    const mark = async (tx, id) => {
+      const seq = ++seqCounter;
+      await tx.prepare(insertSql).run(id, "F", seq);
+    };
+    await Promise.all([
+      db.withTransaction(async (tx) => {
+        await mark(tx, "f-a1");
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        await mark(tx, "f-a2");
+      }),
+      db.withTransaction(async (tx) => {
+        await mark(tx, "f-b1");
+      }),
+    ]);
+    const seqRows = await db.prepare(`SELECT id FROM ${TABLE} ORDER BY weight`).all();
+    const seqOrder = seqRows.map((row) => String(row.id));
+    check(
+      "F 顶层事务串行化：并发事务不交错执行（#54 语义保持）",
+      JSON.stringify(seqOrder) === JSON.stringify(["f-a1", "f-a2", "f-b1"]),
+      `执行顺序 ${JSON.stringify(seqOrder)}`
+    );
+
+    // ---------- G. affected-rows（D4）----------
     // 这组断言直接对应 deleteHotword() / updateMeetingStatus() 的判据：
     //   const deleted = Number(result.changes ?? 0) > 0;
     //   if (Number(result.changes ?? 0) === 0) throw new Error("状态已被改动");
@@ -206,35 +239,35 @@ async function runSuite(db, dbType) {
 
     const insertInfo = await db.prepare(insertSql).run("f-1", "F", 1);
     check(
-      "F1 INSERT 的 affected-rows = 1",
+      "G1 INSERT 的 affected-rows = 1",
       Number(insertInfo.changes ?? -1) === 1,
       `changes=${insertInfo.changes}`
     );
 
     const updateInfo = await db.prepare(`UPDATE ${TABLE} SET weight = ? WHERE id = ?`).run(9, "f-1");
     check(
-      "F2 UPDATE 命中 1 条 → affected-rows = 1",
+      "G2 UPDATE 命中 1 条 → affected-rows = 1",
       Number(updateInfo.changes ?? -1) === 1,
       `changes=${updateInfo.changes}`
     );
 
     const updateMiss = await db.prepare(`UPDATE ${TABLE} SET weight = ? WHERE id = ?`).run(9, "f-nope");
     check(
-      "F3 UPDATE 不命中 → affected-rows = 0（deleteHotword 语义：0 即「不存在」）",
+      "G3 UPDATE 不命中 → affected-rows = 0（deleteHotword 语义：0 即「不存在」）",
       Number(updateMiss.changes ?? -1) === 0,
       `changes=${updateMiss.changes}`
     );
 
     const deleteInfo = await db.prepare(`DELETE FROM ${TABLE} WHERE id = ?`).run("f-1");
     check(
-      "F4 DELETE 命中 1 条 → affected-rows = 1（updateMeetingStatus 语义：0 即「已被改动」）",
+      "G4 DELETE 命中 1 条 → affected-rows = 1（updateMeetingStatus 语义：0 即「已被改动」）",
       Number(deleteInfo.changes ?? -1) === 1,
       `changes=${deleteInfo.changes}`
     );
 
     const deleteMiss = await db.prepare(`DELETE FROM ${TABLE} WHERE id = ?`).run("f-1");
     check(
-      "F5 DELETE 不命中 → affected-rows = 0",
+      "G5 DELETE 不命中 → affected-rows = 0",
       Number(deleteMiss.changes ?? -1) === 0,
       `changes=${deleteMiss.changes}`
     );
@@ -243,40 +276,40 @@ async function runSuite(db, dbType) {
     await db.withTransaction(async (tx) => {
       const inTxInsert = await tx.prepare(insertSql).run("f-tx", "F", 1);
       check(
-        "F6 事务内 INSERT 的 affected-rows = 1",
+        "G6 事务内 INSERT 的 affected-rows = 1",
         Number(inTxInsert.changes ?? -1) === 1,
         `changes=${inTxInsert.changes}`
       );
       const inTxUpdate = await tx.prepare(`UPDATE ${TABLE} SET weight = ? WHERE id = ?`).run(3, "f-tx");
       check(
-        "F7 事务内 UPDATE 命中 → affected-rows = 1",
+        "G7 事务内 UPDATE 命中 → affected-rows = 1",
         Number(inTxUpdate.changes ?? -1) === 1,
         `changes=${inTxUpdate.changes}`
       );
       const inTxMiss = await tx.prepare(`UPDATE ${TABLE} SET weight = ? WHERE id = ?`).run(3, "f-tx-nope");
       check(
-        "F8 事务内 UPDATE 不命中 → affected-rows = 0",
+        "G8 事务内 UPDATE 不命中 → affected-rows = 0",
         Number(inTxMiss.changes ?? -1) === 0,
         `changes=${inTxMiss.changes}`
       );
       const inTxDelete = await tx.prepare(`DELETE FROM ${TABLE} WHERE id = ?`).run("f-tx");
       check(
-        "F9 事务内 DELETE 命中 → affected-rows = 1",
+        "G9 事务内 DELETE 命中 → affected-rows = 1",
         Number(inTxDelete.changes ?? -1) === 1,
         `changes=${inTxDelete.changes}`
       );
       const inTxDeleteMiss = await tx.prepare(`DELETE FROM ${TABLE} WHERE id = ?`).run("f-tx");
       check(
-        "F10 事务内 DELETE 不命中 → affected-rows = 0",
+        "G10 事务内 DELETE 不命中 → affected-rows = 0",
         Number(inTxDeleteMiss.changes ?? -1) === 0,
         `changes=${inTxDeleteMiss.changes}`
       );
     });
 
-    // ---------- G. 回调签名兼容 ----------
+    // ---------- H. 回调签名兼容 ----------
     // 既有调用方可能写 `withTransaction(async () => ...)`（不接收 tx）——多一个参数不破坏它们。
     const compat = await db.withTransaction(async () => "ok");
-    check("G 回调签名兼容：不接收 tx 的回调照常工作", compat === "ok", `返回值 ${JSON.stringify(compat)}`);
+    check("H 回调签名兼容：不接收 tx 的回调照常工作", compat === "ok", `返回值 ${JSON.stringify(compat)}`);
   } finally {
     await db.knex.schema.dropTableIfExists(TABLE).catch(() => {});
   }
