@@ -19,6 +19,10 @@
  *     本脚本不再引用它：**测的那条必须就是跑的那条**。
  *
  * 场景：
+ *   0. **结构性守卫（R2）**：运行时源码里不许出现 node:sqlite / DatabaseSync，
+ *      `CREATE TABLE` 只许出现在 server/db/*.mjs（唯一 schema 实现）——见
+ *      assertSingleSchemaImplementation()。本项目三次栽在「两份 schema 实现、
+ *      测的和跑的不是同一份」上，这条守卫让第二份 schema 一出现就红。
  *   1. 全新库初始化（knex）→ 16 张表 + schema_version = SCHEMA_VERSION（单行）
  *   2. 幂等（knex）：连续两次初始化 → 单行、第二次无 Migration applied、表结构不变
  *   3. 旧库迁移（knex）：构造 v0 旧结构 → 数据搬迁 + legacy 清理 + 录音表
@@ -40,9 +44,9 @@ import {
   initializeSchema,
   SCHEMA_VERSION as KNEX_SCHEMA_VERSION,
 } from "../server/db/schema.mjs";
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, relative, sep } from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
@@ -306,7 +310,92 @@ async function buildLegacyV0WithDuplicates(db) {
   await db.knex.raw(insertSend, ["send-a3", "llm-a3", "主题A3", now]);
 }
 
+// ==================== 结构性守卫（R2）：只允许一份 schema 实现 ====================
+//
+// 背景：本项目已经三次栽在「两份 schema 实现、测的和跑的不是同一份」上
+// （#51 版本记账、#53 方言基建只有脚本调、#54 legacy 与 knex 两套 DDL 并存）。
+// #54 已删除 legacy 的 `server/database-schema.mjs`（node:sqlite 手写 DDL），
+// 这里把它变成**结构性断言**，让下面两种情况在 CI 里立刻红，而不是靠人记：
+//   ① 运行时源码（`src/`、`server/`）里出现 `import … from "node:sqlite"` 或
+//      `new DatabaseSync` —— 驱动已统一为 knex（better-sqlite3 / mysql2 / tedious）；
+//   ② `CREATE TABLE` 出现在 `server/db/*.mjs` 之外 —— schema 只能有一个实现。
+// 注意：`tests/` 不在扫描范围内（那是未接 CI 的手工脚本，见 tests/README.md）。
+// 注释里提到 `node:sqlite` 不算违规，所以匹配前先剥注释。
+
+const RUNTIME_SOURCE_ROOTS = ["src", "server"];
+const SCHEMA_IMPL_DIR = "server/db";
+const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".mjs", ".js", ".cjs", ".mts", ".cts"]);
+
+/** 剥掉块注释与行注释（保留 `http://` 这类带冒号的串，避免误伤） */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+function walkSourceFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) {
+      files.push(...walkSourceFiles(full));
+    } else if (SOURCE_EXTENSIONS.has(entry.slice(entry.lastIndexOf(".")))) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+/**
+ * 结构性守卫（跑在 `db:test-schema` 链路的最前面）。
+ * 任何一条违规都会让 `db:test-schema` / `db:test-parity` 直接红。
+ */
+function assertSingleSchemaImplementation() {
+  const root = process.cwd();
+  const violations = [];
+  let scanned = 0;
+
+  for (const sourceRoot of RUNTIME_SOURCE_ROOTS) {
+    for (const file of walkSourceFiles(join(root, sourceRoot))) {
+      const rel = relative(root, file).split(sep).join("/");
+      const code = stripComments(readFileSync(file, "utf-8"));
+      scanned += 1;
+
+      const importsSqlite =
+        /from\s+["']node:sqlite["']/.test(code) ||
+        /require\(\s*["']node:sqlite["']\s*\)/.test(code) ||
+        /import\(\s*["']node:sqlite["']\s*\)/.test(code);
+      const usesDatabaseSync = /\bnew\s+DatabaseSync\b/.test(code);
+      if (importsSqlite || usesDatabaseSync) {
+        violations.push(
+          `${rel}: 运行时源码不许再引入 node:sqlite / new DatabaseSync（驱动已统一为 knex，legacy 已退役）`
+        );
+      }
+
+      if (/\bCREATE\s+TABLE\b/i.test(code)) {
+        const inSchemaImpl = rel.startsWith(`${SCHEMA_IMPL_DIR}/`) && rel.endsWith(".mjs");
+        if (!inSchemaImpl) {
+          violations.push(
+            `${rel}: CREATE TABLE 只允许出现在 ${SCHEMA_IMPL_DIR}/*.mjs（schema 只许有一个实现）`
+          );
+        }
+      }
+    }
+  }
+
+  assert(
+    violations.length === 0,
+    `结构性守卫失败（${violations.length} 处违规）:\n  - ${violations.join("\n  - ")}`
+  );
+  console.log(
+    `✅ 场景0 结构性守卫: 扫描 ${scanned} 个运行时源文件 —— 无 node:sqlite/DatabaseSync，CREATE TABLE 仅存在于 ${SCHEMA_IMPL_DIR}/*.mjs`
+  );
+}
+
 async function main() {
+  // --- 场景 0：结构性守卫（R2）---
+  assertSingleSchemaImplementation();
+
   console.log(`[info] SCHEMA_VERSION = ${KNEX_SCHEMA_VERSION}（唯一实现：server/db/schema.mjs）`);
 
   const dir = mkdtempSync(join(tmpdir(), "db-schema-test-"));
