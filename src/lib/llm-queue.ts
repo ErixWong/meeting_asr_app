@@ -1,4 +1,5 @@
-export type LlmTaskType = "translate" | "summary" | "test" | "chat";
+// feat-261101-04（#44）：新增 "title"（会议 AI 标题），沿用同一个队列/并发/容量/记账，不另造调度。
+export type LlmTaskType = "translate" | "summary" | "test" | "chat" | "title";
 
 export interface LlmQueueStatus {
   inFlight: number;
@@ -25,6 +26,8 @@ const DEFAULT_WAIT_MS: Record<LlmTaskType, number> = {
   test: 30_000,
   summary: 300_000,
   chat: 60_000,
+  // 标题是一次短生成，但排在同队列里可能前面压着纪要/翻译；给 120s 排队预算。
+  title: 120_000,
 };
 
 let configReader: ConfigReader = () => DEFAULT_CONFIG;
