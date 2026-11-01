@@ -589,19 +589,32 @@ type AsyncStatement<T = SqliteRow> = {
 type AsyncDatabase = {
   exec: (sql: string) => Promise<void>;
   prepare: <T = SqliteRow>(sql: string) => AsyncStatement<T>;
-  withTransaction: <U>(callback: () => Promise<U>) => Promise<U>;
+  /**
+   * 事务（issue #55 D1）：回调参数 `tx` 是**绑定在事务连接上的句柄**，事务内的语句
+   * 必须用它。在事务上下文里对普通 db 调用 `prepare/exec/withTransaction` 会被
+   * AsyncDb 的运行期防线直接抛错（D2）——语句不允许落在事务连接之外。
+   */
+  withTransaction: <U>(callback: (tx: AsyncDatabase) => Promise<U>) => Promise<U>;
 };
 
 /**
- * 事务：直接交给 `AsyncDb.withTransaction()`（同一实例串行化，见 server/db/async-db.mjs）。
+ * 事务：交给 `AsyncDb.withTransaction()`（同一实例串行化，见 server/db/async-db.mjs）。
+ *
+ * issue #55 起事务句柄显式传递：回调第一个参数 `tx` 是事务连接上的句柄，事务内的语句
+ * 一律走 `tx`。已经处在事务里（嵌套调用）时把外层 `tx` 作为第二个参数传进来——
+ * `tx.withTransaction()` 会开 savepoint（内层回滚只影响内层），而用普通 `db` 嵌套会被
+ * 运行期防线抛错。
  *
  * 与 legacy 的差异：legacy 是「嵌套时直接把回调放进外层事务里跑」（扁平），现在是
  * 「嵌套时开 savepoint」（内层回滚只影响内层）。两者在「内层异常向外穿透」时结果相同；
  * 差别只出现在外层吞掉内层异常时（legacy 内层写入保留、新实现内层写入回滚），
  * 本单所有调用点都不吞内层异常。详见交付报告「行为差异清单」。
  */
-async function withTransaction<T>(callback: () => Promise<T>): Promise<T> {
-  const database = await getDb();
+async function withTransaction<T>(
+  callback: (tx: AsyncDatabase) => Promise<T>,
+  db?: AsyncDatabase
+): Promise<T> {
+  const database = db ?? (await getDb());
   return database.withTransaction(callback);
 }
 
@@ -1006,8 +1019,8 @@ async function insertMissingSetting(database: AsyncDatabase, setting: SettingRow
     );
 }
 
-async function upsertSetting(setting: SettingRow) {
-  const database = await getDb();
+async function upsertSetting(setting: SettingRow, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   await database
     .prepare(`
       INSERT INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
@@ -1028,8 +1041,8 @@ async function upsertSetting(setting: SettingRow) {
     );
 }
 
-async function upsertPromptTemplate(template: PromptTemplateRow) {
-  const database = await getDb();
+async function upsertPromptTemplate(template: PromptTemplateRow, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   const existing = await database
     .prepare("SELECT created_at as createdAt FROM llm_prompt_templates WHERE id = ?")
     .get(template.id) as { createdAt?: string } | undefined;
@@ -1062,8 +1075,8 @@ async function upsertPromptTemplate(template: PromptTemplateRow) {
     );
 }
 
-async function upsertHotword(hotword: HotwordRow) {
-  const database = await getDb();
+async function upsertHotword(hotword: HotwordRow, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   const existing = await database
     .prepare("SELECT created_at as createdAt FROM asr_hotwords WHERE id = ?")
     .get(hotword.id) as { createdAt?: string } | undefined;
@@ -1094,8 +1107,8 @@ function isSecretSetting(setting: Pick<SettingRow, "itemSection" | "itemMark">) 
   return SECRET_SETTING_KEYS.has(`${setting.itemSection}:${setting.itemMark}`);
 }
 
-export async function listSettings() {
-  const database = await getDb();
+export async function listSettings(db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   return await database
     .prepare(`
       SELECT
@@ -1316,9 +1329,9 @@ function validateSettings(settings: unknown): SettingRow[] {
 
 export async function saveSettings(settings: unknown) {
   const validatedSettings = validateSettings(settings);
-  return await withTransaction(async () => {
+  return await withTransaction(async (tx) => {
     const existingSettings = new Map(
-      (await listSettings() as SettingRow[]).map((setting) => [
+      (await listSettings(tx) as SettingRow[]).map((setting) => [
         `${setting.itemSection}:${setting.itemMark}`,
         setting,
       ])
@@ -1328,7 +1341,7 @@ export async function saveSettings(settings: unknown) {
       const nextSetting = isSecretSetting(setting) && setting.itemValue === "" && existing?.itemValue
         ? { ...setting, itemValue: existing.itemValue }
         : setting;
-      await upsertSetting(nextSetting);
+      await upsertSetting(nextSetting, tx);
     }
     await writeAuditLog({
       actionType: "settings.update",
@@ -1340,14 +1353,14 @@ export async function saveSettings(settings: unknown) {
           ? "***"
           : setting.itemValue,
       })),
-    });
+    }, tx);
     invalidateAsrRuntimeConfig();
     invalidateAudioRuntimeConfig();
   });
 }
 
-export async function listPromptTemplates() {
-  const database = await getDb();
+export async function listPromptTemplates(db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   return await database
     .prepare(`
       SELECT
@@ -1369,7 +1382,7 @@ export async function listPromptTemplates() {
 }
 
 export async function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSystem"> & { isSystem?: boolean }) {
-  return await withTransaction(async () => {
+  return await withTransaction(async (tx) => {
     const template: PromptTemplateRow = {
       id: newId("tpl"),
       isSystem: input.isSystem ?? false,
@@ -1380,22 +1393,22 @@ export async function createPromptTemplate(input: Omit<PromptTemplateRow, "id" |
       description: input.description ?? "",
       status: normalizeStatus(input.status),
     };
-    await upsertPromptTemplate(template);
-    const created = (await listPromptTemplates()).find((item) => item.id === template.id);
+    await upsertPromptTemplate(template, tx);
+    const created = (await listPromptTemplates(tx)).find((item) => item.id === template.id);
     await writeAuditLog({
       actionType: "prompt_template.create",
       resourceType: "prompt_template",
       resourceId: template.id,
       resourceName: template.templateName,
       afterSnapshot: created,
-    });
+    }, tx);
     return created;
   });
 }
 
 export async function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTemplateRow, "id">>) {
-  return await withTransaction(async () => {
-    const existing = (await listPromptTemplates()).find((item) => item.id === id);
+  return await withTransaction(async (tx) => {
+    const existing = (await listPromptTemplates(tx)).find((item) => item.id === id);
     if (!existing) return null;
 
     const next: PromptTemplateRow = {
@@ -1409,8 +1422,8 @@ export async function updatePromptTemplate(id: string, patch: Partial<Omit<Promp
       isSystem: patch.isSystem ?? existing.isSystem,
     };
 
-    await upsertPromptTemplate(next);
-    const updated = (await listPromptTemplates()).find((item) => item.id === id);
+    await upsertPromptTemplate(next, tx);
+    const updated = (await listPromptTemplates(tx)).find((item) => item.id === id);
     await writeAuditLog({
       actionType: "prompt_template.update",
       resourceType: "prompt_template",
@@ -1418,13 +1431,13 @@ export async function updatePromptTemplate(id: string, patch: Partial<Omit<Promp
       resourceName: updated?.templateName ?? existing.templateName,
       beforeSnapshot: existing,
       afterSnapshot: updated,
-    });
+    }, tx);
     return updated;
   });
 }
 
-export async function listHotwords() {
-  const database = await getDb();
+export async function listHotwords(db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   return await database
     .prepare(`
       SELECT
@@ -1442,7 +1455,7 @@ export async function listHotwords() {
 }
 
 export async function createHotword(input: Omit<HotwordRow, "id">) {
-  return await withTransaction(async () => {
+  return await withTransaction(async (tx) => {
     const hotword: HotwordRow = {
       id: newId("hw"),
       term: requireNonEmpty(input.term, "Hotword term"),
@@ -1450,23 +1463,23 @@ export async function createHotword(input: Omit<HotwordRow, "id">) {
       status: normalizeStatus(input.status),
       note: input.note ?? "",
     };
-    await upsertHotword(hotword);
-    const created = (await listHotwords()).find((item) => item.id === hotword.id);
+    await upsertHotword(hotword, tx);
+    const created = (await listHotwords(tx)).find((item) => item.id === hotword.id);
     await writeAuditLog({
       actionType: "hotword.create",
       resourceType: "hotword",
       resourceId: hotword.id,
       resourceName: hotword.term,
       afterSnapshot: created,
-    });
+    }, tx);
     invalidateAsrRuntimeConfig();
     return created;
   });
 }
 
 export async function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>) {
-  return await withTransaction(async () => {
-    const existing = (await listHotwords()).find((item) => item.id === id);
+  return await withTransaction(async (tx) => {
+    const existing = (await listHotwords(tx)).find((item) => item.id === id);
     if (!existing) return null;
 
     const next: HotwordRow = {
@@ -1477,8 +1490,8 @@ export async function updateHotword(id: string, patch: Partial<Omit<HotwordRow, 
       note: patch.note ?? existing.note,
     };
 
-    await upsertHotword(next);
-    const updated = (await listHotwords()).find((item) => item.id === id);
+    await upsertHotword(next, tx);
+    const updated = (await listHotwords(tx)).find((item) => item.id === id);
     await writeAuditLog({
       actionType: "hotword.update",
       resourceType: "hotword",
@@ -1486,15 +1499,15 @@ export async function updateHotword(id: string, patch: Partial<Omit<HotwordRow, 
       resourceName: updated?.term ?? existing.term,
       beforeSnapshot: existing,
       afterSnapshot: updated,
-    });
+    }, tx);
     invalidateAsrRuntimeConfig();
     return updated;
   });
 }
 export async function deleteHotword(id: string) {
-  return await withTransaction(async () => {
-    const existing = (await listHotwords()).find((item) => item.id === id);
-    const result = await (await getDb()).prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
+  return await withTransaction(async (tx) => {
+    const existing = (await listHotwords(tx)).find((item) => item.id === id);
+    const result = await tx.prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
     const deleted = Number(result.changes ?? 0) > 0;
     if (!deleted) return false;
 
@@ -1504,7 +1517,7 @@ export async function deleteHotword(id: string) {
       resourceId: id,
       resourceName: existing?.term ?? id,
       beforeSnapshot: existing,
-    });
+    }, tx);
     invalidateAsrRuntimeConfig();
     return true;
   });
@@ -1524,8 +1537,8 @@ export async function listRoles() {
     .all<RoleRow>();
 }
 
-export async function listUsers() {
-  const users = await (await getDb())
+export async function listUsers(db?: AsyncDatabase) {
+  const users = await (db ?? (await getDb()))
     .prepare<UserRow>(`
       SELECT
         id,
@@ -1544,13 +1557,13 @@ export async function listUsers() {
   return Promise.all(
     users.map<Promise<UserWithRoles>>(async (user) => ({
       ...user,
-      roles: await listUserRoles(user.id),
+      roles: await listUserRoles(user.id, db),
     }))
   );
 }
 
-async function listUserRoles(userId: string) {
-  return await (await getDb())
+async function listUserRoles(userId: string, db?: AsyncDatabase) {
+  return await (db ?? (await getDb()))
     .prepare<RoleRow>(`
       SELECT
         r.id,
@@ -1571,8 +1584,8 @@ export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: strin
   const displayName = requireNonEmpty(input.displayName, "Display name");
   const initialPassword = validatePassword(input.initialPassword);
   const passwordHash = await hashPassword(initialPassword);
-  return await withTransaction(async () => {
-    (await getDb())
+  return await withTransaction(async (tx) => {
+    await tx
       .prepare(`
         INSERT INTO users (
           id, account_name, display_name, email, department, external_user_id,
@@ -1593,15 +1606,15 @@ export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: strin
         createdAt
       );
 
-    await setUserRoleKeys(id, input.roleKeys ?? ["user"]);
-    const user = (await listUsers()).find((item) => item.id === id);
+    await setUserRoleKeys(id, input.roleKeys ?? ["user"], tx);
+    const user = (await listUsers(tx)).find((item) => item.id === id);
     await writeAuditLog({
       actionType: "user.create",
       resourceType: "user",
       resourceId: id,
       resourceName: accountName,
       afterSnapshot: user,
-    });
+    }, tx);
     return user;
   });
 }
@@ -1612,17 +1625,17 @@ export async function resetUserPassword(userId: string, nextPassword: string) {
   if (!existing) return null;
 
   const passwordHash = await hashPassword(next);
-  return await withTransaction(async () => {
-    (await getDb())
+  return await withTransaction(async (tx) => {
+    await tx
       .prepare(`
         UPDATE users
         SET password_hash = ?, must_change_password = 1, updated_at = ?
         WHERE id = ?
       `)
       .run(passwordHash, nowIso(), userId);
-    await (await getDb()).prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    await tx.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
 
-    const updated = (await listUsers()).find((item) => item.id === userId);
+    const updated = (await listUsers(tx)).find((item) => item.id === userId);
     await writeAuditLog({
       actionType: "user.password_reset",
       resourceType: "user",
@@ -1633,18 +1646,18 @@ export async function resetUserPassword(userId: string, nextPassword: string) {
         mustChangePassword: true,
         sessionsRevoked: true,
       },
-    });
+    }, tx);
     return updated;
   });
 }
 
 export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[] }) {
-  return await withTransaction(async () => {
-    const before = (await listUsers()).find((item) => item.id === id);
+  return await withTransaction(async (tx) => {
+    const before = (await listUsers(tx)).find((item) => item.id === id);
     if (!before) return null;
     ensureUserChangeAllowed(id, patch);
 
-    (await getDb())
+    await tx
       .prepare(`
         UPDATE users
         SET account_name = ?, display_name = ?, email = ?, department = ?, status = ?, updated_at = ?
@@ -1661,10 +1674,10 @@ export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">>
       );
 
     if (patch.roleKeys !== undefined) {
-      await setUserRoleKeys(id, patch.roleKeys);
+      await setUserRoleKeys(id, patch.roleKeys, tx);
     }
 
-    const after = (await listUsers()).find((item) => item.id === id);
+    const after = (await listUsers(tx)).find((item) => item.id === id);
     await writeAuditLog({
       actionType: "user.update",
       resourceType: "user",
@@ -1672,15 +1685,15 @@ export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">>
       resourceName: after?.accountName ?? before.accountName,
       beforeSnapshot: before,
       afterSnapshot: after,
-    });
+    }, tx);
     return after;
   });
 }
 
-export async function setUserRoleKeys(userId: string, roleKeys: string[]) {
-  return await withTransaction(async () => {
+export async function setUserRoleKeys(userId: string, roleKeys: string[], db?: AsyncDatabase) {
+  return await withTransaction(async (tx) => {
     ensureUserRoleChangeAllowed(userId, roleKeys);
-    const database = await getDb();
+    const database = tx;
     const roles = await database
       .prepare(`SELECT id, role_key as roleKey FROM roles`)
       .all() as Array<{ id: string; roleKey: string }>;
@@ -1701,8 +1714,8 @@ export async function setUserRoleKeys(userId: string, roleKeys: string[]) {
         .run(newId("user-role"), userId, role.id, nowIso());
     }
 
-    return (await listUsers()).find((item) => item.id === userId) ?? null;
-  });
+    return (await listUsers(tx)).find((item) => item.id === userId) ?? null;
+  }, db);
 }
 
 function ensureUserChangeAllowed(
@@ -2171,11 +2184,11 @@ export async function changeUserPassword(accountName: string, currentPassword: s
   }
 
   const passwordHash = await hashPassword(next);
-  return await withTransaction(async () => {
-    (await getDb())
+  return await withTransaction(async (tx) => {
+    await tx
       .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
       .run(passwordHash, nowIso(), user.id);
-    await (await getDb()).prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
+    await tx.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
 
     return true;
   });
@@ -2216,9 +2229,9 @@ async function writeAuditLog(input: {
   errorMessage?: string | null;
   beforeSnapshot?: unknown;
   afterSnapshot?: unknown;
-}) {
+}, db?: AsyncDatabase) {
   const actor = getCurrentActor();
-  (await getDb())
+  await (db ?? (await getDb()))
     .prepare(`
       INSERT INTO audit_logs (
         id, actor_user_id, actor_account_name, actor_display_name,
@@ -2245,7 +2258,6 @@ async function writeAuditLog(input: {
 }
 
 export async function createMeeting(input: MeetingInput) {
-  const database = await getDb();
   const createdAt = nowIso();
   const meetingId = newId("meeting");
   const asrResultId = newId("asr");
@@ -2302,8 +2314,8 @@ export async function createMeeting(input: MeetingInput) {
       }
     : { captureSessionId, segments: transcriptSegments };
 
-  const meetingResult = await withTransaction(async () => {
-    await database
+  const meetingResult = await withTransaction(async (tx) => {
+    await tx
       .prepare(`
         INSERT INTO meetings (
           id, title, source_type, source_file_name, duration_seconds, status, status_updated_at,
@@ -2326,7 +2338,7 @@ export async function createMeeting(input: MeetingInput) {
         createdAt
       );
 
-    await database
+    await tx
       .prepare(`
         INSERT INTO meeting_asr_results (
           id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
@@ -2347,15 +2359,15 @@ export async function createMeeting(input: MeetingInput) {
       );
 
     if (captureSession) {
-      await database
+      await tx
         .prepare("DELETE FROM asr_capture_sessions WHERE capture_session_id = ?")
         .run(captureSessionId);
     }
 
     // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
-    await bindAudioRecordingsToMeeting({ meetingId, captureSessionIds });
+    await bindAudioRecordingsToMeeting({ meetingId, captureSessionIds }, tx);
 
-    const meeting = await getMeetingById(meetingId);
+    const meeting = await getMeetingById(meetingId, tx);
     await writeAuditLog({
       actionType: "meeting.create",
       resourceType: "meeting",
@@ -2371,7 +2383,7 @@ export async function createMeeting(input: MeetingInput) {
             durationLabel: meeting.durationLabel,
           }
         : null,
-    });
+    }, tx);
     return meeting;
   });
 
@@ -2390,7 +2402,6 @@ export async function appendMeetingTranscript(input: {
   const existing = await getMeetingById(input.meetingId);
   if (!existing) return null;
 
-  const database = await getDb();
   const createdAt = nowIso();
   const settings = await listSettings();
   const activeHotwords = await listActiveHotwordMap();
@@ -2437,8 +2448,8 @@ export async function appendMeetingTranscript(input: {
       }
     : { captureSessionId, segments: transcriptSegments };
 
-  return await withTransaction(async () => {
-    await database
+  return await withTransaction(async (tx) => {
+    await tx
       .prepare(`
         INSERT INTO meeting_asr_results (
           id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
@@ -2458,7 +2469,7 @@ export async function appendMeetingTranscript(input: {
         createdAt
       );
 
-    await database
+    await tx
       .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
       .run(createdAt, input.meetingId);
 
@@ -2466,15 +2477,16 @@ export async function appendMeetingTranscript(input: {
     await bindAudioRecordingsToMeeting({
       meetingId: input.meetingId,
       captureSessionIds: collectCaptureSessionIds(input),
-    });
+    }, tx);
 
-    return await getMeetingById(input.meetingId);
+    return await getMeetingById(input.meetingId, tx);
   });
 }
 
-export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null) {
+export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   const updatedAt = nowIso();
-  (await getDb())
+  await database
     .prepare(`
       UPDATE meetings
       SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
@@ -2482,7 +2494,7 @@ export async function updateMeetingStatus(id: string, status: string, lastErrorM
     `)
     .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id);
 
-  return await getMeetingById(id);
+  return await getMeetingById(id, db);
 }
 
 export async function updateTranscriptMeetingStatus(
@@ -2500,9 +2512,9 @@ export async function updateTranscriptMeetingStatus(
     throw new Error(`Invalid meeting status transition: ${existing.status} -> ${status}`);
   }
 
-  return await withTransaction(async () => {
+  return await withTransaction(async (tx) => {
     const updatedAt = nowIso();
-    const result = await (await getDb())
+    const result = await tx
       .prepare(`
         UPDATE meetings
         SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
@@ -2514,7 +2526,7 @@ export async function updateTranscriptMeetingStatus(
       throw new Error(`Meeting status changed before transition: ${id}`);
     }
 
-    const updated = await getMeetingById(id);
+    const updated = await getMeetingById(id, tx);
     await writeAuditLog({
       actionType: "meeting.status.update",
       resourceType: "meeting",
@@ -2534,19 +2546,19 @@ export async function updateTranscriptMeetingStatus(
             lastErrorMessage: updated.lastErrorMessage,
           }
         : null,
-    });
+    }, tx);
     return updated;
   });
 }
 
 export async function updateMeeting(id: string, patch: { title?: string }) {
-  return await withTransaction(async () => {
-    const existing = await getMeetingById(id);
+  return await withTransaction(async (tx) => {
+    const existing = await getMeetingById(id, tx);
     if (!existing) return null;
 
     const updatedAt = nowIso();
     const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
-    (await getDb())
+    await tx
       .prepare(`
         UPDATE meetings
         SET title = ?, updated_at = ?
@@ -2554,7 +2566,7 @@ export async function updateMeeting(id: string, patch: { title?: string }) {
       `)
       .run(nextTitle, updatedAt, id);
 
-    const updated = await getMeetingById(id);
+    const updated = await getMeetingById(id, tx);
     await writeAuditLog({
       actionType: "meeting.update",
       resourceType: "meeting",
@@ -2572,25 +2584,24 @@ export async function updateMeeting(id: string, patch: { title?: string }) {
             status: updated.status,
           }
         : null,
-    });
+    }, tx);
     return updated;
   });
 }
 
 export async function deleteMeeting(id: string) {
-  const { deleted, audioRows } = await withTransaction(async () => {
-    const database = await getDb();
+  const { deleted, audioRows } = await withTransaction(async (tx) => {
     const actor = getCurrentActor();
-    const before = await getMeetingById(id);
+    const before = await getMeetingById(id, tx);
     // 先取录音行（meetings 删除后 meeting_audio_recordings 会被 FK 级联清掉）
-    const removedAudio = await listAudioRecordingsForMeeting(id);
-    const result = await database
+    const removedAudio = await listAudioRecordingsForMeeting(id, tx);
+    const result = await tx
       .prepare("DELETE FROM meetings WHERE id = ? AND created_by_user_id = ?")
       .run(id, actor.id);
     const isDeleted = Number(result.changes ?? 0) > 0;
     if (isDeleted) {
       // 级联已清行；显式再删一次兜底（foreign_keys 未开时也不会留脏行）
-      await deleteAudioRecordingRowsForMeeting(id);
+      await deleteAudioRecordingRowsForMeeting(id, tx);
       await writeAuditLog({
         actionType: "meeting.delete",
         resourceType: "meeting",
@@ -2604,7 +2615,7 @@ export async function deleteMeeting(id: string) {
               lastErrorMessage: before.lastErrorMessage,
             }
           : null,
-      });
+      }, tx);
     }
     return { deleted: isDeleted, audioRows: isDeleted ? removedAudio : [] };
   });
@@ -2835,8 +2846,8 @@ export async function listMeetings() {
   });
 }
 
-async function queryMeetingRowById(id: string) {
-  return await (await getDb())
+async function queryMeetingRowById(id: string, db?: AsyncDatabase) {
+  return await (db ?? (await getDb()))
     .prepare(`
       SELECT
         m.id,
@@ -2859,20 +2870,20 @@ async function queryMeetingRowById(id: string) {
     .get<MeetingRow>(id);
 }
 
-async function ensureMeetingOwned(id: string) {
+async function ensureMeetingOwned(id: string, db?: AsyncDatabase) {
   const actor = getCurrentActor();
-  const owner = await (await getDb())
+  const owner = await (db ?? (await getDb()))
     .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
     .get(id) as { ownerId: string } | undefined;
   return Boolean(owner && owner.ownerId === actor.id);
 }
 
-export async function getMeetingLightById(id: string) {
-  if (!await ensureMeetingOwned(id)) return null;
-  const row = await queryMeetingRowById(id);
+export async function getMeetingLightById(id: string, db?: AsyncDatabase) {
+  if (!await ensureMeetingOwned(id, db)) return null;
+  const row = await queryMeetingRowById(id, db);
   if (!row) return null;
   const audio = projectMeetingAudio(
-    await listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    await listAudioRecordingsForMeeting(id, db) as MeetingAudioRow[],
     row.title ?? "录音"
   );
   return {
@@ -2882,23 +2893,23 @@ export async function getMeetingLightById(id: string) {
   };
 }
 
-export async function getMeetingById(id: string) {
-  if (!await ensureMeetingOwned(id)) return null;
-  const row = await queryMeetingRowById(id);
+export async function getMeetingById(id: string, db?: AsyncDatabase) {
+  if (!await ensureMeetingOwned(id, db)) return null;
+  const row = await queryMeetingRowById(id, db);
   if (!row) return null;
   const audio = projectMeetingAudio(
-    await listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    await listAudioRecordingsForMeeting(id, db) as MeetingAudioRow[],
     row.title ?? "录音"
   );
   return {
-    ...mapMeetingRow({ ...row, transcript: await getMergedMeetingTranscriptSegments(id) }),
+    ...mapMeetingRow({ ...row, transcript: await getMergedMeetingTranscriptSegments(id, db) }),
     hasAudio: audio.hasAudio,
     audioRecordings: audio.audioRecordings,
   };
 }
 
-async function getMeetingAsrRows(meetingId: string) {
-  return await (await getDb())
+async function getMeetingAsrRows(meetingId: string, db?: AsyncDatabase) {
+  return await (db ?? (await getDb()))
     .prepare(`
       SELECT
         id,
@@ -2928,8 +2939,8 @@ function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
   }));
 }
 
-async function getMergedMeetingTranscriptSegments(meetingId: string) {
-  return (await getMeetingAsrRows(meetingId)).flatMap((row) => {
+async function getMergedMeetingTranscriptSegments(meetingId: string, db?: AsyncDatabase) {
+  return (await getMeetingAsrRows(meetingId, db)).flatMap((row) => {
     const payload = parseJsonOr<JsonRecord>(row.rawPayload, {});
     const segments = parseTranscriptSegments(payload.transcriptSegments ?? payload.segments);
 
@@ -2947,15 +2958,15 @@ async function getMergedMeetingTranscriptSegments(meetingId: string) {
   });
 }
 
-async function getMergedMeetingTranscript(meetingId: string) {
-  return (await getMeetingAsrRows(meetingId))
+async function getMergedMeetingTranscript(meetingId: string, db?: AsyncDatabase) {
+  return (await getMeetingAsrRows(meetingId, db))
     .map((row) => String(row.normalizedText || "").trim())
     .filter(Boolean)
     .join("\n");
 }
 
-async function listMeetingLlmResultsByMeetingId(meetingId: string) {
-  const database = await getDb();
+async function listMeetingLlmResultsByMeetingId(meetingId: string, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   return await database
     .prepare(`
       SELECT
@@ -3267,7 +3278,7 @@ async function translateMeetingFlow(
       throw new Error("LLM returned empty translation result");
     }
 
-    await withTransaction(async () => {
+    await withTransaction(async (tx) => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3277,7 +3288,7 @@ async function translateMeetingFlow(
         generationConfigSnapshot: snapshot,
         generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
         status: "succeeded",
-        versionNo: await getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId, tx),
         resultType: "translation",
         resultTitle: template.templateName,
         rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
@@ -3285,8 +3296,8 @@ async function translateMeetingFlow(
         resultMarkdown,
         errorMessage: null,
       };
-      await insertMeetingLlmResult(row);
-      await updateMeetingStatus(meetingId, "generated");
+      await insertMeetingLlmResult(row, tx);
+      await updateMeetingStatus(meetingId, "generated", undefined, tx);
       await writeAuditLog({
         actionType: "llm.translate",
         resourceType: "meeting_llm_result",
@@ -3299,7 +3310,7 @@ async function translateMeetingFlow(
           status: row.status,
           targetLang: lang,
         },
-      });
+      }, tx);
     });
     console.log(
       `[LLM] translate: meeting=${meetingId} lang=${lang} segments=${segments.length} batches=${batches.length} elapsed=${Date.now() - startedAt}ms`
@@ -3309,7 +3320,7 @@ async function translateMeetingFlow(
     const elapsedMs = Date.now() - startedAt;
     const errorMessage = `Translation failed: ${error instanceof Error ? error.message : String(error)} (elapsed=${elapsedMs}ms)`;
     console.error(`[LLM] translate failed: meeting=${meetingId} error=${errorMessage}`);
-    await withTransaction(async () => {
+    await withTransaction(async (tx) => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3319,7 +3330,7 @@ async function translateMeetingFlow(
         generationConfigSnapshot: snapshot,
         generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
         status: "failed",
-        versionNo: await getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId, tx),
         resultType: "translation",
         resultTitle: template.templateName,
         rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
@@ -3327,8 +3338,8 @@ async function translateMeetingFlow(
         resultMarkdown: "",
         errorMessage,
       };
-      await insertMeetingLlmResult(row);
-      await updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      await insertMeetingLlmResult(row, tx);
+      await updateMeetingStatus(meetingId, "llm_failed", errorMessage, tx);
       await writeAuditLog({
         actionType: "llm.translate",
         resourceType: "meeting_llm_result",
@@ -3343,7 +3354,7 @@ async function translateMeetingFlow(
           status: row.status,
           targetLang: lang,
         },
-      });
+      }, tx);
     });
     throw error;
   }
@@ -3365,8 +3376,8 @@ export async function persistLiveTranslation(
     .map((segment) => segment.text.trim())
     .join("\n");
 
-  return await withTransaction(async () => {
-    const existing = await listMeetingLlmResultsByMeetingId(meetingId);
+  return await withTransaction(async (tx) => {
+    const existing = await listMeetingLlmResultsByMeetingId(meetingId, tx);
     const resultMarkdown = textBlocks.join("\n\n");
     const row: MeetingLlmResultRow = {
       id: newId("llm"),
@@ -3377,7 +3388,7 @@ export async function persistLiveTranslation(
       generationConfigSnapshot: JSON.stringify({ targetLang: targetLang || "en", source: "live" }),
       generationMode: "default_auto",
       status: "succeeded",
-      versionNo: await getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId, tx),
       resultType: "translation",
       resultTitle: "会议翻译",
       rawPrompt: "",
@@ -3385,7 +3396,7 @@ export async function persistLiveTranslation(
       resultMarkdown,
       errorMessage: null,
     };
-    await insertMeetingLlmResult(row);
+    await insertMeetingLlmResult(row, tx);
     await writeAuditLog({
       actionType: "llm.translate",
       resourceType: "meeting_llm_result",
@@ -3400,7 +3411,7 @@ export async function persistLiveTranslation(
         blockCount: textBlocks.length,
         existingResults: existing.length,
       },
-    });
+    }, tx);
     return row;
   });
 }
@@ -3543,8 +3554,8 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
     console.error(
       `[LLM] failed: meeting=${meetingId} error=${errorMessage}`
     );
-    await withTransaction(async () => {
-      const versionNo = await getNextLlmVersionNo(meetingId);
+    await withTransaction(async (tx) => {
+      const versionNo = await getNextLlmVersionNo(meetingId, tx);
       await insertMeetingLlmResult({
         id: newId("llm"),
         meetingId,
@@ -3561,8 +3572,8 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
         rawResponse: rawText ? rawText.slice(0, 4000) : "",
         resultMarkdown: "",
         errorMessage,
-      });
-      await updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      }, tx);
+      await updateMeetingStatus(meetingId, "llm_failed", errorMessage, tx);
       await writeAuditLog({
         actionType: existing.length > 0 ? "llm.regenerate" : "llm.generate_default",
         resourceType: "meeting",
@@ -3575,11 +3586,11 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
           versionNo,
           status: "failed",
         },
-      });
+      }, tx);
     });
     throw error;
   }
-  await withTransaction(async () => {
+  await withTransaction(async (tx) => {
     const row: MeetingLlmResultRow = {
       id: newId("llm"),
       meetingId,
@@ -3589,7 +3600,7 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
       generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
       generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
       status: "succeeded",
-      versionNo: await getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId, tx),
       resultType: template.templateType || "custom",
       resultTitle: template.templateName,
       rawPrompt: prompt,
@@ -3600,8 +3611,8 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
           ? "结果可能不完整（finish_reason=length，输出被截断）"
           : null,
     };
-    await insertMeetingLlmResult(row);
-    await updateMeetingStatus(meetingId, "generated");
+    await insertMeetingLlmResult(row, tx);
+    await updateMeetingStatus(meetingId, "generated", undefined, tx);
     await writeAuditLog({
       actionType: row.generationMode === "default_auto" ? "llm.generate_default" : "llm.regenerate",
       resourceType: "meeting_llm_result",
@@ -3613,14 +3624,14 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
         versionNo: row.versionNo,
         status: row.status,
       },
-    });
+    }, tx);
   });
 
   return (await listMeetingLlmResultsByMeetingId(meetingId))[0];
 }
 
-async function getNextLlmVersionNo(meetingId: string) {
-  const row = await (await getDb())
+async function getNextLlmVersionNo(meetingId: string, db?: AsyncDatabase) {
+  const row = await (db ?? (await getDb()))
     .prepare(`
       SELECT COALESCE(MAX(version_no), 0) + 1 as nextVersionNo
       FROM meeting_llm_results
@@ -3631,8 +3642,8 @@ async function getNextLlmVersionNo(meetingId: string) {
   return Number(row?.nextVersionNo ?? 1);
 }
 
-async function insertMeetingLlmResult(row: MeetingLlmResultRow) {
-  (await getDb())
+async function insertMeetingLlmResult(row: MeetingLlmResultRow, db?: AsyncDatabase) {
+  await (db ?? (await getDb()))
     .prepare(`
       INSERT INTO meeting_llm_results (
         id, meeting_id, input_transcript_snapshot, llm_setting_mark, prompt_template_id,
@@ -3815,7 +3826,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
     const errorMessage = `${baseMessage} (elapsed=${elapsedMs}ms)`;
     console.error(`[LLM] title failed: meeting=${meetingId} error=${errorMessage}`);
 
-    await withTransaction(async () => {
+    await withTransaction(async (tx) => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3825,7 +3836,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
         generationConfigSnapshot,
         generationMode: "manual_regenerate",
         status: "failed",
-        versionNo: await getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId, tx),
         resultType: TITLE_RESULT_TYPE,
         resultTitle: previousTitle,
         rawPrompt: built.prompt,
@@ -3833,7 +3844,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
         resultMarkdown: "",
         errorMessage,
       };
-      await insertMeetingLlmResult(row);
+      await insertMeetingLlmResult(row, tx);
       await writeAuditLog({
         actionType: "llm.title",
         resourceType: "meeting",
@@ -3849,19 +3860,18 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
           sentChars: built.sentChars,
           truncated: built.truncated,
         },
-      });
+      }, tx);
     });
 
     if (error instanceof AiTitleError) throw error;
     throw new AiTitleError(errorMessage, 502);
   }
 
-  return await withTransaction(async () => {
-    const database = await getDb();
+  return await withTransaction(async (tx) => {
     const updatedAt = nowIso();
     // 改名 + 记账在同一个事务里：要么都生效、要么都不发生（不留半更新状态）。
     // 并发点击时 title 是单条 UPDATE，天然原子，后者覆盖前者。
-    await database
+    await tx
       .prepare("UPDATE meetings SET title = ?, updated_at = ? WHERE id = ?")
       .run(title, updatedAt, meetingId);
 
@@ -3874,7 +3884,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
       generationConfigSnapshot,
       generationMode: "manual_regenerate",
       status: "succeeded",
-      versionNo: await getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId, tx),
       resultType: TITLE_RESULT_TYPE,
       resultTitle: title,
       rawPrompt: built.prompt,
@@ -3882,7 +3892,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
       resultMarkdown: title,
       errorMessage: null,
     };
-    await insertMeetingLlmResult(row);
+    await insertMeetingLlmResult(row, tx);
 
     await writeAuditLog({
       actionType: "llm.title",
@@ -3899,10 +3909,10 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
         sentChars: built.sentChars,
         truncated: built.truncated,
       },
-    });
+    }, tx);
 
     // 返回**与列表/详情同一个投影函数**的会议对象（#43 R2 教训：两处不能各拼一套）
-    const meeting = await getMeetingLightById(meetingId);
+    const meeting = await getMeetingLightById(meetingId, tx);
     return {
       title,
       previousTitle,
@@ -3917,16 +3927,15 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
 }
 
 export async function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
-  return await withTransaction(async () => {
-    if (!await ensureMeetingOwned(meetingId)) return null;
-    const existing = await getMeetingLlmResultById(id);
+  return await withTransaction(async (tx) => {
+    if (!await ensureMeetingOwned(meetingId, tx)) return null;
+    const existing = await getMeetingLlmResultById(id, tx);
     if (!existing) return null;
-    if (!await meetingLlmResultBelongsToMeeting(id, meetingId)) {
+    if (!await meetingLlmResultBelongsToMeeting(id, meetingId, tx)) {
       throw new Error("Meeting LLM result does not belong to this meeting");
     }
 
-    const database = await getDb();
-    await database
+    await tx
       .prepare(`
         UPDATE meeting_llm_results
         SET result_markdown = ?, result_title = ?
@@ -3938,7 +3947,7 @@ export async function updateMeetingLlmResult(meetingId: string, id: string, patc
         id
       );
 
-    const updated = await getMeetingLlmResultById(id);
+    const updated = await getMeetingLlmResultById(id, tx);
     await writeAuditLog({
       actionType: "llm_result.update",
       resourceType: "meeting_llm_result",
@@ -3951,23 +3960,22 @@ export async function updateMeetingLlmResult(meetingId: string, id: string, patc
         meetingId,
         resultTitle: updated?.resultTitle,
       },
-    });
+    }, tx);
     return updated;
   });
 }
 
 export async function deleteMeetingLlmResult(meetingId: string, id: string) {
-  return await withTransaction(async () => {
-    if (!await ensureMeetingOwned(meetingId)) return null;
-    const existing = await getMeetingLlmResultById(id);
+  return await withTransaction(async (tx) => {
+    if (!await ensureMeetingOwned(meetingId, tx)) return null;
+    const existing = await getMeetingLlmResultById(id, tx);
     if (!existing) return false;
-    if (!await meetingLlmResultBelongsToMeeting(id, meetingId)) {
+    if (!await meetingLlmResultBelongsToMeeting(id, meetingId, tx)) {
       throw new Error("Meeting LLM result does not belong to this meeting");
     }
 
-    const database = await getDb();
-    await database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
-    const result = await database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
+    await tx.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
+    const result = await tx.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
     const deleted = Number(result.changes ?? 0) > 0;
     if (deleted) {
       await writeAuditLog({
@@ -3980,14 +3988,14 @@ export async function deleteMeetingLlmResult(meetingId: string, id: string) {
           resultTitle: existing.resultTitle,
           resultMarkdown: existing.resultMarkdown,
         },
-      });
+      }, tx);
     }
     return deleted;
   });
 }
 
-async function getMeetingLlmResultById(id: string) {
-  const database = await getDb();
+async function getMeetingLlmResultById(id: string, db?: AsyncDatabase) {
+  const database = db ?? (await getDb());
   return database
     .prepare<MeetingLlmResultRow>(`
       SELECT
@@ -4013,8 +4021,8 @@ async function getMeetingLlmResultById(id: string) {
     .get<MeetingLlmResultRow>(id);
 }
 
-async function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string) {
-  const row = await (await getDb())
+async function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string, db?: AsyncDatabase) {
+  const row = await (db ?? (await getDb()))
     .prepare(`
       SELECT lr.id
       FROM meeting_llm_results lr
@@ -4160,7 +4168,7 @@ export async function createMeetingSendRecord(input: {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Mail send failed";
     const failedSendRecordId = newId("send");
-    await withTransaction(async () => {
+    await withTransaction(async (tx) => {
       await insertMeetingSendRecord({
         id: failedSendRecordId,
         meetingLlmResultId: input.meetingLlmResultId,
@@ -4177,8 +4185,8 @@ export async function createMeetingSendRecord(input: {
         providerMessageId: null,
         errorMessage,
         sentByUserId: getCurrentActor().id,
-      }, null);
-      await updateMeetingStatus(input.meetingId, "send_failed", errorMessage);
+      }, null, tx);
+      await updateMeetingStatus(input.meetingId, "send_failed", errorMessage, tx);
       await writeAuditLog({
         actionType: "mail.send",
         resourceType: "meeting_send_record",
@@ -4193,7 +4201,7 @@ export async function createMeetingSendRecord(input: {
           ccRecipients,
           status: "failed",
         },
-      });
+      }, tx);
     });
     throw error;
   }
@@ -4216,9 +4224,9 @@ export async function createMeetingSendRecord(input: {
     sentByUserId: getCurrentActor().id,
   };
 
-  await withTransaction(async () => {
-    await insertMeetingSendRecord(row, nowIso());
-    await updateMeetingStatus(input.meetingId, "sent");
+  await withTransaction(async (tx) => {
+    await insertMeetingSendRecord(row, nowIso(), tx);
+    await updateMeetingStatus(input.meetingId, "sent", undefined, tx);
     await writeAuditLog({
       actionType: "mail.send",
       resourceType: "meeting_send_record",
@@ -4231,14 +4239,14 @@ export async function createMeetingSendRecord(input: {
         ccRecipients,
         status: row.status,
       },
-    });
+    }, tx);
   });
 
   return (await listMeetingSendRecords(input.meetingId))?.[0] ?? null;
 }
 
-async function insertMeetingSendRecord(row: MeetingSendRecordRow, sentAt: string | null) {
-  (await getDb())
+async function insertMeetingSendRecord(row: MeetingSendRecordRow, sentAt: string | null, db?: AsyncDatabase) {
+  await (db ?? (await getDb()))
     .prepare(`
       INSERT INTO meeting_send_records (
         id, meeting_llm_result_id, mail_template_type, subject,

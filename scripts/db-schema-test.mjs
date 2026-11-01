@@ -112,6 +112,9 @@ async function polluteKnexVersion(db, versions) {
 // 后进入者把 `this.knex` 改写成自己的 trx，先退出者又指回自己的 outerKnex ⇒ 语句
 // 可能落在事务之外却仍返回「成功」，或 savepoint 名撞车报 `no such savepoint: sp_1`。
 //
+// issue #55 起事务句柄显式传递（`withTransaction(async (tx) => …)`），嵌套用 `tx`：
+// 语句只能落在事务连接上，普通 db 在事务上下文里调用 prepare/exec 会直接抛错（D2 防线）。
+//
 // 本套件真跑（不是源码级断言）四条：
 //   A 两个并发顶层事务：都提交、互不丢失、不报 savepoint 错
 //   B 并发下的嵌套事务：内层抛错只回滚内层，外层与另一个事务照常提交
@@ -141,15 +144,15 @@ async function runTransactionConcurrencySuite(db, dbType) {
     let concurrentError = null;
     try {
       await Promise.all([
-        db.withTransaction(async () => {
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a1", "A");
+        db.withTransaction(async (tx) => {
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a1", "A");
           await sleep(20);
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a2", "A");
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a2", "A");
         }),
-        db.withTransaction(async () => {
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b1", "B");
+        db.withTransaction(async (tx) => {
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b1", "B");
           await sleep(20);
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b2", "B");
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b2", "B");
         }),
       ]);
     } catch (error) {
@@ -170,20 +173,20 @@ async function runTransactionConcurrencySuite(db, dbType) {
     let nestedError = null;
     try {
       await Promise.all([
-        db.withTransaction(async () => {
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-outer", "C");
+        db.withTransaction(async (tx) => {
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-outer", "C");
           try {
-            await db.withTransaction(async () => {
-              await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-inner", "C");
+            await tx.withTransaction(async (tx2) => {
+              await tx2.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-inner", "C");
               throw new Error("inner-rollback");
             });
           } catch {
             // 内层异常被外层吞掉 → 外层应提交，内层那行必须已回滚
           }
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-after", "C");
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-after", "C");
         }),
-        db.withTransaction(async () => {
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("d-1", "D");
+        db.withTransaction(async (tx) => {
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("d-1", "D");
         }),
       ]);
     } catch (error) {
@@ -203,8 +206,8 @@ async function runTransactionConcurrencySuite(db, dbType) {
     if (dbType === "sqlite") {
       await db.prepare("DELETE FROM tx_probe").run();
       const rollbackTx = db
-        .withTransaction(async () => {
-          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("tx-doomed", "T");
+        .withTransaction(async (tx) => {
+          await tx.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("tx-doomed", "T");
           await sleep(30);
           throw new Error("rollback-whole");
         })
@@ -949,26 +952,26 @@ async function runDialectSuite(db, dbType) {
   // --- 3b. 事务并发回归（issue #54）：三库都跑 ---
   await runTransactionConcurrencySuite(db, dbType);
 
-  // --- 4. 嵌套事务语义（MSSQL 分支走 knex.transaction 后必须真测） ---
-  //    已知缺口：sqlite/mysql 的嵌套 savepoint 有独立缺陷（_txDepth 实例级 +
-  //    ROLLBACK TO SAVEPOINT sp_1），登记在 docs/design/db-dialect-portability.md，
-  //    归 #55 修，本单不碰 ⇒ 嵌套断言只在 mssql 上跑。
-  if (dbType === "mssql") {
+  // --- 4. 嵌套事务语义（issue #55 D5：三库都跑） ---
+  //    #54 时 sqlite/mysql 的嵌套 savepoint 有独立缺陷（`no such savepoint: sp_1`），
+  //    当时只在 mssql 上跑。 #55 把 savepoint 发在事务连接上（knex 嵌套事务），
+  //    三库都断言「内层回滚只影响内层」。
+  {
     await db.prepare("DELETE FROM schema_version").run();
     await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(KNEX_SCHEMA_VERSION);
 
     // 4a. 内层失败只回滚到内层，外层照常提交
-    await db.withTransaction(async () => {
-      await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(10);
+    await db.withTransaction(async (tx) => {
+      await tx.prepare("INSERT INTO schema_version (version) VALUES (?)").run(10);
       try {
-        await db.withTransaction(async () => {
-          await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(11);
+        await tx.withTransaction(async (tx2) => {
+          await tx2.prepare("INSERT INTO schema_version (version) VALUES (?)").run(11);
           throw new Error("inner-rollback");
         });
       } catch {
         // 内层异常在外层被吞掉 → 外层应提交
       }
-      await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(12);
+      await tx.prepare("INSERT INTO schema_version (version) VALUES (?)").run(12);
     });
     const afterInner = (
       await db.prepare("SELECT version FROM schema_version ORDER BY version").all()
@@ -984,9 +987,9 @@ async function runDialectSuite(db, dbType) {
     await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(KNEX_SCHEMA_VERSION);
     let outerThrew = false;
     try {
-      await db.withTransaction(async () => {
-        await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(20);
-        await db.withTransaction(async () => {
+      await db.withTransaction(async (tx) => {
+        await tx.prepare("INSERT INTO schema_version (version) VALUES (?)").run(20);
+        await tx.withTransaction(async () => {
           throw new Error("inner-propagate");
         });
       });
@@ -1094,10 +1097,13 @@ function runChild(args, env) {
   });
 }
 
-/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件与语义锁 */
+/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件、语义锁与事务套件 */
 async function mainMatrix({ allowSkip = false } = {}) {
   const self = fileURLToPath(import.meta.url);
   const semanticScript = join(process.cwd(), "scripts", "db-semantic-test.mjs");
+  // issue #55 D7：事务句柄/affected-rows 套件（scripts/db-tx-test.mjs）作为一个 job 挂进每个目标，
+  // 矩阵语义不变：任何 SKIP 即失败（外部靶子不可达时不许绿着过关）。
+  const txScript = join(process.cwd(), "scripts", "db-tx-test.mjs");
   const mysqlPassword = process.env.CI_MYSQL_PASSWORD || "";
   const mssqlPassword = process.env.CI_MSSQL_PASSWORD || "";
   const mysqlEnv = {
@@ -1121,6 +1127,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移全量", args: [self], env: {} },
         { name: "语义锁", args: [semanticScript], env: {} },
+        { name: "事务句柄/affected-rows", args: [txScript], env: {} },
       ],
     },
     {
@@ -1128,6 +1135,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mysqlEnv },
         { name: "语义锁", args: [semanticScript], env: mysqlEnv },
+        { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mysqlEnv },
       ],
     },
     {
@@ -1135,6 +1143,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mssqlEnv },
         { name: "语义锁", args: [semanticScript], env: mssqlEnv },
+        { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mssqlEnv },
       ],
     },
   ];

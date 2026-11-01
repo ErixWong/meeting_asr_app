@@ -503,8 +503,8 @@ async function runMigrations(db) {
   // 记账收敛：行数 > 1（历史缺陷遗留）或「无记录但结构已是最新」→ 写成唯一一行。
   // 值取 MAX(现存) 而不是最新版本号：收敛只做去重，版本推进由下面的迁移循环负责。
   if (rowCount > 1 || (rowCount === 0 && currentVersion > 0)) {
-    await db.withTransaction(async () => {
-      await writeSchemaVersion(db, currentVersion);
+    await db.withTransaction(async (tx) => {
+      await writeSchemaVersion(tx, currentVersion);
     });
     if (rowCount > 1) {
       console.log(`[DB] schema_version 收敛为单行: ${rowCount} 行 → v${currentVersion}`);
@@ -522,9 +522,10 @@ async function runMigrations(db) {
     const sortedMigrations = [...MIGRATIONS].sort((a, b) => a.version - b.version);
     for (const migration of sortedMigrations) {
       if (migration.version <= currentVersion) continue;
-      await db.withTransaction(async () => {
-        await migration.up(db);
-        await writeSchemaVersion(db, migration.version);
+      // 迁移体内的 DDL/记账必须落在事务连接上（issue #55）：显式用 tx，不再用 db
+      await db.withTransaction(async (tx) => {
+        await migration.up(tx);
+        await writeSchemaVersion(tx, migration.version);
       });
       console.log(`[DB] Migration applied: v${migration.version} (${migration.name}) [knex]`);
     }
