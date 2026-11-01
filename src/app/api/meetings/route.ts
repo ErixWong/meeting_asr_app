@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-  return NextResponse.json({ meetings: listMeetings() });
+  return NextResponse.json({ meetings: await listMeetings() });
   });
 }
 
@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
   try {
       const body = await req.json();
-      const meeting = createMeeting({
+      const meeting = await createMeeting({
         title: body.title,
         sourceType: body.sourceType,
         sourceFileName: body.sourceFileName ?? null,

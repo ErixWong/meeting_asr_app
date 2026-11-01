@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return withRequiredRoles(req, CONTENT_ROLES, async () => {
-  return NextResponse.json({ templates: listPromptTemplates() });
+  return NextResponse.json({ templates: await listPromptTemplates() });
   });
 }
 
@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
   try {
       const body = await req.json();
-      const template = createPromptTemplate({
+      const template = await createPromptTemplate({
         templateKey: body.templateKey,
         templateName: body.templateName,
         templateType: body.templateType,

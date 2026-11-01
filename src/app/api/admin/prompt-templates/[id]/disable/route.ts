@@ -6,7 +6,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   const { id } = await params;
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
-      const template = updatePromptTemplate(id, { status: "disabled" });
+      const template = await updatePromptTemplate(id, { status: "disabled" });
       if (!template) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

@@ -5,7 +5,7 @@ import { getActorRoleKeys } from "@/lib/admin-store";
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
-  const actor = getAuthenticatedActor(req);
+  const actor = await getAuthenticatedActor(req);
   if (!actor) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -17,7 +17,7 @@ export async function GET(req: Request) {
       displayName: actor.displayName,
       email: actor.email ?? "",
       mustChangePassword: Boolean(actor.mustChangePassword),
-      roles: getActorRoleKeys(actor.id, actor.status),
+      roles: await getActorRoleKeys(actor.id, actor.status),
     },
   });
 }

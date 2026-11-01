@@ -6,7 +6,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   const { id } = await params;
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
-      const hotword = updateHotword(id, { status: "disabled" });
+      const hotword = await updateHotword(id, { status: "disabled" });
       if (!hotword) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

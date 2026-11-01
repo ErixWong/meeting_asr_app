@@ -19,9 +19,9 @@ function readCookie(req: Request, name: string) {
   return decodeURIComponent(match.slice(name.length + 1));
 }
 
-export function getAuthenticatedActor(req: Request) {
+export async function getAuthenticatedActor(req: Request) {
   const sessionToken = readCookie(req, SESSION_COOKIE_NAME);
-  const sessionActor = getActorBySessionToken(sessionToken);
+  const sessionActor = await getActorBySessionToken(sessionToken);
   if (sessionActor) {
     return { ...sessionActor, mustChangePassword: Boolean(sessionActor.mustChangePassword) };
   }
@@ -29,7 +29,7 @@ export function getAuthenticatedActor(req: Request) {
   const accountName = getRequestAccountName(req);
   if (!accountName) return null;
 
-  const actor = getActorByAccountName(accountName);
+  const actor = await getActorByAccountName(accountName);
   if (!actor || actor.status !== "active") return null;
   return { ...actor, mustChangePassword: Boolean(actor.mustChangePassword) };
 }
@@ -46,19 +46,19 @@ function getRequestAccountName(req: Request) {
   return (req.headers.get("x-user-account") || req.headers.get("x-authenticated-user") || "").trim();
 }
 
-export function withRequiredRoles<T>(
+export async function withRequiredRoles<T>(
   req: Request,
   roleKeys: string[],
-  handler: () => T
+  handler: () => Promise<T> | T
 ) {
-  const auth = authorizeAnyRole(req, roleKeys);
+  const auth = await authorizeAnyRole(req, roleKeys);
   if ("response" in auth) return auth.response;
 
   return runWithActor(auth.actor, handler);
 }
 
-function authorizeAnyRole(req: Request, roleKeys: string[]) {
-  const actor = getAuthenticatedActor(req);
+async function authorizeAnyRole(req: Request, roleKeys: string[]) {
+  const actor = await getAuthenticatedActor(req);
   if (!actor) {
     return { response: NextResponse.json({ error: "Unauthorized" }, { status: 401 }) };
   }
@@ -72,7 +72,7 @@ function authorizeAnyRole(req: Request, roleKeys: string[]) {
     };
   }
 
-  const currentRoleKeys = new Set(getActorRoleKeys(actor.id, actor.status));
+  const currentRoleKeys = new Set(await getActorRoleKeys(actor.id, actor.status));
   if (roleKeys.some((roleKey) => currentRoleKeys.has(roleKey))) {
     return { actor };
   }

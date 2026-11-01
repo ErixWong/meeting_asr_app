@@ -1,9 +1,9 @@
 /**
  * 会议 AI 标题（feat-261101-04 / GitHub #44）
  *
- * 本文件只放**可单测的纯函数**与常量：不 import 任何运行时模块（`DatabaseSync` 是
- * type-only import，编译期擦除），因此 `scripts/ai-title-test.mjs` 可以直接 import
- * 真实源码做断言，不需要 mock 整个 admin-store。
+ * 本文件只放**可单测的纯函数**与常量：不 import 任何运行时模块（数据库句柄只用
+ * 结构类型 `TitleTemplateDatabase`，编译期擦除），因此 `scripts/ai-title-test.mjs`
+ * 可以直接 import 真实源码做断言，不需要 mock 整个 admin-store。
  *
  * 三块职责：
  *   1. `sanitizeMeetingTitle` —— LLM 输出清洗（引号/换行/首尾标点/空白/长度上限/空兜底）；
@@ -12,7 +12,17 @@
  *
  * 红线：长度按**字符（码点）**算，不按字节；清洗后绝不允许返回空串。
  */
-import type { DatabaseSync } from "node:sqlite";
+/**
+ * `ensureTitleTemplate` 只用到 `prepare(sql).run(...)`。
+ *
+ * 结构类型而不是具体驱动：`server/db-shared.mjs` 的 AsyncDb（Promise）与测试里的
+ * `node:sqlite` DatabaseSync（同步）都满足它 —— `await` 对两者都成立。
+ */
+export type TitleTemplateDatabase = {
+  prepare: (sql: string) => {
+    run: (...params: unknown[]) => PromiseLike<{ changes?: number | null }> | { changes?: number | null };
+  };
+};
 
 // ---------------------------------------------------------------------------
 // 模板常量：tpl-title（key = system_title，type = title）
@@ -255,8 +265,11 @@ export function buildTitlePrompt(
  *
  * @returns "inserted" = 本次插入了；"kept" = 已存在，保持原样
  */
-export function ensureTitleTemplate(database: DatabaseSync, now: string): "inserted" | "kept" {
-  const result = database
+export async function ensureTitleTemplate(
+  database: TitleTemplateDatabase,
+  now: string
+): Promise<"inserted" | "kept"> {
+  const result = await database
     .prepare(`
       INSERT INTO llm_prompt_templates (
         id, template_key, template_name, template_type, content, description, status, is_system, created_at, updated_at

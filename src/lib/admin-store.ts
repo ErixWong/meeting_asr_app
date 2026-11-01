@@ -1,5 +1,4 @@
-﻿import { DatabaseSync } from "node:sqlite";
-import { existsSync, statSync } from "node:fs";
+﻿import { existsSync, statSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -567,55 +566,90 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   },
 };
 
-let dbSeeded = false;
+let seedPromise: Promise<void> | null = null;
 const actorContext = new AsyncLocalStorage<ActorContext>();
-let transactionDepth = 0;
 
 const globalForLlmReconcile = globalThis as unknown as { __llmStuckReconciled?: boolean };
 
-function withTransaction<T>(callback: () => T): T {
-  const database = getDb();
-  if (transactionDepth > 0) return callback();
+/**
+ * Promise 化的数据库句柄（`server/db-shared.mjs` 的 AsyncDb）。
+ *
+ * 与 legacy `src/types/node-sqlite.d.ts` 的 `DatabaseSync` **同形**：
+ * `prepare<T>()` / `get<U>()` / `all<U>()` 的泛型调用写法不变，只是返回值变成 Promise。
+ * 这样 78 处迁移点只需补 `await`，类型断言与 SQL 文本逐字不变。
+ */
+type SqliteRow = Record<string, unknown>;
 
-  database.exec("BEGIN IMMEDIATE");
-  transactionDepth = 1;
+type AsyncStatement<T = SqliteRow> = {
+  run: (...params: unknown[]) => Promise<{ changes?: number; lastInsertRowid?: number | null }>;
+  get: <U = T>(...params: unknown[]) => Promise<U | undefined>;
+  all: <U = T>(...params: unknown[]) => Promise<U[]>;
+};
 
-  try {
-    const result = callback();
-    database.exec("COMMIT");
-    return result;
-  } catch (error) {
-    try {
-      database.exec("ROLLBACK");
-    } catch {
-      // Preserve the original database error if rollback itself fails.
-    }
-    throw error;
-  } finally {
-    transactionDepth = 0;
-  }
+type AsyncDatabase = {
+  exec: (sql: string) => Promise<void>;
+  prepare: <T = SqliteRow>(sql: string) => AsyncStatement<T>;
+  withTransaction: <U>(callback: () => Promise<U>) => Promise<U>;
+};
+
+/**
+ * 事务：直接交给 `AsyncDb.withTransaction()`（同一实例串行化，见 server/db/async-db.mjs）。
+ *
+ * 与 legacy 的差异：legacy 是「嵌套时直接把回调放进外层事务里跑」（扁平），现在是
+ * 「嵌套时开 savepoint」（内层回滚只影响内层）。两者在「内层异常向外穿透」时结果相同；
+ * 差别只出现在外层吞掉内层异常时（legacy 内层写入保留、新实现内层写入回滚），
+ * 本单所有调用点都不吞内层异常。详见交付报告「行为差异清单」。
+ */
+async function withTransaction<T>(callback: () => Promise<T>): Promise<T> {
+  const database = await getDb();
+  return database.withTransaction(callback);
 }
 
-function getDb(): DatabaseSync {
-  const database = getSharedDb();
-  if (!dbSeeded) {
-    dbSeeded = true;
-    migrateAuthSchema(database);
-    seedDefaults(database);
-    reconcileStuckLlmProcessing(database);
+/**
+ * 取数据库句柄（单例）。
+ *
+ * 首次调用做一次幂等初始化（auth 列自愈 → 种子数据 → 卡住的 LLM 任务收敛）；
+ * 异步化后用 single-flight promise 代替 legacy 的 `dbSeeded` 布尔值，避免并发首调重复跑。
+ *
+ * ⚠ 播种期间必须**重入放行**：seedDefaults / seedIdentityDefaults 内部会调用
+ * `upsertPromptTemplate` / `upsertHotword` / `writeAuditLog` 等仍然走 `getDb()` 的函数。
+ * 若这些调用也去 `await seedPromise`，就会等待「自己所在的那个 promise」—— 永久挂住
+ * （同步时代 `dbSeeded` 是布尔值，重入只会看到 true 直接返回句柄，所以没有这个问题）。
+ * 用 AsyncLocalStorage 标记播种上下文：**同一个异步上下文**内重入直接拿句柄，
+ * 其他并发调用仍然排队等播种完成。
+ */
+const seedingContext = new AsyncLocalStorage<AsyncDatabase>();
+
+async function getDb(): Promise<AsyncDatabase> {
+  const seedingDb = seedingContext.getStore();
+  if (seedingDb) return seedingDb;
+
+  const database = (await getSharedDb()) as unknown as AsyncDatabase;
+  if (!seedPromise) {
+    seedPromise = seedingContext
+      .run(database, async () => {
+        await migrateAuthSchema(database);
+        await seedDefaults(database);
+        await reconcileStuckLlmProcessing(database);
+      })
+      .catch((error) => {
+        seedPromise = null;
+        throw error;
+      });
   }
+  await seedPromise;
   return database;
 }
 
-function reconcileStuckLlmProcessing(database: DatabaseSync) {
+async function reconcileStuckLlmProcessing(database: AsyncDatabase) {
   if (globalForLlmReconcile.__llmStuckReconciled) return;
   globalForLlmReconcile.__llmStuckReconciled = true;
 
-  const stuck = database
+  const stuck = await database
     .prepare("SELECT id FROM meetings WHERE status = 'llm_processing'")
     .all() as Array<{ id: string }>;
   for (const row of stuck) {
-    database
+    await database
       .prepare(`
         UPDATE meetings
         SET status = 'llm_failed', last_error_message = ?, status_updated_at = ?, updated_at = ?
@@ -628,27 +662,27 @@ function reconcileStuckLlmProcessing(database: DatabaseSync) {
   }
 }
 
-function migrateAuthSchema(database: DatabaseSync) {
-  ensureColumn(database, "users", "password_hash", "TEXT");
-  ensureColumn(database, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0");
-  ensureColumn(database, "users", "last_login_at", "TEXT");
+async function migrateAuthSchema(database: AsyncDatabase) {
+  await ensureColumn(database, "users", "password_hash", "TEXT");
+  await ensureColumn(database, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(database, "users", "last_login_at", "TEXT");
 }
 
-function ensureColumn(database: DatabaseSync, tableName: string, columnName: string, definition: string) {
-  const columns = database.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+async function ensureColumn(database: AsyncDatabase, tableName: string, columnName: string, definition: string) {
+  const columns = (await database.prepare(`PRAGMA table_info(${tableName})`).all()) as Array<{ name: string }>;
   if (columns.some((column) => column.name === columnName)) return;
-  database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  await database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
 }
 
-function seedDefaults(database: DatabaseSync) {
+async function seedDefaults(database: AsyncDatabase) {
   const templateCount = Number(
-    database.prepare("SELECT COUNT(*) as count FROM llm_prompt_templates").get()?.count ?? 0
+    (await database.prepare("SELECT COUNT(*) as count FROM llm_prompt_templates").get())?.count ?? 0
   );
   const hotwordCount = Number(
-    database.prepare("SELECT COUNT(*) as count FROM asr_hotwords").get()?.count ?? 0
+    (await database.prepare("SELECT COUNT(*) as count FROM asr_hotwords").get())?.count ?? 0
   );
 
-  seedIdentityDefaults(database);
+  await seedIdentityDefaults(database);
 
   const defaults: SettingRow[] = [
       {
@@ -892,7 +926,7 @@ function seedDefaults(database: DatabaseSync) {
   ];
 
   for (const setting of defaults) {
-    insertMissingSetting(database, setting);
+    await insertMissingSetting(database, setting);
   }
 
   if (templateCount === 0) {
@@ -921,7 +955,7 @@ function seedDefaults(database: DatabaseSync) {
     ];
 
     for (const template of templates) {
-      upsertPromptTemplate(template);
+      await upsertPromptTemplate(template);
     }
   }
 
@@ -933,11 +967,11 @@ function seedDefaults(database: DatabaseSync) {
     ];
 
     for (const hotword of hotwords) {
-      upsertHotword(hotword);
+      await upsertHotword(hotword);
     }
   }
 
-  upsertPromptTemplate({
+  await upsertPromptTemplate({
     id: "tpl-translate",
     templateKey: "system_translate",
     templateName: "会议翻译",
@@ -953,11 +987,11 @@ function seedDefaults(database: DatabaseSync) {
   // 那一整块不会跑 —— 只靠种子会拿不到标题模板。语义与 tpl-translate 的覆盖式 upsert
   // 不同：**已有同名模板（id=tpl-title 或 template_key=system_title）就不覆盖**
   // （用户可能改过内容），缺失才插入。见 src/lib/ai-title.ts ensureTitleTemplate。
-  ensureTitleTemplate(database, nowIso());
+  await ensureTitleTemplate(database, nowIso());
 }
 
-function insertMissingSetting(database: DatabaseSync, setting: SettingRow) {
-  database
+async function insertMissingSetting(database: AsyncDatabase, setting: SettingRow) {
+  await database
     .prepare(`
       INSERT OR IGNORE INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -972,9 +1006,9 @@ function insertMissingSetting(database: DatabaseSync, setting: SettingRow) {
     );
 }
 
-function upsertSetting(setting: SettingRow) {
-  const database = getDb();
-  database
+async function upsertSetting(setting: SettingRow) {
+  const database = await getDb();
+  await database
     .prepare(`
       INSERT INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -994,13 +1028,13 @@ function upsertSetting(setting: SettingRow) {
     );
 }
 
-function upsertPromptTemplate(template: PromptTemplateRow) {
-  const database = getDb();
-  const existing = database
+async function upsertPromptTemplate(template: PromptTemplateRow) {
+  const database = await getDb();
+  const existing = await database
     .prepare("SELECT created_at as createdAt FROM llm_prompt_templates WHERE id = ?")
     .get(template.id) as { createdAt?: string } | undefined;
 
-  database
+  await database
     .prepare(`
       INSERT INTO llm_prompt_templates (id, template_key, template_name, template_type, content, description, status, is_system, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1028,13 +1062,13 @@ function upsertPromptTemplate(template: PromptTemplateRow) {
     );
 }
 
-function upsertHotword(hotword: HotwordRow) {
-  const database = getDb();
-  const existing = database
+async function upsertHotword(hotword: HotwordRow) {
+  const database = await getDb();
+  const existing = await database
     .prepare("SELECT created_at as createdAt FROM asr_hotwords WHERE id = ?")
     .get(hotword.id) as { createdAt?: string } | undefined;
 
-  database
+  await database
     .prepare(`
       INSERT INTO asr_hotwords (id, term, weight, status, note, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1060,9 +1094,9 @@ function isSecretSetting(setting: Pick<SettingRow, "itemSection" | "itemMark">) 
   return SECRET_SETTING_KEYS.has(`${setting.itemSection}:${setting.itemMark}`);
 }
 
-export function listSettings() {
-  const database = getDb();
-  return database
+export async function listSettings() {
+  const database = await getDb();
+  return await database
     .prepare(`
       SELECT
         item_section as itemSection,
@@ -1077,8 +1111,8 @@ export function listSettings() {
     .all<SettingRow>();
 }
 
-export function listSettingsForAdmin() {
-  return (listSettings() as Array<SettingRow & { updatedAt?: string }>).map((setting) => ({
+export async function listSettingsForAdmin() {
+  return (await listSettings() as Array<SettingRow & { updatedAt?: string }>).map((setting) => ({
     ...setting,
     itemValue: isSecretSetting(setting) ? "" : setting.itemValue,
     isSecret: isSecretSetting(setting),
@@ -1086,14 +1120,14 @@ export function listSettingsForAdmin() {
   }));
 }
 
-export function getSettingValue(section: string, mark: string) {
-  const row = (listSettings() as Array<SettingRow>)
+export async function getSettingValue(section: string, mark: string) {
+  const row = (await listSettings() as Array<SettingRow>)
     .find((setting) => setting.itemSection === section && setting.itemMark === mark);
   return row?.itemValue ?? "";
 }
 
-function buildDisableThinkingParams(): Record<string, unknown> {
-  if (getSettingValue("llm", "thinking_model") === "0") return {};
+async function buildDisableThinkingParams(): Promise<Record<string, unknown>>{
+  if (await getSettingValue("llm", "thinking_model") === "0") return {};
   return {
     enable_thinking: false,
     chat_template_kwargs: { enable_thinking: false },
@@ -1114,9 +1148,9 @@ export interface TranslateResult {
 }
 
 export async function translateSentences(sentences: string[], targetLang: string): Promise<TranslateResult> {
-  const baseUrl = getSettingValue("llm", "base_url");
-  const apiKey = getSettingValue("llm", "api_key");
-  const model = getSettingValue("llm", "model");
+  const baseUrl = await getSettingValue("llm", "base_url");
+  const apiKey = await getSettingValue("llm", "api_key");
+  const model = await getSettingValue("llm", "model");
   if (!baseUrl || !model) throw new Error("LLM config incomplete");
 
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
@@ -1166,9 +1200,9 @@ export interface TranslateSelectionResult {
 }
 
 export async function translateSelection(text: string, targetLang: string): Promise<TranslateSelectionResult> {
-  const baseUrl = getSettingValue("llm", "base_url");
-  const apiKey = getSettingValue("llm", "api_key");
-  const model = getSettingValue("llm", "model");
+  const baseUrl = await getSettingValue("llm", "base_url");
+  const apiKey = await getSettingValue("llm", "api_key");
+  const model = await getSettingValue("llm", "model");
   if (!baseUrl || !model) throw new Error("LLM config incomplete");
 
   const endpoint = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
@@ -1225,9 +1259,9 @@ export async function translateSelection(text: string, targetLang: string): Prom
   }
 }
 
-setLlmQueueConfigReader(() => {
-  const concurrency = Number(String(getSettingValue("llm", "max_concurrency") || "").trim());
-  const capacity = Number(String(getSettingValue("llm", "queue_capacity") || "").trim());
+setLlmQueueConfigReader(async () => {
+  const concurrency = Number(String((await getSettingValue("llm", "max_concurrency")) || "").trim());
+  const capacity = Number(String((await getSettingValue("llm", "queue_capacity")) || "").trim());
   return {
     maxConcurrency: Number.isFinite(concurrency) && concurrency > 0 ? concurrency : 2,
     capacity: Number.isFinite(capacity) && capacity > 0 ? capacity : 10,
@@ -1280,11 +1314,11 @@ function validateSettings(settings: unknown): SettingRow[] {
   });
 }
 
-export function saveSettings(settings: unknown) {
+export async function saveSettings(settings: unknown) {
   const validatedSettings = validateSettings(settings);
-  return withTransaction(() => {
+  return await withTransaction(async () => {
     const existingSettings = new Map(
-      (listSettings() as SettingRow[]).map((setting) => [
+      (await listSettings() as SettingRow[]).map((setting) => [
         `${setting.itemSection}:${setting.itemMark}`,
         setting,
       ])
@@ -1294,9 +1328,9 @@ export function saveSettings(settings: unknown) {
       const nextSetting = isSecretSetting(setting) && setting.itemValue === "" && existing?.itemValue
         ? { ...setting, itemValue: existing.itemValue }
         : setting;
-      upsertSetting(nextSetting);
+      await upsertSetting(nextSetting);
     }
-    writeAuditLog({
+    await writeAuditLog({
       actionType: "settings.update",
       resourceType: "settings",
       resourceId: "app_settings",
@@ -1312,9 +1346,9 @@ export function saveSettings(settings: unknown) {
   });
 }
 
-export function listPromptTemplates() {
-  const database = getDb();
-  return database
+export async function listPromptTemplates() {
+  const database = await getDb();
+  return await database
     .prepare(`
       SELECT
         id,
@@ -1331,11 +1365,11 @@ export function listPromptTemplates() {
       ORDER BY created_at ASC
     `)
     .all<PromptTemplateRow>()
-    .map((row) => ({ ...row, isSystem: Boolean(row.isSystem) }));
+    .then((rows) => rows.map((row) => ({ ...row, isSystem: Boolean(row.isSystem) })));
 }
 
-export function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSystem"> & { isSystem?: boolean }) {
-  return withTransaction(() => {
+export async function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSystem"> & { isSystem?: boolean }) {
+  return await withTransaction(async () => {
     const template: PromptTemplateRow = {
       id: newId("tpl"),
       isSystem: input.isSystem ?? false,
@@ -1346,9 +1380,9 @@ export function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSy
       description: input.description ?? "",
       status: normalizeStatus(input.status),
     };
-    upsertPromptTemplate(template);
-    const created = listPromptTemplates().find((item) => item.id === template.id);
-    writeAuditLog({
+    await upsertPromptTemplate(template);
+    const created = (await listPromptTemplates()).find((item) => item.id === template.id);
+    await writeAuditLog({
       actionType: "prompt_template.create",
       resourceType: "prompt_template",
       resourceId: template.id,
@@ -1359,9 +1393,9 @@ export function createPromptTemplate(input: Omit<PromptTemplateRow, "id" | "isSy
   });
 }
 
-export function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTemplateRow, "id">>) {
-  return withTransaction(() => {
-    const existing = listPromptTemplates().find((item) => item.id === id);
+export async function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTemplateRow, "id">>) {
+  return await withTransaction(async () => {
+    const existing = (await listPromptTemplates()).find((item) => item.id === id);
     if (!existing) return null;
 
     const next: PromptTemplateRow = {
@@ -1375,9 +1409,9 @@ export function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTempl
       isSystem: patch.isSystem ?? existing.isSystem,
     };
 
-    upsertPromptTemplate(next);
-    const updated = listPromptTemplates().find((item) => item.id === id);
-    writeAuditLog({
+    await upsertPromptTemplate(next);
+    const updated = (await listPromptTemplates()).find((item) => item.id === id);
+    await writeAuditLog({
       actionType: "prompt_template.update",
       resourceType: "prompt_template",
       resourceId: id,
@@ -1389,9 +1423,9 @@ export function updatePromptTemplate(id: string, patch: Partial<Omit<PromptTempl
   });
 }
 
-export function listHotwords() {
-  const database = getDb();
-  return database
+export async function listHotwords() {
+  const database = await getDb();
+  return await database
     .prepare(`
       SELECT
         id,
@@ -1407,8 +1441,8 @@ export function listHotwords() {
     .all<HotwordRow>();
 }
 
-export function createHotword(input: Omit<HotwordRow, "id">) {
-  return withTransaction(() => {
+export async function createHotword(input: Omit<HotwordRow, "id">) {
+  return await withTransaction(async () => {
     const hotword: HotwordRow = {
       id: newId("hw"),
       term: requireNonEmpty(input.term, "Hotword term"),
@@ -1416,9 +1450,9 @@ export function createHotword(input: Omit<HotwordRow, "id">) {
       status: normalizeStatus(input.status),
       note: input.note ?? "",
     };
-    upsertHotword(hotword);
-    const created = listHotwords().find((item) => item.id === hotword.id);
-    writeAuditLog({
+    await upsertHotword(hotword);
+    const created = (await listHotwords()).find((item) => item.id === hotword.id);
+    await writeAuditLog({
       actionType: "hotword.create",
       resourceType: "hotword",
       resourceId: hotword.id,
@@ -1430,9 +1464,9 @@ export function createHotword(input: Omit<HotwordRow, "id">) {
   });
 }
 
-export function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>) {
-  return withTransaction(() => {
-    const existing = listHotwords().find((item) => item.id === id);
+export async function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>) {
+  return await withTransaction(async () => {
+    const existing = (await listHotwords()).find((item) => item.id === id);
     if (!existing) return null;
 
     const next: HotwordRow = {
@@ -1443,9 +1477,9 @@ export function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>
       note: patch.note ?? existing.note,
     };
 
-    upsertHotword(next);
-    const updated = listHotwords().find((item) => item.id === id);
-    writeAuditLog({
+    await upsertHotword(next);
+    const updated = (await listHotwords()).find((item) => item.id === id);
+    await writeAuditLog({
       actionType: "hotword.update",
       resourceType: "hotword",
       resourceId: id,
@@ -1457,14 +1491,14 @@ export function updateHotword(id: string, patch: Partial<Omit<HotwordRow, "id">>
     return updated;
   });
 }
-export function deleteHotword(id: string) {
-  return withTransaction(() => {
-    const existing = listHotwords().find((item) => item.id === id);
-    const result = getDb().prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
+export async function deleteHotword(id: string) {
+  return await withTransaction(async () => {
+    const existing = (await listHotwords()).find((item) => item.id === id);
+    const result = await (await getDb()).prepare("DELETE FROM asr_hotwords WHERE id = ?").run(id);
     const deleted = Number(result.changes ?? 0) > 0;
     if (!deleted) return false;
 
-    writeAuditLog({
+    await writeAuditLog({
       actionType: "hotword.delete",
       resourceType: "hotword",
       resourceId: id,
@@ -1476,8 +1510,8 @@ export function deleteHotword(id: string) {
   });
 }
 
-export function listRoles() {
-  return getDb()
+export async function listRoles() {
+  return await (await getDb())
     .prepare<RoleRow>(`
       SELECT
         id,
@@ -1487,11 +1521,11 @@ export function listRoles() {
       FROM roles
       ORDER BY role_key ASC
     `)
-    .all();
+    .all<RoleRow>();
 }
 
-export function listUsers() {
-  const users = getDb()
+export async function listUsers() {
+  const users = await (await getDb())
     .prepare<UserRow>(`
       SELECT
         id,
@@ -1505,16 +1539,18 @@ export function listUsers() {
       FROM users
       ORDER BY created_at ASC
     `)
-    .all();
+    .all<UserRow>();
 
-  return users.map<UserWithRoles>((user) => ({
-    ...user,
-    roles: listUserRoles(user.id),
-  }));
+  return Promise.all(
+    users.map<Promise<UserWithRoles>>(async (user) => ({
+      ...user,
+      roles: await listUserRoles(user.id),
+    }))
+  );
 }
 
-function listUserRoles(userId: string) {
-  return getDb()
+async function listUserRoles(userId: string) {
+  return await (await getDb())
     .prepare<RoleRow>(`
       SELECT
         r.id,
@@ -1525,7 +1561,7 @@ function listUserRoles(userId: string) {
       WHERE ur.user_id = ?
       ORDER BY r.role_key ASC
     `)
-    .all(userId);
+    .all<RoleRow>(userId);
 }
 
 export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: string[]; initialPassword: string }) {
@@ -1535,8 +1571,8 @@ export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: strin
   const displayName = requireNonEmpty(input.displayName, "Display name");
   const initialPassword = validatePassword(input.initialPassword);
   const passwordHash = await hashPassword(initialPassword);
-  return withTransaction(() => {
-    getDb()
+  return await withTransaction(async () => {
+    (await getDb())
       .prepare(`
         INSERT INTO users (
           id, account_name, display_name, email, department, external_user_id,
@@ -1557,9 +1593,9 @@ export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: strin
         createdAt
       );
 
-    setUserRoleKeys(id, input.roleKeys ?? ["user"]);
-    const user = listUsers().find((item) => item.id === id);
-    writeAuditLog({
+    await setUserRoleKeys(id, input.roleKeys ?? ["user"]);
+    const user = (await listUsers()).find((item) => item.id === id);
+    await writeAuditLog({
       actionType: "user.create",
       resourceType: "user",
       resourceId: id,
@@ -1572,22 +1608,22 @@ export async function createUser(input: Omit<UserRow, "id"> & { roleKeys?: strin
 
 export async function resetUserPassword(userId: string, nextPassword: string) {
   const next = validatePassword(nextPassword);
-  const existing = listUsers().find((item) => item.id === userId);
+  const existing = (await listUsers()).find((item) => item.id === userId);
   if (!existing) return null;
 
   const passwordHash = await hashPassword(next);
-  return withTransaction(() => {
-    getDb()
+  return await withTransaction(async () => {
+    (await getDb())
       .prepare(`
         UPDATE users
         SET password_hash = ?, must_change_password = 1, updated_at = ?
         WHERE id = ?
       `)
       .run(passwordHash, nowIso(), userId);
-    getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
+    await (await getDb()).prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(userId);
 
-    const updated = listUsers().find((item) => item.id === userId);
-    writeAuditLog({
+    const updated = (await listUsers()).find((item) => item.id === userId);
+    await writeAuditLog({
       actionType: "user.password_reset",
       resourceType: "user",
       resourceId: userId,
@@ -1602,13 +1638,13 @@ export async function resetUserPassword(userId: string, nextPassword: string) {
   });
 }
 
-export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[] }) {
-  return withTransaction(() => {
-    const before = listUsers().find((item) => item.id === id);
+export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { roleKeys?: string[] }) {
+  return await withTransaction(async () => {
+    const before = (await listUsers()).find((item) => item.id === id);
     if (!before) return null;
     ensureUserChangeAllowed(id, patch);
 
-    getDb()
+    (await getDb())
       .prepare(`
         UPDATE users
         SET account_name = ?, display_name = ?, email = ?, department = ?, status = ?, updated_at = ?
@@ -1625,11 +1661,11 @@ export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { r
       );
 
     if (patch.roleKeys !== undefined) {
-      setUserRoleKeys(id, patch.roleKeys);
+      await setUserRoleKeys(id, patch.roleKeys);
     }
 
-    const after = listUsers().find((item) => item.id === id);
-    writeAuditLog({
+    const after = (await listUsers()).find((item) => item.id === id);
+    await writeAuditLog({
       actionType: "user.update",
       resourceType: "user",
       resourceId: id,
@@ -1641,11 +1677,11 @@ export function updateUser(id: string, patch: Partial<Omit<UserRow, "id">> & { r
   });
 }
 
-export function setUserRoleKeys(userId: string, roleKeys: string[]) {
-  return withTransaction(() => {
+export async function setUserRoleKeys(userId: string, roleKeys: string[]) {
+  return await withTransaction(async () => {
     ensureUserRoleChangeAllowed(userId, roleKeys);
-    const database = getDb();
-    const roles = database
+    const database = await getDb();
+    const roles = await database
       .prepare(`SELECT id, role_key as roleKey FROM roles`)
       .all() as Array<{ id: string; roleKey: string }>;
     const selectedRoles = roles.filter((role) => roleKeys.includes(role.roleKey));
@@ -1655,9 +1691,9 @@ export function setUserRoleKeys(userId: string, roleKeys: string[]) {
       throw new Error(`Unknown role keys: ${unknownRoleKeys.join(", ")}`);
     }
 
-    database.prepare("DELETE FROM user_roles WHERE user_id = ?").run(userId);
+    await database.prepare("DELETE FROM user_roles WHERE user_id = ?").run(userId);
     for (const role of selectedRoles) {
-      database
+      await database
         .prepare(`
         INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
           VALUES (?, ?, ?, ?)
@@ -1665,7 +1701,7 @@ export function setUserRoleKeys(userId: string, roleKeys: string[]) {
         .run(newId("user-role"), userId, role.id, nowIso());
     }
 
-    return listUsers().find((item) => item.id === userId) ?? null;
+    return (await listUsers()).find((item) => item.id === userId) ?? null;
   });
 }
 
@@ -1690,8 +1726,8 @@ function ensureUserRoleChangeAllowed(userId: string, roleKeys: string[]) {
   }
 }
 
-export function listAuditLogs(limit = 100) {
-  return getDb()
+export async function listAuditLogs(limit = 100) {
+  return await (await getDb())
           .prepare<AuditLogRow>(`
       SELECT
         id,
@@ -1712,13 +1748,13 @@ export function listAuditLogs(limit = 100) {
     .all(limit);
 }
 
-export function cleanupExpiredAuditLogs(retentionDays = 30) {
-  return cleanupSharedAuditLogs(retentionDays);
+export async function cleanupExpiredAuditLogs(retentionDays = 30) {
+  return await cleanupSharedAuditLogs(retentionDays);
 }
 
-export function getRuntimeConfig() {
-  const settings = listSettings();
-  const templates = listPromptTemplates();
+export async function getRuntimeConfig() {
+  const settings = await listSettings();
+  const templates = await listPromptTemplates();
 
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
@@ -1756,18 +1792,18 @@ export function getRuntimeConfig() {
   };
 }
 
-export function listActiveHotwordMap() {
-  const active = listHotwords().filter((item) => item.status === "active");
+export async function listActiveHotwordMap() {
+  const active = (await listHotwords()).filter((item) => item.status === "active");
   return active.reduce<Record<string, number>>((acc, item) => {
     acc[item.term] = Number(item.weight);
     return acc;
   }, {});
 }
 
-function getAsrCaptureSession(captureSessionId: string) {
+async function getAsrCaptureSession(captureSessionId: string) {
   if (!captureSessionId) return null;
 
-  const row = getDb()
+  const row = (await (await getDb())
     .prepare(`
       SELECT
         capture_session_id as captureSessionId,
@@ -1779,7 +1815,7 @@ function getAsrCaptureSession(captureSessionId: string) {
       FROM asr_capture_sessions
       WHERE capture_session_id = ?
     `)
-    .get(captureSessionId) as AsrCaptureSessionRow | undefined;
+    .get(captureSessionId)) as AsrCaptureSessionRow | undefined;
 
   return row ?? null;
 }
@@ -1839,7 +1875,7 @@ async function hashPassword(password: string) {
   return `${PASSWORD_SCHEME}$16384$8$1$${salt}$${key.toString("hex")}`;
 }
 
-// 仅供 getDb() 同步初始化（seedIdentityDefaults）使用；交互路径一律使用异步 hashPassword。
+// 仅供 await getDb() 同步初始化（seedIdentityDefaults）使用；交互路径一律使用异步 hashPassword。
 function hashPasswordSync(password: string) {
   const salt = randomBytes(16).toString("hex");
   const key = scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString("hex");
@@ -1889,9 +1925,9 @@ function sessionExpiryIso() {
   return expiresAt.toISOString();
 }
 
-function seedIdentityDefaults(database: DatabaseSync) {
+async function seedIdentityDefaults(database: AsyncDatabase) {
   const userCount = Number(
-    database.prepare("SELECT COUNT(*) as count FROM users").get()?.count ?? 0
+    (await database.prepare("SELECT COUNT(*) as count FROM users").get())?.count ?? 0
   );
   const bootstrapAdminAccount = getBootstrapAdminAccount();
   const bootstrapAdminPassword = getBootstrapAdminPassword();
@@ -1902,7 +1938,7 @@ function seedIdentityDefaults(database: DatabaseSync) {
   ];
 
   for (const role of roles) {
-    database
+    await database
       .prepare(`
         INSERT INTO roles (id, role_key, role_name, created_at)
         VALUES (?, ?, ?, ?)
@@ -1911,43 +1947,45 @@ function seedIdentityDefaults(database: DatabaseSync) {
       .run(role.id, role.roleKey, role.roleName, nowIso());
   }
 
-  const systemAdminRole = database
+  const systemAdminRole = await database
     .prepare("SELECT id FROM roles WHERE role_key = 'system_admin'")
     .get() as { id: string } | undefined;
-  const legacyMinutesAdminRole = database
+  const legacyMinutesAdminRole = await database
     .prepare("SELECT id FROM roles WHERE role_key = 'minutes_admin'")
     .get() as { id: string } | undefined;
 
   if (systemAdminRole && legacyMinutesAdminRole) {
-    database
+    await database
       .prepare(`
         UPDATE OR IGNORE user_roles
         SET role_id = ?
         WHERE role_id = ?
       `)
       .run(systemAdminRole.id, legacyMinutesAdminRole.id);
-    database.prepare("DELETE FROM roles WHERE id = ?").run(legacyMinutesAdminRole.id);
+    await database.prepare("DELETE FROM roles WHERE id = ?").run(legacyMinutesAdminRole.id);
   }
 
-  const existingBootstrapAdmin = database
+  const existingBootstrapAdmin = await database
     .prepare("SELECT id FROM users WHERE account_name = ?")
     .get(bootstrapAdminAccount) as { id: string } | undefined;
   const systemAdminCount = Number(
-    database
-      .prepare(`
-        SELECT COUNT(*) as count
-        FROM users u
-        INNER JOIN user_roles ur ON ur.user_id = u.id
-        INNER JOIN roles r ON r.id = ur.role_id
-        WHERE r.role_key = 'system_admin' AND u.status = 'active'
-      `)
-      .get()?.count ?? 0
+    (
+      await database
+        .prepare(`
+          SELECT COUNT(*) as count
+          FROM users u
+          INNER JOIN user_roles ur ON ur.user_id = u.id
+          INNER JOIN roles r ON r.id = ur.role_id
+          WHERE r.role_key = 'system_admin' AND u.status = 'active'
+        `)
+        .get()
+    )?.count ?? 0
   );
   const shouldCreateBootstrapAdmin =
     bootstrapAdminAccount && !existingBootstrapAdmin && (userCount === 0 || systemAdminCount === 0);
 
   if (shouldCreateBootstrapAdmin) {
-    database
+    await database
       .prepare(`
         INSERT INTO users (
           id, account_name, display_name, email, department, external_user_id,
@@ -1969,16 +2007,16 @@ function seedIdentityDefaults(database: DatabaseSync) {
       );
   }
 
-  const adminUser = database
+  const adminUser = await database
     .prepare("SELECT id, password_hash as passwordHash FROM users WHERE account_name = ?")
     .get(bootstrapAdminAccount) as { id: string; passwordHash?: string | null } | undefined;
-  const adminRole = database
+  const adminRole = await database
     .prepare("SELECT id FROM roles WHERE role_key = ?")
     .get("system_admin") as { id: string } | undefined;
 
   if (adminUser && adminRole) {
     if (!adminUser.passwordHash) {
-      database
+      await database
         .prepare("UPDATE users SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?")
         .run(
           hashPasswordSync(bootstrapAdminPassword.password),
@@ -1988,7 +2026,7 @@ function seedIdentityDefaults(database: DatabaseSync) {
         );
     }
 
-    database
+    await database
       .prepare(`
         INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
         VALUES (?, ?, ?, ?)
@@ -2008,11 +2046,11 @@ export function runWithActor<T>(actor: ActorContext, callback: () => T): T {
   return actorContext.run(actor, callback);
 }
 
-export function getActorByAccountName(accountName: string) {
+export async function getActorByAccountName(accountName: string) {
   const normalizedAccount = String(accountName ?? "").trim();
   if (!normalizedAccount) return null;
 
-  return getDb()
+  return await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -2031,7 +2069,7 @@ export async function authenticateUser(accountName: string, password: string) {
   const normalizedAccount = String(accountName ?? "").trim();
   if (!normalizedAccount || !password) return null;
 
-  const user = getDb()
+  const user = await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -2051,12 +2089,12 @@ export async function authenticateUser(accountName: string, password: string) {
 
   if (verification.needsRehash) {
     const passwordHash = await hashPassword(password);
-    getDb()
+    (await getDb())
       .prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
       .run(passwordHash, nowIso(), user.id);
   }
 
-  getDb()
+  (await getDb())
     .prepare("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?")
     .run(nowIso(), nowIso(), user.id);
 
@@ -2069,10 +2107,10 @@ export async function authenticateUser(accountName: string, password: string) {
   };
 }
 
-export function createAuthSession(userId: string) {
+export async function createAuthSession(userId: string) {
   const token = randomBytes(32).toString("base64url");
   const expiresAt = sessionExpiryIso();
-  getDb()
+  (await getDb())
     .prepare(`
       INSERT INTO auth_sessions (id, user_id, token_hash, expires_at, created_at, last_seen_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -2082,11 +2120,11 @@ export function createAuthSession(userId: string) {
   return { token, expiresAt };
 }
 
-export function getActorBySessionToken(token: string) {
+export async function getActorBySessionToken(token: string) {
   const sessionToken = String(token ?? "").trim();
   if (!sessionToken) return null;
 
-  const row = getDb()
+  const row = await (await getDb())
     .prepare(`
       SELECT
         u.id,
@@ -2103,24 +2141,24 @@ export function getActorBySessionToken(token: string) {
 
   if (!row || row.status !== "active") return null;
 
-  getDb()
+  (await getDb())
     .prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?")
     .run(nowIso(), hashSessionToken(sessionToken));
 
   return { ...row, mustChangePassword: Boolean(row.mustChangePassword) };
 }
 
-export function deleteAuthSession(token: string) {
+export async function deleteAuthSession(token: string) {
   const sessionToken = String(token ?? "").trim();
   if (!sessionToken) return;
-  getDb().prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(hashSessionToken(sessionToken));
+  await (await getDb()).prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(hashSessionToken(sessionToken));
 }
 
 export async function changeUserPassword(accountName: string, currentPassword: string, nextPassword: string) {
   const normalizedAccount = requireNonEmpty(accountName, "Account name");
   const next = validatePassword(nextPassword);
 
-  const user = getDb()
+  const user = await (await getDb())
     .prepare(`
       SELECT id, password_hash as passwordHash
       FROM users
@@ -2133,42 +2171,43 @@ export async function changeUserPassword(accountName: string, currentPassword: s
   }
 
   const passwordHash = await hashPassword(next);
-  return withTransaction(() => {
-    getDb()
+  return await withTransaction(async () => {
+    (await getDb())
       .prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
       .run(passwordHash, nowIso(), user.id);
-    getDb().prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
+    await (await getDb()).prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(user.id);
 
     return true;
   });
 }
 
-export function getCurrentActorRoleKeys() {
+export async function getCurrentActorRoleKeys() {
   const actor = getCurrentActor();
-  return getActorRoleKeys(actor.id, actor.status);
+  return await getActorRoleKeys(actor.id, actor.status);
 }
 
-export function getActorRoleKeys(userId: string, status = "active") {
+export async function getActorRoleKeys(userId: string, status = "active") {
   if (status !== "active") return [];
 
-  return getDb()
-    .prepare(`
-      SELECT r.role_key as roleKey
-      FROM user_roles ur
-      INNER JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = ?
-      ORDER BY r.role_key ASC
-    `)
-    .all(userId)
-    .map((row) => row.roleKey);
+  return (
+    await (await getDb())
+      .prepare(`
+        SELECT r.role_key as roleKey
+        FROM user_roles ur
+        INNER JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = ?
+        ORDER BY r.role_key ASC
+      `)
+      .all(userId)
+  ).map((row) => row.roleKey);
 }
 
-export function currentActorHasAnyRole(roleKeys: string[]) {
-  const currentRoleKeys = new Set(getCurrentActorRoleKeys());
+export async function currentActorHasAnyRole(roleKeys: string[]) {
+  const currentRoleKeys = new Set(await getCurrentActorRoleKeys());
   return roleKeys.some((roleKey) => currentRoleKeys.has(roleKey));
 }
 
-function writeAuditLog(input: {
+async function writeAuditLog(input: {
   actionType: string;
   resourceType: string;
   resourceId: string;
@@ -2179,7 +2218,7 @@ function writeAuditLog(input: {
   afterSnapshot?: unknown;
 }) {
   const actor = getCurrentActor();
-  getDb()
+  (await getDb())
     .prepare(`
       INSERT INTO audit_logs (
         id, actor_user_id, actor_account_name, actor_display_name,
@@ -2205,13 +2244,13 @@ function writeAuditLog(input: {
     );
 }
 
-export function createMeeting(input: MeetingInput) {
-  const database = getDb();
+export async function createMeeting(input: MeetingInput) {
+  const database = await getDb();
   const createdAt = nowIso();
   const meetingId = newId("meeting");
   const asrResultId = newId("asr");
-  const settings = listSettings();
-  const activeHotwords = listActiveHotwordMap();
+  const settings = await listSettings();
+  const activeHotwords = await listActiveHotwordMap();
   const actor = getCurrentActor();
 
   const get = (section: string, mark: string) =>
@@ -2228,9 +2267,9 @@ export function createMeeting(input: MeetingInput) {
   const captureSessionIds = collectCaptureSessionIds(input);
   const captureSessionId = String(input.captureSessionId || captureSessionIds[0] || "").trim();
   if (captureSessionId) {
-    drainCaptureEvents(captureSessionId);
+    await drainCaptureEvents(captureSessionId);
   }
-  const captureSession = getAsrCaptureSession(captureSessionId);
+  const captureSession = await getAsrCaptureSession(captureSessionId);
   const captureStats = captureSession ? getCaptureSessionStats(captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
@@ -2263,8 +2302,8 @@ export function createMeeting(input: MeetingInput) {
       }
     : { captureSessionId, segments: transcriptSegments };
 
-  const meetingResult = withTransaction(() => {
-    database
+  const meetingResult = await withTransaction(async () => {
+    await database
       .prepare(`
         INSERT INTO meetings (
           id, title, source_type, source_file_name, duration_seconds, status, status_updated_at,
@@ -2287,7 +2326,7 @@ export function createMeeting(input: MeetingInput) {
         createdAt
       );
 
-    database
+    await database
       .prepare(`
         INSERT INTO meeting_asr_results (
           id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
@@ -2308,16 +2347,16 @@ export function createMeeting(input: MeetingInput) {
       );
 
     if (captureSession) {
-      database
+      await database
         .prepare("DELETE FROM asr_capture_sessions WHERE capture_session_id = ?")
         .run(captureSessionId);
     }
 
     // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
-    bindAudioRecordingsToMeeting({ meetingId, captureSessionIds });
+    await bindAudioRecordingsToMeeting({ meetingId, captureSessionIds });
 
-    const meeting = getMeetingById(meetingId);
-    writeAuditLog({
+    const meeting = await getMeetingById(meetingId);
+    await writeAuditLog({
       actionType: "meeting.create",
       resourceType: "meeting",
       resourceId: meetingId,
@@ -2342,19 +2381,19 @@ export function createMeeting(input: MeetingInput) {
   return meetingResult;
 }
 
-export function appendMeetingTranscript(input: {
+export async function appendMeetingTranscript(input: {
   meetingId: string;
   captureSessionId: string;
   captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
 }) {
-  const existing = getMeetingById(input.meetingId);
+  const existing = await getMeetingById(input.meetingId);
   if (!existing) return null;
 
-  const database = getDb();
+  const database = await getDb();
   const createdAt = nowIso();
-  const settings = listSettings();
-  const activeHotwords = listActiveHotwordMap();
+  const settings = await listSettings();
+  const activeHotwords = await listActiveHotwordMap();
   const transcriptSegments = Array.isArray(input.transcriptSegments) ? input.transcriptSegments : [];
   const normalizedText = transcriptSegments.map((segment) => String(segment.text ?? "")).join("");
   if (!normalizedText.trim()) return existing;
@@ -2363,9 +2402,9 @@ export function appendMeetingTranscript(input: {
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
   const captureSessionId = String(input.captureSessionId || "").trim();
   if (captureSessionId) {
-    drainCaptureEvents(captureSessionId);
+    await drainCaptureEvents(captureSessionId);
   }
-  const captureSession = getAsrCaptureSession(captureSessionId);
+  const captureSession = await getAsrCaptureSession(captureSessionId);
   const captureStats = captureSession ? getCaptureSessionStats(captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
@@ -2398,8 +2437,8 @@ export function appendMeetingTranscript(input: {
       }
     : { captureSessionId, segments: transcriptSegments };
 
-  return withTransaction(() => {
-    database
+  return await withTransaction(async () => {
+    await database
       .prepare(`
         INSERT INTO meeting_asr_results (
           id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
@@ -2419,23 +2458,23 @@ export function appendMeetingTranscript(input: {
         createdAt
       );
 
-    database
+    await database
       .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
       .run(createdAt, input.meetingId);
 
     // feat-261101-01：增量落定路径同样把录音绑定到会议（幂等，重复绑不报错）
-    bindAudioRecordingsToMeeting({
+    await bindAudioRecordingsToMeeting({
       meetingId: input.meetingId,
       captureSessionIds: collectCaptureSessionIds(input),
     });
 
-    return getMeetingById(input.meetingId);
+    return await getMeetingById(input.meetingId);
   });
 }
 
-export function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null) {
+export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null) {
   const updatedAt = nowIso();
-  getDb()
+  (await getDb())
     .prepare(`
       UPDATE meetings
       SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
@@ -2443,15 +2482,15 @@ export function updateMeetingStatus(id: string, status: string, lastErrorMessage
     `)
     .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id);
 
-  return getMeetingById(id);
+  return await getMeetingById(id);
 }
 
-export function updateTranscriptMeetingStatus(
+export async function updateTranscriptMeetingStatus(
   id: string,
   status: "paused" | "transcribed",
   lastErrorMessage?: string | null
 ) {
-  const existing = getMeetingById(id);
+  const existing = await getMeetingById(id);
   if (!existing) return null;
 
   const allowedFrom = status === "paused"
@@ -2461,9 +2500,9 @@ export function updateTranscriptMeetingStatus(
     throw new Error(`Invalid meeting status transition: ${existing.status} -> ${status}`);
   }
 
-  return withTransaction(() => {
+  return await withTransaction(async () => {
     const updatedAt = nowIso();
-    const result = getDb()
+    const result = await (await getDb())
       .prepare(`
         UPDATE meetings
         SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
@@ -2475,8 +2514,8 @@ export function updateTranscriptMeetingStatus(
       throw new Error(`Meeting status changed before transition: ${id}`);
     }
 
-    const updated = getMeetingById(id);
-    writeAuditLog({
+    const updated = await getMeetingById(id);
+    await writeAuditLog({
       actionType: "meeting.status.update",
       resourceType: "meeting",
       resourceId: id,
@@ -2500,14 +2539,14 @@ export function updateTranscriptMeetingStatus(
   });
 }
 
-export function updateMeeting(id: string, patch: { title?: string }) {
-  return withTransaction(() => {
-    const existing = getMeetingById(id);
+export async function updateMeeting(id: string, patch: { title?: string }) {
+  return await withTransaction(async () => {
+    const existing = await getMeetingById(id);
     if (!existing) return null;
 
     const updatedAt = nowIso();
     const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
-    getDb()
+    (await getDb())
       .prepare(`
         UPDATE meetings
         SET title = ?, updated_at = ?
@@ -2515,8 +2554,8 @@ export function updateMeeting(id: string, patch: { title?: string }) {
       `)
       .run(nextTitle, updatedAt, id);
 
-    const updated = getMeetingById(id);
-    writeAuditLog({
+    const updated = await getMeetingById(id);
+    await writeAuditLog({
       actionType: "meeting.update",
       resourceType: "meeting",
       resourceId: id,
@@ -2538,21 +2577,21 @@ export function updateMeeting(id: string, patch: { title?: string }) {
   });
 }
 
-export function deleteMeeting(id: string) {
-  const { deleted, audioRows } = withTransaction(() => {
-    const database = getDb();
+export async function deleteMeeting(id: string) {
+  const { deleted, audioRows } = await withTransaction(async () => {
+    const database = await getDb();
     const actor = getCurrentActor();
-    const before = getMeetingById(id);
+    const before = await getMeetingById(id);
     // 先取录音行（meetings 删除后 meeting_audio_recordings 会被 FK 级联清掉）
-    const removedAudio = listAudioRecordingsForMeeting(id);
-    const result = database
+    const removedAudio = await listAudioRecordingsForMeeting(id);
+    const result = await database
       .prepare("DELETE FROM meetings WHERE id = ? AND created_by_user_id = ?")
       .run(id, actor.id);
     const isDeleted = Number(result.changes ?? 0) > 0;
     if (isDeleted) {
       // 级联已清行；显式再删一次兜底（foreign_keys 未开时也不会留脏行）
-      deleteAudioRecordingRowsForMeeting(id);
-      writeAuditLog({
+      await deleteAudioRecordingRowsForMeeting(id);
+      await writeAuditLog({
         actionType: "meeting.delete",
         resourceType: "meeting",
         resourceId: id,
@@ -2675,18 +2714,18 @@ export function projectMeetingAudio(
 }
 // #endregion meeting-audio-projection
 
-export function getMeetingAudioRecordings(meetingId: string): MeetingAudioClientRow[] {
-  if (!meetingId || !ensureMeetingOwned(meetingId)) return [];
-  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
-  return projectMeetingAudio(rows, queryMeetingRowById(meetingId)?.title ?? "录音").audioRecordings;
+export async function getMeetingAudioRecordings(meetingId: string): Promise<MeetingAudioClientRow[]>{
+  if (!meetingId || !await ensureMeetingOwned(meetingId)) return [];
+  const rows = await listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  return projectMeetingAudio(rows, (await queryMeetingRowById(meetingId))?.title ?? "录音").audioRecordings;
 }
 
 /** 播放/下载用：属主校验后返回磁盘绝对路径 + 元信息。 */
-export function getMeetingAudioFile(input: { meetingId: string; recordingId?: string | null }) {
+export async function getMeetingAudioFile(input: { meetingId: string; recordingId?: string | null }) {
   const { meetingId } = input;
-  if (!meetingId || !ensureMeetingOwned(meetingId)) return null;
+  if (!meetingId || !await ensureMeetingOwned(meetingId)) return null;
 
-  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  const rows = await listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
   const readyRows = rows.filter((row) => row.status === "ready" && row.filePath);
   const recordingId = String(input.recordingId || "").trim();
   const target = recordingId
@@ -2706,7 +2745,7 @@ export function getMeetingAudioFile(input: { meetingId: string; recordingId?: st
   const stats = statSync(absolutePath);
   if (!stats.isFile()) return null;
 
-  const meetingTitle = queryMeetingRowById(meetingId)?.title ?? "录音";
+  const meetingTitle = (await queryMeetingRowById(meetingId))?.title ?? "录音";
   return {
     filePath: absolutePath,
     size: stats.size,
@@ -2720,9 +2759,9 @@ export function getMeetingAudioFile(input: { meetingId: string; recordingId?: st
  * 只查投影需要的列 —— `file_path` / `raw_file_path` 在 SQL 层就不查，从源头杜绝磁盘路径外泄。
  * 排序与 `listAudioRecordingsForMeeting` 一致（created_at, id），保证列表/详情下载文件名序号相同。
  */
-function listMeetingAudioRowsByMeeting(): Map<string, MeetingAudioRow[]> {
+async function listMeetingAudioRowsByMeeting(): Promise<Map<string, MeetingAudioRow[]>>{
   const actor = getCurrentActor();
-  const rows = getDb()
+  const rows = await (await getDb())
     .prepare(`
       SELECT
         r.id,
@@ -2758,10 +2797,10 @@ function listMeetingAudioRowsByMeeting(): Map<string, MeetingAudioRow[]> {
   return grouped;
 }
 
-export function listMeetings() {
-  const database = getDb();
+export async function listMeetings() {
+  const database = await getDb();
   const actor = getCurrentActor();
-  const rows = database
+  const rows = await database
     .prepare(`
       SELECT
         m.id,
@@ -2784,7 +2823,7 @@ export function listMeetings() {
     `)
     .all<MeetingRow>(actor.id);
 
-  const audioByMeeting = listMeetingAudioRowsByMeeting();
+  const audioByMeeting = await listMeetingAudioRowsByMeeting();
 
   return rows.map((row) => {
     const audio = projectMeetingAudio(audioByMeeting.get(String(row.id)) ?? [], row.title ?? "录音");
@@ -2796,8 +2835,8 @@ export function listMeetings() {
   });
 }
 
-function queryMeetingRowById(id: string) {
-  return getDb()
+async function queryMeetingRowById(id: string) {
+  return await (await getDb())
     .prepare(`
       SELECT
         m.id,
@@ -2820,20 +2859,20 @@ function queryMeetingRowById(id: string) {
     .get<MeetingRow>(id);
 }
 
-function ensureMeetingOwned(id: string) {
+async function ensureMeetingOwned(id: string) {
   const actor = getCurrentActor();
-  const owner = getDb()
+  const owner = await (await getDb())
     .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
     .get(id) as { ownerId: string } | undefined;
   return Boolean(owner && owner.ownerId === actor.id);
 }
 
-export function getMeetingLightById(id: string) {
-  if (!ensureMeetingOwned(id)) return null;
-  const row = queryMeetingRowById(id);
+export async function getMeetingLightById(id: string) {
+  if (!await ensureMeetingOwned(id)) return null;
+  const row = await queryMeetingRowById(id);
   if (!row) return null;
   const audio = projectMeetingAudio(
-    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    await listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
     row.title ?? "录音"
   );
   return {
@@ -2843,23 +2882,23 @@ export function getMeetingLightById(id: string) {
   };
 }
 
-export function getMeetingById(id: string) {
-  if (!ensureMeetingOwned(id)) return null;
-  const row = queryMeetingRowById(id);
+export async function getMeetingById(id: string) {
+  if (!await ensureMeetingOwned(id)) return null;
+  const row = await queryMeetingRowById(id);
   if (!row) return null;
   const audio = projectMeetingAudio(
-    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    await listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
     row.title ?? "录音"
   );
   return {
-    ...mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) }),
+    ...mapMeetingRow({ ...row, transcript: await getMergedMeetingTranscriptSegments(id) }),
     hasAudio: audio.hasAudio,
     audioRecordings: audio.audioRecordings,
   };
 }
 
-function getMeetingAsrRows(meetingId: string) {
-  return getDb()
+async function getMeetingAsrRows(meetingId: string) {
+  return await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -2889,8 +2928,8 @@ function parseTranscriptSegments(value: unknown): TranscriptSegment[] {
   }));
 }
 
-function getMergedMeetingTranscriptSegments(meetingId: string) {
-  return getMeetingAsrRows(meetingId).flatMap((row) => {
+async function getMergedMeetingTranscriptSegments(meetingId: string) {
+  return (await getMeetingAsrRows(meetingId)).flatMap((row) => {
     const payload = parseJsonOr<JsonRecord>(row.rawPayload, {});
     const segments = parseTranscriptSegments(payload.transcriptSegments ?? payload.segments);
 
@@ -2908,16 +2947,16 @@ function getMergedMeetingTranscriptSegments(meetingId: string) {
   });
 }
 
-function getMergedMeetingTranscript(meetingId: string) {
-  return getMeetingAsrRows(meetingId)
+async function getMergedMeetingTranscript(meetingId: string) {
+  return (await getMeetingAsrRows(meetingId))
     .map((row) => String(row.normalizedText || "").trim())
     .filter(Boolean)
     .join("\n");
 }
 
-function listMeetingLlmResultsByMeetingId(meetingId: string) {
-  const database = getDb();
-  return database
+async function listMeetingLlmResultsByMeetingId(meetingId: string) {
+  const database = await getDb();
+  return await database
     .prepare(`
       SELECT
         id,
@@ -2941,9 +2980,9 @@ function listMeetingLlmResultsByMeetingId(meetingId: string) {
     .all<MeetingLlmResultRow>(meetingId);
 }
 
-export function listMeetingAsrResults(meetingId: string) {
-  if (!ensureMeetingOwned(meetingId)) return null;
-  return getDb()
+export async function listMeetingAsrResults(meetingId: string) {
+  if (!await ensureMeetingOwned(meetingId)) return null;
+  return await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -2962,9 +3001,9 @@ export function listMeetingAsrResults(meetingId: string) {
     .all<MeetingAsrSummaryRow>(meetingId);
 }
 
-export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
-  if (!ensureMeetingOwned(meetingId)) return null;
-  const row = getDb()
+export async function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
+  if (!await ensureMeetingOwned(meetingId)) return null;
+  const row = await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -2991,9 +3030,9 @@ export function getMeetingAsrResultDetail(meetingId: string, resultId: string) {
   };
 }
 
-export function listMeetingLlmResultSummaries(meetingId: string) {
-  if (!ensureMeetingOwned(meetingId)) return null;
-  return getDb()
+export async function listMeetingLlmResultSummaries(meetingId: string) {
+  if (!await ensureMeetingOwned(meetingId)) return null;
+  return await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -3014,9 +3053,9 @@ export function listMeetingLlmResultSummaries(meetingId: string) {
     .all<Pick<MeetingLlmResultRow, "id" | "meetingId" | "promptTemplateId" | "generationMode" | "status" | "versionNo" | "resultType" | "resultTitle" | "generationConfigSnapshot" | "errorMessage" | "createdAt">>(meetingId);
 }
 
-export function getMeetingLlmResultDetail(meetingId: string, resultId: string) {
-  if (!ensureMeetingOwned(meetingId)) return null;
-  return getDb()
+export async function getMeetingLlmResultDetail(meetingId: string, resultId: string) {
+  if (!await ensureMeetingOwned(meetingId)) return null;
+  return await (await getDb())
     .prepare(`
       SELECT
         id,
@@ -3138,17 +3177,17 @@ export function setLlmTransport(transport: LlmTransport | null) {
 
 let llmTransport: LlmTransport = llmRequest;
 
-export function claimMeetingLlmGeneration(meetingId: string):
-  { ok: true } | { ok: false; status: 404 | 409; error: string } {
-  const database = getDb();
-  const owner = database
+export async function claimMeetingLlmGeneration(meetingId: string):
+  Promise<{ ok: true } | { ok: false; status: 404 | 409; error: string }> {
+  const database = await getDb();
+  const owner = await database
     .prepare("SELECT created_by_user_id as ownerId FROM meetings WHERE id = ?")
     .get(meetingId) as { ownerId: string } | undefined;
   if (!owner || owner.ownerId !== getCurrentActor().id) {
     return { ok: false, status: 404, error: "Meeting not found" };
   }
 
-  const claim = database
+  const claim = await database
     .prepare(`
       UPDATE meetings
       SET status = 'llm_processing', status_updated_at = ?, last_error_message = NULL, updated_at = ?
@@ -3170,7 +3209,7 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
       error instanceof Error &&
       error.message.includes("LLM queue")
     ) {
-      updateMeetingStatus(meetingId, "llm_failed", `LLM queue busy: ${error.message}`);
+      await updateMeetingStatus(meetingId, "llm_failed", `LLM queue busy: ${error.message}`);
     }
     throw error;
   }
@@ -3186,10 +3225,10 @@ async function translateMeetingFlow(
   targetLang: string | undefined
 ) {
   const lang = targetLang || "en";
-  const segments = getMergedMeetingTranscriptSegments(meetingId)
+  const segments = (await getMergedMeetingTranscriptSegments(meetingId))
     .filter((segment) => segment.isFinal && Boolean(segment.text.trim()))
     .map((segment) => segment.text.trim());
-  const existing = listMeetingLlmResultsByMeetingId(meetingId);
+  const existing = await listMeetingLlmResultsByMeetingId(meetingId);
   const startedAt = Date.now();
   const snapshot = JSON.stringify({
     targetLang: lang,
@@ -3228,7 +3267,7 @@ async function translateMeetingFlow(
       throw new Error("LLM returned empty translation result");
     }
 
-    withTransaction(() => {
+    await withTransaction(async () => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3238,7 +3277,7 @@ async function translateMeetingFlow(
         generationConfigSnapshot: snapshot,
         generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
         status: "succeeded",
-        versionNo: getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId),
         resultType: "translation",
         resultTitle: template.templateName,
         rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
@@ -3246,9 +3285,9 @@ async function translateMeetingFlow(
         resultMarkdown,
         errorMessage: null,
       };
-      insertMeetingLlmResult(row);
-      updateMeetingStatus(meetingId, "generated");
-      writeAuditLog({
+      await insertMeetingLlmResult(row);
+      await updateMeetingStatus(meetingId, "generated");
+      await writeAuditLog({
         actionType: "llm.translate",
         resourceType: "meeting_llm_result",
         resourceId: row.id,
@@ -3270,7 +3309,7 @@ async function translateMeetingFlow(
     const elapsedMs = Date.now() - startedAt;
     const errorMessage = `Translation failed: ${error instanceof Error ? error.message : String(error)} (elapsed=${elapsedMs}ms)`;
     console.error(`[LLM] translate failed: meeting=${meetingId} error=${errorMessage}`);
-    withTransaction(() => {
+    await withTransaction(async () => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3280,7 +3319,7 @@ async function translateMeetingFlow(
         generationConfigSnapshot: snapshot,
         generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
         status: "failed",
-        versionNo: getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId),
         resultType: "translation",
         resultTitle: template.templateName,
         rawPrompt: inputTranscriptSnapshot.slice(0, 4000),
@@ -3288,9 +3327,9 @@ async function translateMeetingFlow(
         resultMarkdown: "",
         errorMessage,
       };
-      insertMeetingLlmResult(row);
-      updateMeetingStatus(meetingId, "llm_failed", errorMessage);
-      writeAuditLog({
+      await insertMeetingLlmResult(row);
+      await updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      await writeAuditLog({
         actionType: "llm.translate",
         resourceType: "meeting_llm_result",
         resourceId: row.id,
@@ -3310,7 +3349,7 @@ async function translateMeetingFlow(
   }
 }
 
-export function persistLiveTranslation(
+export async function persistLiveTranslation(
   meetingId: string,
   targetLang: string,
   blocks: Array<{ time: string; timeSeconds: number; text: string }>
@@ -3319,15 +3358,15 @@ export function persistLiveTranslation(
     .map((block) => String(block.text ?? "").trim())
     .filter(Boolean);
   if (textBlocks.length === 0) return null;
-  if (!ensureMeetingOwned(meetingId)) return null;
+  if (!await ensureMeetingOwned(meetingId)) return null;
 
-  const segments = getMergedMeetingTranscriptSegments(meetingId)
+  const segments = (await getMergedMeetingTranscriptSegments(meetingId))
     .filter((segment) => segment.isFinal && Boolean(segment.text.trim()))
     .map((segment) => segment.text.trim())
     .join("\n");
 
-  return withTransaction(() => {
-    const existing = listMeetingLlmResultsByMeetingId(meetingId);
+  return await withTransaction(async () => {
+    const existing = await listMeetingLlmResultsByMeetingId(meetingId);
     const resultMarkdown = textBlocks.join("\n\n");
     const row: MeetingLlmResultRow = {
       id: newId("llm"),
@@ -3338,7 +3377,7 @@ export function persistLiveTranslation(
       generationConfigSnapshot: JSON.stringify({ targetLang: targetLang || "en", source: "live" }),
       generationMode: "default_auto",
       status: "succeeded",
-      versionNo: getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId),
       resultType: "translation",
       resultTitle: "会议翻译",
       rawPrompt: "",
@@ -3346,8 +3385,8 @@ export function persistLiveTranslation(
       resultMarkdown,
       errorMessage: null,
     };
-    insertMeetingLlmResult(row);
-    writeAuditLog({
+    await insertMeetingLlmResult(row);
+    await writeAuditLog({
       actionType: "llm.translate",
       resourceType: "meeting_llm_result",
       resourceId: row.id,
@@ -3367,33 +3406,33 @@ export function persistLiveTranslation(
 }
 
 async function createMeetingLlmResultInner(meetingId: string, templateId?: string, options?: { skipClaim?: boolean; targetLang?: string }) {
-  if (!ensureMeetingOwned(meetingId)) throw new Error("Meeting not found");
+  if (!await ensureMeetingOwned(meetingId)) throw new Error("Meeting not found");
 
   if (!options?.skipClaim) {
-    const claim = claimMeetingLlmGeneration(meetingId);
+    const claim = await claimMeetingLlmGeneration(meetingId);
     if (!claim.ok) throw new Error(claim.error);
   }
 
-  const inputTranscriptSnapshot = getMergedMeetingTranscript(meetingId);
+  const inputTranscriptSnapshot = await getMergedMeetingTranscript(meetingId);
   if (!inputTranscriptSnapshot) {
-    updateMeetingStatus(meetingId, "llm_failed", "Meeting ASR transcript not found");
+    await updateMeetingStatus(meetingId, "llm_failed", "Meeting ASR transcript not found");
     throw new Error("Meeting ASR transcript not found");
   }
 
-  const settings = listSettings();
-  const templates = listPromptTemplates();
+  const settings = await listSettings();
+  const templates = await listPromptTemplates();
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
   const selectedTemplateId = templateId || get("system", "default_prompt_template_id");
   const template = templates.find((item) => item.id === selectedTemplateId);
   if (!template) {
-    updateMeetingStatus(meetingId, "llm_failed", "Prompt template not found");
+    await updateMeetingStatus(meetingId, "llm_failed", "Prompt template not found");
     throw new Error("Prompt template not found");
   }
 
   if (template.templateType === "translation") {
-    return translateMeetingFlow(meetingId, template, inputTranscriptSnapshot, options?.targetLang);
+    return await translateMeetingFlow(meetingId, template, inputTranscriptSnapshot, options?.targetLang);
   }
 
   const baseUrl = get("llm", "base_url");
@@ -3401,11 +3440,11 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
   const model = get("llm", "model");
 
   if (!baseUrl || !model) {
-    updateMeetingStatus(meetingId, "llm_failed", "LLM config incomplete");
+    await updateMeetingStatus(meetingId, "llm_failed", "LLM config incomplete");
     throw new Error("LLM config incomplete");
   }
 
-  const existing = listMeetingLlmResultsByMeetingId(meetingId);
+  const existing = await listMeetingLlmResultsByMeetingId(meetingId);
   const rawPrompt = String(template.content || "").replaceAll("{transcript}", inputTranscriptSnapshot);
   const contextSize = Number(String(get("llm", "context_size") || "").trim()) || 0;
   const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
@@ -3504,9 +3543,9 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
     console.error(
       `[LLM] failed: meeting=${meetingId} error=${errorMessage}`
     );
-    withTransaction(() => {
-      const versionNo = getNextLlmVersionNo(meetingId);
-      insertMeetingLlmResult({
+    await withTransaction(async () => {
+      const versionNo = await getNextLlmVersionNo(meetingId);
+      await insertMeetingLlmResult({
         id: newId("llm"),
         meetingId,
         inputTranscriptSnapshot,
@@ -3523,8 +3562,8 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
         resultMarkdown: "",
         errorMessage,
       });
-      updateMeetingStatus(meetingId, "llm_failed", errorMessage);
-      writeAuditLog({
+      await updateMeetingStatus(meetingId, "llm_failed", errorMessage);
+      await writeAuditLog({
         actionType: existing.length > 0 ? "llm.regenerate" : "llm.generate_default",
         resourceType: "meeting",
         resourceId: meetingId,
@@ -3540,7 +3579,7 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
     });
     throw error;
   }
-  withTransaction(() => {
+  await withTransaction(async () => {
     const row: MeetingLlmResultRow = {
       id: newId("llm"),
       meetingId,
@@ -3550,7 +3589,7 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
       generationConfigSnapshot: JSON.stringify({ baseUrl, model, contextSize, maxTokens, timeoutMs }),
       generationMode: existing.length > 0 ? "manual_regenerate" : "default_auto",
       status: "succeeded",
-      versionNo: getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId),
       resultType: template.templateType || "custom",
       resultTitle: template.templateName,
       rawPrompt: prompt,
@@ -3561,9 +3600,9 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
           ? "结果可能不完整（finish_reason=length，输出被截断）"
           : null,
     };
-    insertMeetingLlmResult(row);
-    updateMeetingStatus(meetingId, "generated");
-    writeAuditLog({
+    await insertMeetingLlmResult(row);
+    await updateMeetingStatus(meetingId, "generated");
+    await writeAuditLog({
       actionType: row.generationMode === "default_auto" ? "llm.generate_default" : "llm.regenerate",
       resourceType: "meeting_llm_result",
       resourceId: row.id,
@@ -3577,11 +3616,11 @@ async function createMeetingLlmResultInner(meetingId: string, templateId?: strin
     });
   });
 
-  return listMeetingLlmResultsByMeetingId(meetingId)[0];
+  return (await listMeetingLlmResultsByMeetingId(meetingId))[0];
 }
 
-function getNextLlmVersionNo(meetingId: string) {
-  const row = getDb()
+async function getNextLlmVersionNo(meetingId: string) {
+  const row = await (await getDb())
     .prepare(`
       SELECT COALESCE(MAX(version_no), 0) + 1 as nextVersionNo
       FROM meeting_llm_results
@@ -3592,8 +3631,8 @@ function getNextLlmVersionNo(meetingId: string) {
   return Number(row?.nextVersionNo ?? 1);
 }
 
-function insertMeetingLlmResult(row: MeetingLlmResultRow) {
-  getDb()
+async function insertMeetingLlmResult(row: MeetingLlmResultRow) {
+  (await getDb())
     .prepare(`
       INSERT INTO meeting_llm_results (
         id, meeting_id, input_transcript_snapshot, llm_setting_mark, prompt_template_id,
@@ -3641,7 +3680,7 @@ export type MeetingTitleGeneration = {
   previousTitle: string;
   llmResultId: string;
   /** 与列表/详情**同一个投影函数**产出的会议对象（前端拿它同时更新列表行与详情） */
-  meeting: ReturnType<typeof getMeetingLightById>;
+  meeting: Awaited<ReturnType<typeof getMeetingLightById>>;
   promptChars: number;
   transcriptChars: number;
   sentChars: number;
@@ -3654,17 +3693,17 @@ export async function generateMeetingTitle(meetingId: string): Promise<MeetingTi
 }
 
 async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitleGeneration> {
-  if (!ensureMeetingOwned(meetingId)) {
+  if (!await ensureMeetingOwned(meetingId)) {
     throw new AiTitleError("Meeting not found", 404);
   }
 
-  const previousTitle = String(queryMeetingRowById(meetingId)?.title ?? "").trim() || TITLE_FALLBACK_TITLE;
-  const transcript = getMergedMeetingTranscript(meetingId);
+  const previousTitle = String((await queryMeetingRowById(meetingId))?.title ?? "").trim() || TITLE_FALLBACK_TITLE;
+  const transcript = await getMergedMeetingTranscript(meetingId);
   if (!transcript.trim()) {
     throw new AiTitleError("会议还没有转写内容，无法生成标题", 409);
   }
 
-  const settings = listSettings();
+  const settings = await listSettings();
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
@@ -3679,14 +3718,14 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
   // 若库里根本没有标题模板（老库种子没跑到 / 被删），运行期再补一次：
   // `ensureTitleTemplate` 幂等（已有就不覆盖），而 `meeting_llm_results.prompt_template_id`
   // 是 NOT NULL + 外键，记账行必须有真实模板 id 才能落库。
-  const findTitleTemplate = () =>
-    listPromptTemplates().find(
+  const findTitleTemplate = async () =>
+    (await listPromptTemplates()).find(
       (item) => item.templateKey === TITLE_TEMPLATE_KEY || item.id === TITLE_TEMPLATE_ID
     );
-  let template = findTitleTemplate();
+  let template = await findTitleTemplate();
   if (!template) {
-    ensureTitleTemplate(getDb(), nowIso());
-    template = findTitleTemplate();
+    await ensureTitleTemplate(await getDb(), nowIso());
+    template = await findTitleTemplate();
   }
   const built = buildTitlePrompt(template?.content || TITLE_TEMPLATE_CONTENT, transcript);
   const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
@@ -3776,7 +3815,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
     const errorMessage = `${baseMessage} (elapsed=${elapsedMs}ms)`;
     console.error(`[LLM] title failed: meeting=${meetingId} error=${errorMessage}`);
 
-    withTransaction(() => {
+    await withTransaction(async () => {
       const row: MeetingLlmResultRow = {
         id: newId("llm"),
         meetingId,
@@ -3786,7 +3825,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
         generationConfigSnapshot,
         generationMode: "manual_regenerate",
         status: "failed",
-        versionNo: getNextLlmVersionNo(meetingId),
+        versionNo: await getNextLlmVersionNo(meetingId),
         resultType: TITLE_RESULT_TYPE,
         resultTitle: previousTitle,
         rawPrompt: built.prompt,
@@ -3794,8 +3833,8 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
         resultMarkdown: "",
         errorMessage,
       };
-      insertMeetingLlmResult(row);
-      writeAuditLog({
+      await insertMeetingLlmResult(row);
+      await writeAuditLog({
         actionType: "llm.title",
         resourceType: "meeting",
         resourceId: meetingId,
@@ -3817,12 +3856,12 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
     throw new AiTitleError(errorMessage, 502);
   }
 
-  return withTransaction(() => {
-    const database = getDb();
+  return await withTransaction(async () => {
+    const database = await getDb();
     const updatedAt = nowIso();
     // 改名 + 记账在同一个事务里：要么都生效、要么都不发生（不留半更新状态）。
     // 并发点击时 title 是单条 UPDATE，天然原子，后者覆盖前者。
-    database
+    await database
       .prepare("UPDATE meetings SET title = ?, updated_at = ? WHERE id = ?")
       .run(title, updatedAt, meetingId);
 
@@ -3835,7 +3874,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
       generationConfigSnapshot,
       generationMode: "manual_regenerate",
       status: "succeeded",
-      versionNo: getNextLlmVersionNo(meetingId),
+      versionNo: await getNextLlmVersionNo(meetingId),
       resultType: TITLE_RESULT_TYPE,
       resultTitle: title,
       rawPrompt: built.prompt,
@@ -3843,9 +3882,9 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
       resultMarkdown: title,
       errorMessage: null,
     };
-    insertMeetingLlmResult(row);
+    await insertMeetingLlmResult(row);
 
-    writeAuditLog({
+    await writeAuditLog({
       actionType: "llm.title",
       resourceType: "meeting",
       resourceId: meetingId,
@@ -3863,7 +3902,7 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
     });
 
     // 返回**与列表/详情同一个投影函数**的会议对象（#43 R2 教训：两处不能各拼一套）
-    const meeting = getMeetingLightById(meetingId);
+    const meeting = await getMeetingLightById(meetingId);
     return {
       title,
       previousTitle,
@@ -3877,17 +3916,17 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
   });
 }
 
-export function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
-  return withTransaction(() => {
-    if (!ensureMeetingOwned(meetingId)) return null;
-    const existing = getMeetingLlmResultById(id);
+export async function updateMeetingLlmResult(meetingId: string, id: string, patch: { resultMarkdown?: string; resultTitle?: string }) {
+  return await withTransaction(async () => {
+    if (!await ensureMeetingOwned(meetingId)) return null;
+    const existing = await getMeetingLlmResultById(id);
     if (!existing) return null;
-    if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
+    if (!await meetingLlmResultBelongsToMeeting(id, meetingId)) {
       throw new Error("Meeting LLM result does not belong to this meeting");
     }
 
-    const database = getDb();
-    database
+    const database = await getDb();
+    await database
       .prepare(`
         UPDATE meeting_llm_results
         SET result_markdown = ?, result_title = ?
@@ -3899,8 +3938,8 @@ export function updateMeetingLlmResult(meetingId: string, id: string, patch: { r
         id
       );
 
-    const updated = getMeetingLlmResultById(id);
-    writeAuditLog({
+    const updated = await getMeetingLlmResultById(id);
+    await writeAuditLog({
       actionType: "llm_result.update",
       resourceType: "meeting_llm_result",
       resourceId: id,
@@ -3917,21 +3956,21 @@ export function updateMeetingLlmResult(meetingId: string, id: string, patch: { r
   });
 }
 
-export function deleteMeetingLlmResult(meetingId: string, id: string) {
-  return withTransaction(() => {
-    if (!ensureMeetingOwned(meetingId)) return null;
-    const existing = getMeetingLlmResultById(id);
+export async function deleteMeetingLlmResult(meetingId: string, id: string) {
+  return await withTransaction(async () => {
+    if (!await ensureMeetingOwned(meetingId)) return null;
+    const existing = await getMeetingLlmResultById(id);
     if (!existing) return false;
-    if (!meetingLlmResultBelongsToMeeting(id, meetingId)) {
+    if (!await meetingLlmResultBelongsToMeeting(id, meetingId)) {
       throw new Error("Meeting LLM result does not belong to this meeting");
     }
 
-    const database = getDb();
-    database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
-    const result = database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
+    const database = await getDb();
+    await database.prepare("DELETE FROM meeting_send_records WHERE meeting_llm_result_id = ?").run(id);
+    const result = await database.prepare("DELETE FROM meeting_llm_results WHERE id = ?").run(id);
     const deleted = Number(result.changes ?? 0) > 0;
     if (deleted) {
-      writeAuditLog({
+      await writeAuditLog({
         actionType: "llm_result.delete",
         resourceType: "meeting_llm_result",
         resourceId: id,
@@ -3947,8 +3986,8 @@ export function deleteMeetingLlmResult(meetingId: string, id: string) {
   });
 }
 
-function getMeetingLlmResultById(id: string) {
-  const database = getDb();
+async function getMeetingLlmResultById(id: string) {
+  const database = await getDb();
   return database
     .prepare<MeetingLlmResultRow>(`
       SELECT
@@ -3974,8 +4013,8 @@ function getMeetingLlmResultById(id: string) {
     .get<MeetingLlmResultRow>(id);
 }
 
-function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string) {
-  const row = getDb()
+async function meetingLlmResultBelongsToMeeting(llmResultId: string, meetingId: string) {
+  const row = await (await getDb())
     .prepare(`
       SELECT lr.id
       FROM meeting_llm_results lr
@@ -3993,10 +4032,10 @@ function parseStringArray(value: string | null | undefined): string[] {
     : [];
 }
 
-export function listMeetingSendRecords(meetingId: string) {
-  if (!ensureMeetingOwned(meetingId)) return null;
-  const database = getDb();
-  return database
+export async function listMeetingSendRecords(meetingId: string) {
+  if (!await ensureMeetingOwned(meetingId)) return null;
+  const database = await getDb();
+  return await database
     .prepare(`
       SELECT
         sr.id,
@@ -4020,11 +4059,13 @@ export function listMeetingSendRecords(meetingId: string) {
       ORDER BY sr.created_at DESC
     `)
     .all<MeetingSendRecordRow>(meetingId)
-    .map((row) => ({
-      ...row,
-      toRecipients: parseStringArray(row.toRecipientsJson),
-      ccRecipients: parseStringArray(row.ccRecipientsJson),
-    }));
+    .then((rows) =>
+      rows.map((row) => ({
+        ...row,
+        toRecipients: parseStringArray(row.toRecipientsJson),
+        ccRecipients: parseStringArray(row.ccRecipientsJson),
+      }))
+    );
 }
 
 export async function createMeetingSendRecord(input: {
@@ -4035,14 +4076,14 @@ export async function createMeetingSendRecord(input: {
   ccRecipients: string[];
   mailTemplateType?: string;
 }) {
-  const llmResult = getMeetingLlmResultById(input.meetingLlmResultId);
+  const llmResult = await getMeetingLlmResultById(input.meetingLlmResultId);
   if (!llmResult) {
     throw new Error("Meeting LLM result not found");
   }
-  if (!ensureMeetingOwned(input.meetingId)) {
+  if (!await ensureMeetingOwned(input.meetingId)) {
     throw new Error("Meeting LLM result does not belong to this meeting");
   }
-  if (!meetingLlmResultBelongsToMeeting(input.meetingLlmResultId, input.meetingId)) {
+  if (!await meetingLlmResultBelongsToMeeting(input.meetingLlmResultId, input.meetingId)) {
     throw new Error("Meeting LLM result does not belong to this meeting");
   }
 
@@ -4057,7 +4098,7 @@ export async function createMeetingSendRecord(input: {
     throw new Error("At least one recipient is required");
   }
 
-  const settings = listSettings();
+  const settings = await listSettings();
   const get = (section: string, mark: string) =>
     settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
 
@@ -4095,7 +4136,7 @@ export async function createMeetingSendRecord(input: {
       throw new Error("Mail config incomplete");
     }
 
-    updateMeetingStatus(input.meetingId, "sending");
+    await updateMeetingStatus(input.meetingId, "sending");
     const nodemailer = (eval("require") as NodeRequire)("nodemailer") as {
       createTransport: (options: Record<string, unknown>) => {
         sendMail: (message: Record<string, unknown>) => Promise<{ messageId?: string }>;
@@ -4119,8 +4160,8 @@ export async function createMeetingSendRecord(input: {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Mail send failed";
     const failedSendRecordId = newId("send");
-    withTransaction(() => {
-      insertMeetingSendRecord({
+    await withTransaction(async () => {
+      await insertMeetingSendRecord({
         id: failedSendRecordId,
         meetingLlmResultId: input.meetingLlmResultId,
         mailTemplateType: input.mailTemplateType ?? "formal_minutes_mail",
@@ -4137,8 +4178,8 @@ export async function createMeetingSendRecord(input: {
         errorMessage,
         sentByUserId: getCurrentActor().id,
       }, null);
-      updateMeetingStatus(input.meetingId, "send_failed", errorMessage);
-      writeAuditLog({
+      await updateMeetingStatus(input.meetingId, "send_failed", errorMessage);
+      await writeAuditLog({
         actionType: "mail.send",
         resourceType: "meeting_send_record",
         resourceId: failedSendRecordId,
@@ -4175,10 +4216,10 @@ export async function createMeetingSendRecord(input: {
     sentByUserId: getCurrentActor().id,
   };
 
-  withTransaction(() => {
-    insertMeetingSendRecord(row, nowIso());
-    updateMeetingStatus(input.meetingId, "sent");
-    writeAuditLog({
+  await withTransaction(async () => {
+    await insertMeetingSendRecord(row, nowIso());
+    await updateMeetingStatus(input.meetingId, "sent");
+    await writeAuditLog({
       actionType: "mail.send",
       resourceType: "meeting_send_record",
       resourceId: row.id,
@@ -4193,11 +4234,11 @@ export async function createMeetingSendRecord(input: {
     });
   });
 
-  return listMeetingSendRecords(input.meetingId)?.[0] ?? null;
+  return (await listMeetingSendRecords(input.meetingId))?.[0] ?? null;
 }
 
-function insertMeetingSendRecord(row: MeetingSendRecordRow, sentAt: string | null) {
-  getDb()
+async function insertMeetingSendRecord(row: MeetingSendRecordRow, sentAt: string | null) {
+  (await getDb())
     .prepare(`
       INSERT INTO meeting_send_records (
         id, meeting_llm_result_id, mail_template_type, subject,

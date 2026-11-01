@@ -15,10 +15,21 @@ import { extractRows, listTableColumns } from "./async-db.mjs";
  * 幂等建表：hasTable 检查后 createTable。
  * 不用 knex 的 createTableIfNotExists——它在表已存在时会重复执行
  * unique 索引语句（CREATE UNIQUE INDEX ... IF NOT EXISTS 不受保护）而报错。
+ *
+ * `hasTable()` + `CREATE TABLE` 不是原子操作（legacy 的
+ * `CREATE TABLE IF NOT EXISTS` 才是）。同一个进程里的两个模块图由
+ * `server/db-shared.mjs` 的 globalThis single-flight 串起来；这里再兜一层
+ * 「已经存在」的竞态（跨进程场景），避免启动期直接抛错。
  */
 async function createTableIfAbsent(db, tableName, builder) {
   if (await db.knex.schema.hasTable(tableName)) return;
-  await db.knex.schema.createTable(tableName, builder);
+  try {
+    await db.knex.schema.createTable(tableName, builder);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/already exists|already an object named/i.test(message)) return;
+    throw error;
+  }
 }
 
 // ---------- 建表定义（createTables 与迁移共用） ----------

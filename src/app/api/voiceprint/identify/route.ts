@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
-      if (!isVoiceprintEnabled()) {
+      if (!(await isVoiceprintEnabled())) {
         return NextResponse.json({ error: "voiceprint disabled" }, { status: 409 });
       }
       const body = await req.json().catch(() => ({}));

@@ -10,7 +10,7 @@ export async function GET(
 ) {
   const { id, resultId } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const asrResult = getMeetingAsrResultDetail(id, resultId);
+    const asrResult = await getMeetingAsrResultDetail(id, resultId);
     if (!asrResult) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

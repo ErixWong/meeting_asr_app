@@ -183,7 +183,7 @@ export function enqueueAudioTranscode(captureSessionId) {
  *   失败 → status=failed + 保留 .pcm + error_message。
  */
 export async function runAudioTranscodeJob(captureSessionId) {
-  const row = getAudioRecording(captureSessionId);
+  const row = await getAudioRecording(captureSessionId);
   if (!row) return { ok: false, skipped: true, reason: "no-recording-row" };
 
   const mp3Path = meetingAudioPath(captureSessionId);
@@ -193,11 +193,11 @@ export async function runAudioTranscodeJob(captureSessionId) {
 
   const rawPath = row.rawFilePath ? safeResolveStoredPath(row.rawFilePath) : null;
   if (!rawPath || !existsSync(rawPath)) {
-    markAudioRecordingFailed({ captureSessionId, errorMessage: "raw pcm file is missing" });
+    await markAudioRecordingFailed({ captureSessionId, errorMessage: "raw pcm file is missing" });
     return { ok: false, skipped: false, reason: "raw-missing" };
   }
 
-  const config = getAudioRuntimeConfig();
+  const config = await getAudioRuntimeConfig();
   try {
     const result = await transcodePcmToMp3({
       rawPath,
@@ -206,7 +206,7 @@ export async function runAudioTranscodeJob(captureSessionId) {
       sampleRate: row.sampleRate || DEFAULT_SAMPLE_RATE,
     });
 
-    markAudioRecordingReady({
+    await markAudioRecordingReady({
       captureSessionId,
       filePath: result.storedPath,
       bytes: result.bytes,
@@ -223,7 +223,7 @@ export async function runAudioTranscodeJob(captureSessionId) {
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    markAudioRecordingFailed({ captureSessionId, errorMessage: `transcode failed: ${message}` });
+    await markAudioRecordingFailed({ captureSessionId, errorMessage: `transcode failed: ${message}` });
     return { ok: false, skipped: false, reason: "transcode-failed", error: message };
   }
 }

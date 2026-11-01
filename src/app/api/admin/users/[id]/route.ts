@@ -7,7 +7,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json();
-      const user = updateUser(id, {
+      const user = await updateUser(id, {
         accountName: body.accountName,
         displayName: body.displayName,
         email: body.email,

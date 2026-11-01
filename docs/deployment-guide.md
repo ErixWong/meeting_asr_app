@@ -17,7 +17,7 @@
 
 关键设计：
 
-- **基座**：`node:24-slim`（Debian bookworm / glibc），满足 `node:sqlite` 内置模块（Node ≥ 23.4 免 flag）、`sharp@0.35.3` 与 `@next/swc-linux-x64-gnu` 的预编译二进制，无需编译工具链。
+- **基座**：`node:24-slim`（Debian bookworm / glibc），满足 `better-sqlite3@13` 的原生模块、`sharp@0.35.3` 与 `@next/swc-linux-x64-gnu` 的预编译二进制，无需编译工具链。
 - **运行产物隔离**：宿主机开发机（如 Windows）的 `node_modules` / `.next` 是平台相关二进制，不能直接给 Linux 容器用。compose 将容器内 `/app/node_modules`、`/app/.next` 分别挂到宿主机 `.docker/` 下独立目录，首次启动由容器内 `npm ci` / `npm run build` 生成 Linux 版本，同时不污染源码目录。
 - **数据持久化**：SQLite 位于 `process.cwd()/data`，即容器内 `/app/data` → 宿主机 `.docker/data`。
 
@@ -60,9 +60,10 @@ AUTH_COOKIE_SECURE=false
 BOOTSTRAP_ADMIN_ACCOUNT=admin
 BOOTSTRAP_ADMIN_PASSWORD=<强密码，勿用默认值>
 
-# —— 数据库：当前只支持 SQLite（零配置），无需任何配置 ——
-# ⚠ 下面的 DB_TYPE=mysql|mssql 是「进行中能力」，生产**暂不可用**，见 3.3.1。
-# DB_TYPE=sqlite         # 唯一支持值（默认）；mysql / mssql 尚未接线
+# —— 数据库：默认 SQLite（零配置），无需任何配置 ——
+# ⚠ DB_TYPE=mysql|mssql 在本版本「初始化 + 冒烟可跑通」，但**业务 SQL 的方言语法尚未清零**
+#   （ON CONFLICT / INSERT OR IGNORE / PRAGMA table_info 等），生产**仍只支持 SQLite**，见 3.3.1。
+# DB_TYPE=sqlite         # 默认；mysql / mssql 见 3.3.1 的真实支持面
 # DB_HOST=10.0.0.5       # （未来）外部实例地址
 # DB_PORT=3306           # （未来）MySQL 默认 3306；MSSQL 默认 1433
 # DB_NAME=meeting_asr    # （未来）实例上需先创建同名数据库/库
@@ -76,27 +77,29 @@ EOF
 
 ### 3.3.1 数据库支持面（当前真实状态）
 
-**生产目前仅 SQLite 经过真机验证。** `DB_TYPE=mysql|mssql` 是进行中能力（见 issue #53/#54/#55 的阶段计划），现在**配了也不会生效**：
+**生产目前仅 SQLite 经过真机验证。** #54 之后运行时**已经真的读 `DB_TYPE`**（`server/db-shared.mjs` 的 `getDb()` → `getKnex()` → `AsyncDb`），三库的「初始化 + 冒烟」已在 CI 路径 `npm run db:test-parity` 里跑通；但**业务 SQL 的方言语法还没清零**，所以生产仍只支持 SQLite：
 
-- 运行时（`server/db-shared.mjs` 的 `getDb()`）仍写死 `node:sqlite`，**不读 `DB_TYPE`**；把 `DB_TYPE` 接到运行时是阶段②（#54）的工作。
-- knex 三方言基建（`server/db/index.mjs` / `async-db.mjs` / `schema.mjs`）已存在并已通过三库测试，但目前只被 `scripts/*` 调用，不在运行时路径上。
-- SQLite 是单文件数据库（`data/meeting-asr-app.db`），备份/迁移/换机都只需拷文件（见 §6）。
+- **驱动变更（#54）**：SQLite 从 Node 内置的 `node:sqlite`（`DatabaseSync`，同步）换成 `better-sqlite3@13`（经 knex，Promise 化）。业务代码形态不变（仍是 `prepare(sql).all/get/run`），只是全部变成 `await`。
+- **`DB_TYPE` 真实支持面**：`sqlite`（默认，生产已验证）／`mysql`、`mssql`（**建表 + 迁移 + 版本记账 + 生产入口初始化**已三库跑绿；业务 SQL 的 `ON CONFLICT` / `INSERT OR IGNORE` / `PRAGMA table_info` 等方言语法仍待 #55 清零，配上去会在具体业务路径上出错）。
+- **连接级 PRAGMA 是条件化的**：`journal_mode=WAL` / `busy_timeout=5000` / `foreign_keys=ON` **只在 `DB_TYPE=sqlite` 时下发**（mysql/mssql 没有 `PRAGMA` 语法，实测 mssql 报 `Incorrect syntax near '='`）。WAL 在 Docker bind mount 上不可用时仍会打印原文告警，不静默降级。
+- **SQLite 是单文件数据库**（`data/meeting-asr-app.db`），备份/迁移/换机都只需拷文件（见 §6）。
+- ⚠ **同一库文件禁止混用两种 SQLite 驱动**：`node:sqlite` 与 `better-sqlite3` 交替写同一个文件会让 WAL 对彼此不可读（实测 `SQLITE_IOERR_SHORT_READ`）。生产只用 `better-sqlite3`；脚本/备份工具要读这个库时也必须用 `better-sqlite3`（`node:sqlite` 只在历史脚本里出现过）。
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | ① #53 | 方言事实钉死 + 三库测试脚手架（零运行时变更） | 已完成 |
-| ② #54 | 114 处裸 SQL 同步→异步、`getKnex()` 成为唯一入口、`DB_TYPE` 真正生效 | 待做 |
+| ② #54 | 114 处裸 SQL 同步→异步、`getKnex()` 成为唯一入口、`DB_TYPE` 真正生效 | 已完成 |
 | ③ #55 | 方言语法清零（`ON CONFLICT` / `INSERT OR IGNORE` / `PRAGMA`）+ 大小写语义落地 + 三库 CI | 待做 |
 
 > 方言事实与待办清单：`docs/design/db-dialect-portability.md`。
 
-### 3.3.2 外部实例连通性冒烟（当前只用于验证基建，不影响运行时）
+### 3.3.2 外部实例连通性冒烟
 
 ```bash
 # SQLite（默认，零配置）
 node scripts/db-smoke.mjs
 
-# 外部实例（仅冒烟 knex 基建，不会改变应用运行时的数据库）
+# 外部实例（冒烟 knex 基建；要真的让应用连过去，另配 DB_TYPE 等环境变量）
 DB_TYPE=mysql DB_HOST=10.0.0.5 DB_PORT=3306 DB_NAME=meeting_asr DB_USER=... DB_PASSWORD=... \
   node scripts/db-smoke.mjs
 DB_TYPE=mssql DB_HOST=10.0.0.5 DB_PORT=1433 DB_NAME=meeting_asr DB_USER=sa DB_PASSWORD=... \

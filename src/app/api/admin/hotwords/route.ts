@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
-  return NextResponse.json({ hotwords: listHotwords() });
+  return NextResponse.json({ hotwords: await listHotwords() });
   });
 }
 
@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
   try {
       const body = await req.json();
-      const hotword = createHotword({
+      const hotword = await createHotword({
         term: body.term,
         weight: Number(body.weight ?? 10),
         status: body.status ?? "active",

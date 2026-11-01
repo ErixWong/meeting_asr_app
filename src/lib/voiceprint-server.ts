@@ -17,24 +17,24 @@ export type VoiceprintModelKey = keyof typeof VOICEPRINT_MODELS;
 
 const PROXY_TIMEOUT_MS = 5000;
 
-export function getVoiceprintModel(): VoiceprintModelKey {
-  const raw = getSettingValue("voiceprint", "model");
+export async function getVoiceprintModel(): Promise<VoiceprintModelKey> {
+  const raw = await getSettingValue("voiceprint", "model");
   return raw === "zh_en" ? "zh_en" : "zh";
 }
 
-export function getVoiceprintEndpoint(): string {
-  const model = getVoiceprintModel();
+export async function getVoiceprintEndpoint(): Promise<string> {
+  const model = await getVoiceprintModel();
   const key = model === "zh_en" ? "endpoint_zh_en" : "endpoint_zh";
   // 兼容旧库：未配置 endpoint_zh 时回退旧的 voiceprint:endpoint（默认同为 10097）
   const value =
-    getSettingValue("voiceprint", key) ||
-    (model === "zh" ? getSettingValue("voiceprint", "endpoint") : "") ||
+    (await getSettingValue("voiceprint", key)) ||
+    (model === "zh" ? await getSettingValue("voiceprint", "endpoint") : "") ||
     VOICEPRINT_MODELS[model].defaultEndpoint;
   return value.replace(/\/+$/, "");
 }
 
-export function isVoiceprintEnabled(): boolean {
-  return getSettingValue("voiceprint", "enabled") !== "false";
+export async function isVoiceprintEnabled(): Promise<boolean> {
+  return (await getSettingValue("voiceprint", "enabled")) !== "false";
 }
 
 /** 转发到声纹服务；服务不可用/超时抛 VoiceprintUnavailableError（调用方做降级） */
@@ -51,7 +51,7 @@ export async function proxyVoiceprint<T>(
   timeoutMs: number = PROXY_TIMEOUT_MS,
   endpointOverride?: string
 ): Promise<T> {
-  const endpoint = (endpointOverride ?? getVoiceprintEndpoint()).replace(/\/+$/, "");
+  const endpoint = (endpointOverride ?? (await getVoiceprintEndpoint())).replace(/\/+$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;

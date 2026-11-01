@@ -14,14 +14,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid account or password" }, { status: 401 });
   }
 
-  const session = createAuthSession(actor.id);
+  const session = await createAuthSession(actor.id);
   const response = NextResponse.json({
     user: {
       id: actor.id,
       accountName: actor.accountName,
       displayName: actor.displayName,
       mustChangePassword: Boolean(actor.mustChangePassword),
-      roles: getActorRoleKeys(actor.id, actor.status),
+      roles: await getActorRoleKeys(actor.id, actor.status),
     },
   });
 

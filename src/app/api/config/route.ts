@@ -6,6 +6,6 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-  return NextResponse.json(getRuntimeConfig());
+  return NextResponse.json(await getRuntimeConfig());
   });
 }
