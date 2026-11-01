@@ -6,6 +6,11 @@
  *   node scripts/db-schema-test.mjs --dialect    # 单方言「基线→迁移→记账」套件（DB_TYPE 决定目标）
  *   node scripts/db-schema-test.mjs --matrix     # 三库矩阵：sqlite(两驱动) + mariadb + mssql 各跑一遍
  *
+ * 参数（未知参数一律报错退出，不静默忽略）：
+ *   --matrix / --dialect / --allow-skip
+ *   --allow-skip：存在 SKIP 项时仍以退出码 0 结束。**默认严格**——存在 SKIP ⇒ 退出码非 0
+ *   （矩阵模式下 6 项里只跑通 sqlite、外部靶子不可达时，CI 不许绿着过关）。
+ *
  * 默认模式覆盖两条实现路径（issue #51 的教训：判据必须打到生产实际入口）：
  *   - legacy 路径：server/database-schema.mjs 的 initializeDatabase()
  *     —— 生产实际入口，经 server/db-shared.mjs 的 getDb() 调用（驱动 node:sqlite）
@@ -25,6 +30,7 @@
  * --dialect / --matrix 的库生命周期与安全边界：
  *   mysql / mssql 只允许建/删名字以 `meeting_asr_ci_` 开头的一次性库（共享实例红线），
  *   跑完 DROP；目标库不可达时打印 SKIP 原因并以退出码 3 结束（不许静默假绿）。
+ *   子进程（--dialect / 语义锁）始终按严格语义返回 3，矩阵父进程**不会**把 --allow-skip 透传下去。
  */
 import { createKnexInstance, getDbType } from "../server/db/index.mjs";
 import { AsyncDb, extractRows, listTableColumns } from "../server/db/async-db.mjs";
@@ -614,7 +620,7 @@ async function runDialectSuite(db, dbType) {
 }
 
 /** --dialect：单方言套件（DB_TYPE 决定目标；mysql/mssql 自建自删一次性库） */
-async function mainDialect() {
+async function mainDialect({ allowSkip = false } = {}) {
   const dbType = getDbType();
   console.log(`[dialect] 目标方言 db_type=${dbType}`);
   let tempDir = null;
@@ -638,7 +644,9 @@ async function mainDialect() {
         }`
       );
       console.log("RESULT: SKIP");
-      process.exitCode = 3;
+      // 默认严格：SKIP 一律非 0（矩阵父进程据此归类 SKIP 项）。--allow-skip 只给手动放行用，
+      // 矩阵从不向子进程透传该参数，避免子进程的 SKIP 被误判成 PASS。
+      process.exitCode = allowSkip ? 0 : 3;
       return;
     }
   }
@@ -701,7 +709,7 @@ function runChild(args, env) {
 }
 
 /** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件与语义锁 */
-async function mainMatrix() {
+async function mainMatrix({ allowSkip = false } = {}) {
   const self = fileURLToPath(import.meta.url);
   const semanticScript = join(process.cwd(), "scripts", "db-semantic-test.mjs");
   const mysqlPassword = process.env.CI_MYSQL_PASSWORD || "";
@@ -770,21 +778,68 @@ async function mainMatrix() {
   );
   if (failed.length > 0) {
     process.exitCode = 1;
+    console.log("[matrix] ❌ 存在 FAIL 项，矩阵失败");
   } else if (skipped.length > 0) {
-    console.log("[matrix] 注意：存在 SKIP 项（目标库不可达），见上方原因，未覆盖的方言不算通过");
+    const skipList = skipped.map((item) => `${item.target} / ${item.job}`).join("；");
+    if (allowSkip) {
+      console.log(`[matrix] ⏭ 存在 SKIP 项，已由 --allow-skip 显式放行（退出码 0）：${skipList}`);
+    } else {
+      // 默认严格：SKIP 不许伪装成全绿（6 项里只跑通 sqlite、外部靶子不可达时 CI 必须红）
+      process.exitCode = 1;
+      console.log(
+        `[matrix] ❌ 存在 SKIP 项，未覆盖的方言不算通过（默认严格，退出码非 0）：${skipList}`
+      );
+      console.log("[matrix]    如确认要放行，请显式追加 --allow-skip");
+    }
   }
+}
+
+/** 允许的命令行参数（未知参数一律报错，不静默忽略） */
+const KNOWN_FLAGS = new Map([
+  ["--matrix", "三库矩阵：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件与语义锁"],
+  ["--dialect", "单方言套件（目标由 DB_TYPE / DB_HOST / DB_NAME 等决定）"],
+  ["--allow-skip", "存在 SKIP 项时仍以退出码 0 结束（默认：存在 SKIP 即失败）"],
+]);
+
+function parseArgs(argv) {
+  const flags = new Set();
+  const unknown = [];
+  for (const arg of argv) {
+    if (KNOWN_FLAGS.has(arg)) flags.add(arg);
+    else unknown.push(arg);
+  }
+  return { flags, unknown };
+}
+
+function printUsage() {
+  console.error("[args] 可用参数：");
+  for (const [flag, description] of KNOWN_FLAGS) {
+    console.error(`  ${flag.padEnd(14)} ${description}`);
+  }
+  console.error("  （不带参数）    sqlite 全量套件（两种驱动都跑）");
 }
 
 const invokedDirectly =
   process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
 
 if (invokedDirectly) {
-  const mode = process.argv.includes("--matrix")
-    ? mainMatrix
-    : process.argv.includes("--dialect")
-      ? mainDialect
-      : main;
-  mode().catch((e) => {
+  const { flags, unknown } = parseArgs(process.argv.slice(2));
+  if (unknown.length > 0) {
+    console.error(`❌ 未知参数: ${unknown.join(" ")}`);
+    printUsage();
+    console.log("RESULT: FAIL");
+    process.exit(2);
+  }
+  if (flags.has("--matrix") && flags.has("--dialect")) {
+    console.error("❌ --matrix 与 --dialect 不能同时使用");
+    printUsage();
+    console.log("RESULT: FAIL");
+    process.exit(2);
+  }
+
+  const options = { allowSkip: flags.has("--allow-skip") };
+  const mode = flags.has("--matrix") ? mainMatrix : flags.has("--dialect") ? mainDialect : main;
+  mode(options).catch((e) => {
     console.error("❌", e);
     console.log("RESULT: FAIL");
     process.exit(1);
