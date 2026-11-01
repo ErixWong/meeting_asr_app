@@ -1097,10 +1097,13 @@ function runChild(args, env) {
   });
 }
 
-/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件与语义锁 */
+/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件、语义锁与事务套件 */
 async function mainMatrix({ allowSkip = false } = {}) {
   const self = fileURLToPath(import.meta.url);
   const semanticScript = join(process.cwd(), "scripts", "db-semantic-test.mjs");
+  // issue #55 D7：事务句柄/affected-rows 套件（scripts/db-tx-test.mjs）作为一个 job 挂进每个目标，
+  // 矩阵语义不变：任何 SKIP 即失败（外部靶子不可达时不许绿着过关）。
+  const txScript = join(process.cwd(), "scripts", "db-tx-test.mjs");
   const mysqlPassword = process.env.CI_MYSQL_PASSWORD || "";
   const mssqlPassword = process.env.CI_MSSQL_PASSWORD || "";
   const mysqlEnv = {
@@ -1124,6 +1127,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移全量", args: [self], env: {} },
         { name: "语义锁", args: [semanticScript], env: {} },
+        { name: "事务句柄/affected-rows", args: [txScript], env: {} },
       ],
     },
     {
@@ -1131,6 +1135,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mysqlEnv },
         { name: "语义锁", args: [semanticScript], env: mysqlEnv },
+        { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mysqlEnv },
       ],
     },
     {
@@ -1138,6 +1143,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
       jobs: [
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mssqlEnv },
         { name: "语义锁", args: [semanticScript], env: mssqlEnv },
+        { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mssqlEnv },
       ],
     },
   ];
