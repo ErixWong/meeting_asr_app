@@ -52,8 +52,12 @@ mkdir -p .docker/node_modules .docker/.next .docker/data
 ```bash
 cat > .env <<'EOF'
 # 线上访问的 Origin（浏览器地址栏的协议+域名+端口，多个用逗号分隔）
-# 不配置时 WebSocket (/asr) 握手会被 Origin 白名单拒绝
-ASR_GATEWAY_ALLOWED_ORIGINS=https://meeting.example.com
+# 一般**不需要**配：网关会按「同源」自动放行（Origin 的 hostname+端口 == 请求 Host），
+# 用 IP / 局域网 / 域名 / 换端口访问都能直接录音。
+# 只有反向代理内外层 host 不一致（外层 nginx 改写 Host）时才需要显式列出，例如：
+# ASR_GATEWAY_ALLOWED_ORIGINS=https://meeting.example.com
+# 留空 ⇒ 网关内置默认（http://localhost:3123,http://127.0.0.1:3123）+ 同源判定生效。
+# 判定规则见 docs/design/asr-gateway-origin.md
 # 直接使用 http://host:3123 时设为 false；HTTPS 反向代理时设为 true
 AUTH_COOKIE_SECURE=false
 # 引导管理员（首次启动创建）
@@ -240,7 +244,11 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 ## 6. 安全注意事项
 
 - **必须**设置 `BOOTSTRAP_ADMIN_PASSWORD`，默认 `admin123` 仅限开发。
-- **必须**将 `ASR_GATEWAY_ALLOWED_ORIGINS` 配置为实际访问 Origin，否则 WebSocket 握手被拒（生产默认拒绝未认证连接）。
+- ASR WebSocket 的 Origin 判定：**同源（Origin 的 hostname+端口 == 请求 Host）自动放行**，
+  所以 `http://127.0.0.1:3123`、局域网 IP、域名访问都开箱可用，不必每次配 env。
+  只有反向代理**改写了 Host**（外层 `Host` 与浏览器 `Origin` 不一致）时才需要把实际
+  Origin 写进 `ASR_GATEWAY_ALLOWED_ORIGINS`（逗号分隔）。缺 `Origin` 头的请求一律拒绝。
+  判定细节与日志样例见 `docs/design/asr-gateway-origin.md`。
 - 如果通过 HTTPS 反向代理访问，将 `AUTH_COOKIE_SECURE` 设为 `true`；如果直接通过 HTTP 访问 3123 端口，保持为 `false`，否则浏览器不会发送登录 cookie。
 - 当前容器以 root 运行；如需加固，可在 compose 增加 `user: "node"` 并对 `.docker/` 目录 `chown -R node:node`。
 - 敏感配置（ASR/LLM/SMTP 密钥）存于 SQLite，注意 `.docker/data` 的访问权限。
@@ -250,7 +258,7 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 | 现象 | 原因与处理 |
 |:---|:---|
 | 容器反复重启 / healthcheck 不通过 | 首次构建未完成，查看 `docker compose logs app`；确认网络可访问 npm registry |
-| 页面能打开，但录音/转写 WebSocket 失败 | `ASR_GATEWAY_ALLOWED_ORIGINS` 未包含实际 Origin |
+| 页面能打开，但录音/转写 WebSocket 失败（页面顶部有红色「实时转写连接失败」告警） | 看 `docker compose logs app` 里的 `Rejected client origin:` 一行：`origin=` 是浏览器实际地址、`allowedOrigins=` 是生效白名单。若两者不同源（多为反代改写了 Host），把 `origin=` 的值加进 `.env` 的 `ASR_GATEWAY_ALLOWED_ORIGINS` 后重启容器 |
 | 修改代码后不生效 | 容器启动时自动检测源码并重建，直接执行 `docker compose restart app`；若仍未生效，确认 `docker-compose.yml` 已是最新（`docker compose up -d` 应用新配置） |
 | 需要彻底重置（重装依赖 + 重新构建） | `docker compose down` 后清空 `.docker/node_modules` 与 `.docker/.next` 再 `up -d` |
 | 换部署机迁移 | 源码 + `.env` + `.docker/data`（数据库 + `audio/`）三者一并迁移即可 |
