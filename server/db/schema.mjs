@@ -276,6 +276,15 @@ export async function createIndexes(db) {
 
 const MIGRATIONS = [
   {
+    version: 3,
+    name: "meeting-audio-recordings",
+    async up(db) {
+      // feat-261101-01：会议录音表。新库走 createTables 的基线建表，旧库在此补建，
+      // 两处共用同一个 defineMeetingAudioRecordingsTable（幂等）。
+      await createTableIfAbsent(db, "meeting_audio_recordings", defineMeetingAudioRecordingsTable);
+    },
+  },
+  {
     version: 2,
     name: "drop-capture-sessions-raw-events-json",
     async up(db) {

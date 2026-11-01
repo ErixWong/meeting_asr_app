@@ -2,9 +2,10 @@
  * schema 初始化/迁移验证（PR-B 临时测试，sqlite）
  *
  * 场景：
- *   1. 全新库初始化 → 14 张表 + schema_version=2
+ *   1. 全新库初始化 → 16 张表 + schema_version=3
  *   2. 幂等：重复初始化不报错、版本不变
  *   3. 旧库迁移：构造 v0 旧结构（legacy 含 meeting_asr_result_id）→ 数据搬迁到新结构
+ *      + feat-261101-01 的 meeting_audio_recordings 表在旧库上也必须被建出来
  */
 import { createKnexInstance } from "../server/db/index.mjs";
 import { AsyncDb, listTableColumns } from "../server/db/async-db.mjs";
@@ -33,17 +34,17 @@ async function main() {
     "app_settings", "asr_capture_events", "asr_capture_sessions", "asr_hotwords",
     "audit_logs", "auth_sessions", "llm_prompt_templates", "meeting_asr_results",
     "meeting_llm_results", "meeting_send_records", "meetings", "roles",
-    "schema_version", "user_roles", "users",
+    "schema_version", "user_roles", "users", "meeting_audio_recordings",
   ].sort();
   assert(JSON.stringify(tableNames) === JSON.stringify(expected), `表清单不符: ${tableNames}`);
   const ver = await db.prepare("SELECT version FROM schema_version LIMIT 1").get();
-  assert(Number(ver.version) === 2, `版本号应为 2, 实际 ${ver.version}`);
-  console.log("✅ 场景1 全新库初始化: 15 张表 + schema_version=2");
+  assert(Number(ver.version) === 3, `版本号应为 3, 实际 ${ver.version}`);
+  console.log("✅ 场景1 全新库初始化: 16 张表 + schema_version=3");
 
   // --- 场景 2：幂等 ---
   await initializeSchema(db);
   const ver2 = await db.prepare("SELECT version FROM schema_version LIMIT 1").get();
-  assert(Number(ver2.version) === 2, `重复初始化后版本变化: ${ver2.version}`);
+  assert(Number(ver2.version) === 3, `重复初始化后版本变化: ${ver2.version}`);
   console.log("✅ 场景2 幂等: 重复初始化无副作用");
 
   await db.knex.destroy();
@@ -118,8 +119,17 @@ async function main() {
   );
   assert(legacyLlm.length === 0, "legacy 表未清理");
   const ver3 = await db2.prepare("SELECT version FROM schema_version LIMIT 1").get();
-  assert(Number(ver3.version) === 2, `迁移后版本应为 2`);
-  console.log("✅ 场景3 旧库迁移: 数据搬迁 + legacy 清理 + 版本=2");
+  assert(Number(ver3.version) === 3, `迁移后版本应为 3, 实际 ${ver3.version}`);
+  // feat-261101-01 反向断言：旧库（v0 结构）迁移后必须有会议录音表
+  const audioCols = await listTableColumns(db2, "meeting_audio_recordings");
+  for (const column of [
+    "id", "capture_session_id", "meeting_id", "file_path", "raw_file_path",
+    "format", "status", "bytes", "duration_seconds", "sample_rate",
+    "bitrate_kbps", "error_message", "created_at", "updated_at", "expires_at",
+  ]) {
+    assert(audioCols.includes(column), `meeting_audio_recordings 缺少列 ${column}: ${audioCols}`);
+  }
+  console.log("✅ 场景3 旧库迁移: 数据搬迁 + legacy 清理 + 版本=3 + meeting_audio_recordings 15 列齐全");
 
   await db2.knex.destroy();
   rmSync(dir, { recursive: true, force: true });

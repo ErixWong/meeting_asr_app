@@ -311,3 +311,57 @@ test("transcode job: 已 ready 且文件在 → 直接跳过（幂等）", async
   assert.equal(result.reason, "already-ready");
   console.log("[L2] job 幂等跳过 OK");
 });
+
+// ---------------------------------------------------------------------------
+// L3 schema：meeting_audio_recordings（node:sqlite 运行时路径）
+// ---------------------------------------------------------------------------
+
+test("schema: 运行时建表包含 meeting_audio_recordings 全 15 列 + unique capture_session_id", () => {
+  const database = getSharedDb();
+  const columns = database
+    .prepare("PRAGMA table_info(meeting_audio_recordings)")
+    .all()
+    .map((row) => row.name)
+    .sort();
+  const expected = [
+    "bitrate_kbps", "bytes", "capture_session_id", "created_at", "duration_seconds",
+    "error_message", "expires_at", "file_path", "format", "id", "meeting_id",
+    "raw_file_path", "sample_rate", "status", "updated_at",
+  ];
+  assert.deepEqual(columns, expected);
+
+  const indexes = database
+    .prepare("PRAGMA index_list(meeting_audio_recordings)")
+    .all()
+    .map((row) => row.name);
+  const uniqueIndex = indexes.some((name) => {
+    const cols = database.prepare(`PRAGMA index_info(${name})`).all().map((row) => row.name);
+    return cols.length === 1 && cols[0] === "capture_session_id";
+  });
+  assert.equal(uniqueIndex, true, `capture_session_id 缺 unique 索引: ${indexes.join(",")}`);
+
+  const version = database.prepare("SELECT version FROM schema_version LIMIT 1").get();
+  assert.equal(Number(version.version), 3, `schema_version 应为 3，实际 ${version.version}`);
+  console.log(`[L3] 运行时 schema OK: 15 列 + unique(capture_session_id) + schema_version=3`);
+});
+
+test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键冲突", () => {
+  const first = runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-upsert-1",
+    sampleRate: 16000,
+    rawFilePath: "audio/raw/capture-upsert-1.pcm",
+  });
+  const second = runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-upsert-1",
+    sampleRate: 16000,
+    rawFilePath: "audio/raw/capture-upsert-1.pcm",
+  });
+  assert.equal(first.id, second.id, "upsert 应保留同一行");
+  assert.match(first.id, /^aud-[0-9a-f-]{36}$/, `主键应为 aud-<uuid>，实际 ${first.id}`);
+  assert.equal(second.status, "recording");
+  const count = getSharedDb()
+    .prepare("SELECT COUNT(*) as c FROM meeting_audio_recordings WHERE capture_session_id = ?")
+    .get("capture-upsert-1").c;
+  assert.equal(Number(count), 1);
+  console.log(`[L3] upsert OK: id=${first.id}`);
+});
