@@ -26,7 +26,7 @@
  */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerHooks } from "node:module";
@@ -608,4 +608,69 @@ test("T8 别人的会议 → 404，且不动任何数据", async () => {
 
   store.setLlmTransport(null);
   console.log("[T8] 越权 404 OK");
+});
+
+// ---------------------------------------------------------------------------
+// T9 UI 接线（源码级防回归，不起浏览器）
+//
+// 断言的是**真实源码**里的接线：AI 改名/撤销必须只走一个投影函数
+// （#43 R2 的教训：列表行走 setSelected(m)、详情走 loadMeetingFull()，两处不是一个来源
+// 就会出现「详情有、列表点进去没有」），两个入口都要在，toast 要带撤销动作。
+// 真机浏览器验证由主 agent 在部署后的 :3123 做（见交付报告 ## 未验证）。
+// ---------------------------------------------------------------------------
+
+function sliceBetween(source, startNeedle, endNeedle, fileLabel) {
+  const start = source.indexOf(startNeedle);
+  assert.ok(start >= 0, `${fileLabel} 里找不到起点: ${startNeedle}`);
+  const end = source.indexOf(endNeedle, start + startNeedle.length);
+  assert.ok(end > start, `${fileLabel} 里找不到终点: ${endNeedle}`);
+  return source.slice(start, end);
+}
+
+test("T9 UI 接线：列表/详情两个入口 + 撤销 + 共用投影函数", () => {
+  const pagePath = join(repoRoot, "src", "app", "page.tsx");
+  const historyPath = join(repoRoot, "src", "components", "main", "HistoryList.tsx");
+  const routePath = join(repoRoot, "src", "app", "api", "meetings", "[id]", "ai-title", "route.ts");
+  const pageSource = readFileSync(pagePath, "utf-8");
+  const historySource = readFileSync(historyPath, "utf-8");
+  const routeSource = readFileSync(routePath, "utf-8");
+
+  // 1) 共享投影函数：一次投影同时落到列表行与选中详情
+  const projection = sliceBetween(
+    pageSource,
+    "const applyMeetingProjection = useCallback(",
+    "const handleUndoAiTitle",
+    "page.tsx"
+  );
+  assert.match(projection, /setMeetings\(/, "投影必须更新列表行");
+  assert.match(projection, /setSelected\(/, "投影必须更新选中详情");
+
+  // 2) 成功路径与撤销路径都走这个函数，不许各自拼一套 setState
+  const undoBody = sliceBetween(pageSource, "const handleUndoAiTitle = useCallback(", "const handleGenerateAiTitle", "page.tsx");
+  assert.match(undoBody, /applyMeetingProjection\(data\.meeting\)/, "撤销必须回滚 UI 状态（同一个投影）");
+  assert.match(undoBody, /method: "PATCH"/, "撤销走既有 PATCH /api/meetings/:id 改回原标题");
+  assert.doesNotMatch(undoBody, /setSelected\(|setMeetings\(/, "撤销不许绕过投影函数直接改 state");
+
+  const generateBody = sliceBetween(pageSource, "const handleGenerateAiTitle = useCallback(", "// R2 修 F2", "page.tsx");
+  assert.match(generateBody, /\/ai-title`/, "必须调用新增的 AI 标题接口");
+  assert.match(generateBody, /applyMeetingProjection\(meeting\)/, "成功后必须走共享投影");
+  assert.doesNotMatch(generateBody, /setSelected\(|setMeetings\(/, "成功路径不许绕过投影函数直接改 state");
+  assert.match(generateBody, /label: "撤销"/, "toast 必须提供一次撤销");
+  assert.match(generateBody, /setAiTitleLoadingId\(meetingId\)/, "点击后按钮要进 loading");
+
+  // 3) 两个入口：历史列表项 + 详情页
+  assert.match(pageSource, /onAiTitle=\{\(id\) =>/, "历史列表入口要接线");
+  assert.match(pageSource, /data-testid="ai-title-detail"/, "详情页入口要在");
+  assert.match(historySource, /data-testid=\{`ai-title-list-\$\{m\.id\}`\}/, "列表项按钮要在");
+  assert.match(historySource, /onAiTitle\(m\.id\)/, "列表项按钮要触发 AI 起标题");
+  assert.match(historySource, /aiTitleLoadingId === m\.id/, "列表项按钮要有 loading 态");
+
+  // 4) toast 渲染撤销按钮（notice.action）
+  assert.match(pageSource, /notice\.action &&/, "toast 要渲染 action 按钮");
+  assert.match(pageSource, /notice\.action\.label/, "toast 动作文案来自 notice.action");
+
+  // 5) 接口鉴权与既有会议接口一致（BUSINESS_ROLES），失败按 AiTitleError.status 映射
+  assert.match(routeSource, /withRequiredRoles\(req, BUSINESS_ROLES/, "鉴权口径必须与既有会议接口一致");
+  assert.match(routeSource, /error instanceof AiTitleError \? error\.status : 500/, "错误码按 AiTitleError.status 映射");
+  console.log("[T9] UI 接线（两个入口 / 共用投影 / 撤销）OK");
 });
