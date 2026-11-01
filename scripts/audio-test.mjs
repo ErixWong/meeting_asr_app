@@ -178,5 +178,136 @@ test("audio-config: record_enabled=0 时关闭、非法码率回落到 48", () =
     .run("64", "bitrate_kbps");
   runtimeStore.invalidateAudioRuntimeConfig();
   assert.equal(runtimeStore.getAudioRuntimeConfig().bitrateKbps, 64);
-  console.log("[L1] audio 配置校验 OK（0 关闭 / 999→48 / 64 生效）");
+
+  // 复位，避免影响后续转码用例
+  database
+    .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
+    .run("48", "bitrate_kbps");
+  runtimeStore.invalidateAudioRuntimeConfig();
+  assert.equal(runtimeStore.getAudioRuntimeConfig().bitrateKbps, 48);
+  console.log("[L1] audio 配置校验 OK（0 关闭 / 999→48 / 64 生效 / 复位 48）");
+});
+
+// ---------------------------------------------------------------------------
+// L2 转码 PCM → MP3
+// ---------------------------------------------------------------------------
+
+const transcode = await load("../server/audio-transcode.mjs");
+const { transcodePcmToMp3, runAudioTranscodeJob, isMpegAudioHeader } = transcode;
+
+test("transcode: 2 秒正弦 PCM → mp3 同步头 + 码率相符（±10%）", async () => {
+  const pcm = synthesizePcm({ seconds: 2 });
+  const rawPath = rawAudioPath("capture-tc-1");
+  const mp3Path = meetingAudioPath("capture-tc-1");
+  ensureAudioDirs();
+  writeFileSync(rawPath, pcm);
+
+  const result = await transcodePcmToMp3({ rawPath, mp3Path, bitrateKbps: 48, sampleRate: 16000 });
+  const head = readFileSync(mp3Path).subarray(0, 4);
+  const expectedBytes = (48_000 / 8) * 2; // 48 kbps × 2 秒
+
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.equal(isMpegAudioHeader(head), true, `MP3 同步头不合法: ${head.toString("hex")}`);
+  assert.equal(head[0], 0xff);
+  assert.ok(["f3", "f2", "fb", "fa"].includes(head[1].toString(16)), `同步头第二字节: ${head[1].toString(16)}`);
+  assert.equal(statSync(mp3Path).size, result.bytes);
+  const delta = Math.abs(result.bytes - expectedBytes) / expectedBytes;
+  assert.ok(delta <= 0.1, `字节量 ${result.bytes} 与码率期望 ${expectedBytes} 相差 ${(delta * 100).toFixed(1)}% > 10%`);
+  assert.equal(result.durationSeconds, 2);
+  assert.equal(existsSync(rawPath), true, "纯文件级转码不负责删 pcm");
+  console.log(
+    `[L2] transcode OK: head=${head.toString("hex")} bytes=${result.bytes} (期望≈${expectedBytes}, 偏差 ${(delta * 100).toFixed(1)}%)`
+  );
+});
+
+test("transcode: 目标已存在时幂等跳过（force 才重编）", async () => {
+  const rawPath = rawAudioPath("capture-tc-1");
+  const mp3Path = meetingAudioPath("capture-tc-1");
+  const before = statSync(mp3Path).size;
+  const skipped = await transcodePcmToMp3({ rawPath, mp3Path, bitrateKbps: 48 });
+  assert.equal(skipped.skipped, true);
+  assert.equal(skipped.bytes, before);
+  console.log(`[L2] 幂等跳过 OK（${before} 字节未变）`);
+});
+
+test("transcode: 失败路径不产生半截 mp3、保留 pcm", async () => {
+  const rawPath = rawAudioPath("capture-tc-fail");
+  const mp3Path = meetingAudioPath("capture-tc-fail");
+  ensureAudioDirs();
+  writeFileSync(rawPath, synthesizePcm({ seconds: 1 }));
+  // 让目标路径变成目录 → openSync 必失败
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(mp3Path, { recursive: true });
+
+  await assert.rejects(
+    () => transcodePcmToMp3({ rawPath, mp3Path, bitrateKbps: 48 }),
+    /EISDIR|EACCES|EPERM/
+  );
+  assert.equal(existsSync(rawPath), true, "失败必须保留 .pcm");
+  assert.equal(statSync(mp3Path).isDirectory(), true, "失败不应留下 mp3 文件");
+  rmSync(mp3Path, { recursive: true, force: true });
+  console.log("[L2] 失败路径 OK（pcm 保留、无半截 mp3）");
+});
+
+test("transcode job: 成功 → 行 status=ready + pcm 已删", async () => {
+  const pcm = synthesizePcm({ seconds: 2 });
+  const rawPath = rawAudioPath("capture-tc-job-ok");
+  ensureAudioDirs();
+  writeFileSync(rawPath, pcm);
+  runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-tc-job-ok",
+    sampleRate: 16000,
+    rawFilePath: toStoredPath(rawPath),
+  });
+  runtimeStore.finishAudioRecording({
+    captureSessionId: "capture-tc-job-ok",
+    rawFilePath: toStoredPath(rawPath),
+    bytes: pcm.length,
+    durationSeconds: 2,
+    ok: true,
+  });
+
+  const result = await runAudioTranscodeJob("capture-tc-job-ok");
+  const row = runtimeStore.getAudioRecording("capture-tc-job-ok");
+  assert.equal(result.ok, true);
+  assert.equal(row.status, "ready");
+  assert.equal(row.bitrateKbps, 48);
+  assert.equal(row.rawFilePath, null, "ready 后 raw_file_path 应清空");
+  assert.equal(row.filePath, "audio/meetings/capture-tc-job-ok.mp3");
+  assert.equal(row.durationSeconds, 2);
+  assert.equal(existsSync(rawPath), false, "转码成功后 .pcm 应删除");
+  assert.equal(existsSync(meetingAudioPath("capture-tc-job-ok")), true);
+  console.log(`[L2] job OK: status=${row.status} bytes=${row.bytes} file=${row.filePath}`);
+});
+
+test("transcode job: 失败 → 行 status=failed + pcm 保留 + error_message", async () => {
+  const pcm = synthesizePcm({ seconds: 1 });
+  const rawPath = rawAudioPath("capture-tc-job-fail");
+  ensureAudioDirs();
+  writeFileSync(rawPath, pcm);
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(meetingAudioPath("capture-tc-job-fail"), { recursive: true });
+
+  runtimeStore.registerAudioRecording({
+    captureSessionId: "capture-tc-job-fail",
+    sampleRate: 16000,
+    rawFilePath: toStoredPath(rawPath),
+  });
+
+  const result = await runAudioTranscodeJob("capture-tc-job-fail");
+  const row = runtimeStore.getAudioRecording("capture-tc-job-fail");
+  assert.equal(result.ok, false);
+  assert.equal(row.status, "failed");
+  assert.match(String(row.errorMessage), /transcode failed/);
+  assert.equal(existsSync(rawPath), true, "失败必须保留 .pcm");
+  rmSync(meetingAudioPath("capture-tc-job-fail"), { recursive: true, force: true });
+  console.log(`[L2] job 失败路径 OK: status=${row.status} err=${row.errorMessage}`);
+});
+
+test("transcode job: 已 ready 且文件在 → 直接跳过（幂等）", async () => {
+  const result = await runAudioTranscodeJob("capture-tc-job-ok");
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "already-ready");
+  console.log("[L2] job 幂等跳过 OK");
 });

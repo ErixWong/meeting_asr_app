@@ -16,6 +16,7 @@
     "test:audio": "node --test scripts/audio-test.mjs"
   },
   "dependencies": {
+    "@breezystack/lamejs": "1.2.7",
     "better-sqlite3": "^13.0.3",
     "knex": "^3.3.0",
     "mysql2": "^3.23.3",

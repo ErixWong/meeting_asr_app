@@ -11,6 +11,7 @@ import {
   registerAudioRecording,
 } from "./runtime-store.mjs";
 import { createRecorder } from "./audio-recorder.mjs";
+import { enqueueAudioTranscode } from "./audio-transcode.mjs";
 
 const APP_PORT = Number(process.env.PORT || 3123);
 const DEFAULT_ALLOWED_ORIGINS = `http://localhost:${APP_PORT},http://127.0.0.1:${APP_PORT}`;
@@ -365,6 +366,10 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
             ok: result.ok,
             errorMessage: result.error,
           });
+          if (result.ok && result.bytes > 0) {
+            // 转码异步排任务，不阻塞会话收尾与 WS 响应
+            enqueueAudioTranscode(targetCaptureSessionId);
+          }
         } catch (error) {
           console.error("[ASR Gateway] audio recording persist failed:", error);
         }

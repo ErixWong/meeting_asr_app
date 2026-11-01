@@ -700,7 +700,7 @@ export function markAudioRecordingReady(input) {
     .prepare(`
       UPDATE meeting_audio_recordings
       SET file_path = ?, bytes = ?, duration_seconds = ?, status = 'ready',
-          bitrate_kbps = ?, error_message = NULL, updated_at = ?
+          bitrate_kbps = ?, raw_file_path = NULL, error_message = NULL, updated_at = ?
       WHERE capture_session_id = ?
     `)
     .run(
