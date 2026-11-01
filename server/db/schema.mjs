@@ -274,7 +274,17 @@ export async function createIndexes(db) {
 
 // ---------- 迁移 ----------
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
+  {
+    version: 4,
+    name: "schema-version-single-row",
+    async up() {
+      // fix-261101-02（issue #51）：治愈版本记账。
+      // 真正的收敛动作由 runMigrations 的记账收尾统一完成（DELETE 全表 + INSERT 单行，
+      // 三库通用、不依赖唯一键），本条迁移只负责把版本号推进到 SCHEMA_VERSION，
+      // 使被污染的库（如 [2, 3, 3]）在升级时必然经过一次单行化写入。
+    },
+  },
   {
     version: 3,
     name: "meeting-audio-recordings",
@@ -386,11 +396,54 @@ const MIGRATIONS = [
 
 /**
  * 初始化 schema：建表 + 迁移 + 索引（幂等，可重复调用）
+ *
+ * single-flight：同一 AsyncDb 实例上并发调用共享同一个 in-flight promise，
+ * 避免并发跑迁移（并发会让 AsyncDb 的 _txDepth/savepoint 链路相互交错）。
  */
-export async function initializeSchema(db) {
-  await createTables(db);
-  await runMigrations(db);
-  await createIndexes(db);
+export function initializeSchema(db) {
+  const running = inFlightInitializations.get(db);
+  if (running) return running;
+
+  const promise = (async () => {
+    await createTables(db);
+    await runMigrations(db);
+    await createIndexes(db);
+  })().finally(() => {
+    inFlightInitializations.delete(db);
+  });
+
+  inFlightInitializations.set(db, promise);
+  return promise;
+}
+
+const inFlightInitializations = new WeakMap();
+
+/** 当前代码期望的 schema 版本（= 迁移条数；版本号从 1 连续递增） */
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
+/**
+ * 版本记账写入：DELETE 全表 + INSERT 一行。
+ * 不用 INSERT ... ON CONFLICT / INSERT OR REPLACE：schema_version 没有唯一键
+ * （SQLite 也无法给已有表补主键），REPLACE 在没有约束冲突时就是普通 INSERT。
+ * DELETE 全表 + INSERT 是 SQLite / MySQL / MSSQL 通用写法。
+ */
+async function writeSchemaVersion(db, version) {
+  await db.prepare("DELETE FROM schema_version").run();
+  await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(version);
+}
+
+/**
+ * 读版本：MAX(version)（不依赖无 ORDER BY 的隐式行序）+ 行数。
+ * 行数 > 1 说明库被 issue #51 污染过，调用方负责收敛成单行。
+ */
+async function readSchemaVersion(db) {
+  const row = await db
+    .prepare("SELECT MAX(version) AS max_version, COUNT(*) AS row_count FROM schema_version")
+    .get();
+  return {
+    maxVersion: row?.max_version == null ? 0 : Number(row.max_version),
+    rowCount: Number(row?.row_count ?? 0),
+  };
 }
 
 async function runMigrations(db) {
@@ -398,17 +451,26 @@ async function runMigrations(db) {
     t.integer("version").notNullable();
   });
 
-  const versionRow = await db.prepare("SELECT version FROM schema_version LIMIT 1").get();
-  let currentVersion = versionRow ? Number(versionRow.version) : 0;
+  const latestVersion = SCHEMA_VERSION;
+  const { maxVersion, rowCount } = await readSchemaVersion(db);
+  let currentVersion = maxVersion;
 
-  const latestVersion = MIGRATIONS.length;
-  if (currentVersion === 0 && versionRow === null) {
+  if (rowCount === 0) {
     // 无版本记录：探测结构是否已是最新（全新库直接标记最新；旧库从迁移 1 开始）
     const llmColumns = await listTableColumns(db, "meeting_llm_results");
     if (llmColumns.includes("meeting_id")) {
       currentVersion = latestVersion;
-      await db.prepare("DELETE FROM schema_version").run();
-      await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(latestVersion);
+    }
+  }
+
+  // 记账收敛：行数 > 1（历史缺陷遗留）或「无记录但结构已是最新」→ 写成唯一一行。
+  // 值取 MAX(现存) 而不是最新版本号：收敛只做去重，版本推进由下面的迁移循环负责。
+  if (rowCount > 1 || (rowCount === 0 && currentVersion > 0)) {
+    await db.withTransaction(async () => {
+      await writeSchemaVersion(db, currentVersion);
+    });
+    if (rowCount > 1) {
+      console.log(`[DB] schema_version 收敛为单行: ${rowCount} 行 → v${currentVersion}`);
     }
   }
 
@@ -425,10 +487,9 @@ async function runMigrations(db) {
       if (migration.version <= currentVersion) continue;
       await db.withTransaction(async () => {
         await migration.up(db);
-        await db.prepare("DELETE FROM schema_version").run();
-        await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(migration.version);
+        await writeSchemaVersion(db, migration.version);
       });
-      console.log(`[DB] Migration applied: v${migration.version} (${migration.name})`);
+      console.log(`[DB] Migration applied: v${migration.version} (${migration.name}) [knex]`);
     }
   } finally {
     if (db.dbType === "sqlite") {
