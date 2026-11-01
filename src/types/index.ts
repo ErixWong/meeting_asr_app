@@ -41,7 +41,11 @@ export interface MeetingRecord {
   lastErrorMessage?: string | null;
   transcript: TranscriptSegment[];
   summary: string;
-  /** feat-261101-01：是否有可播放的会议录音 */
+  /**
+   * feat-261101-01：是否有**可播放**的会议录音。
+   * 口径（R2 统一）：存在 `audioRecordings` 里 `status === "ready"` 的条目即为 true；
+   * 列表接口与详情接口走同一个投影函数（`admin-store.projectMeetingAudio`），不再各算一套。
+   */
   hasAudio?: boolean;
   audioRecordings?: MeetingAudioRecording[];
 }

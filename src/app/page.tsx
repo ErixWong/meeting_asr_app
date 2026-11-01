@@ -43,6 +43,9 @@ let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
 const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
 const TRANSLATE_BUFFER_CHARS_MAX = 2000;
+/** R2 F2：录音转码状态有界轮询（8 秒 × 12 次 ≈ 96 秒，用尽即停）。 */
+const AUDIO_PENDING_POLL_INTERVAL_MS = 8000;
+const AUDIO_PENDING_POLL_MAX_ATTEMPTS = 12;
 const SYSTEM_TRANSLATE_TEMPLATE_ID = "tpl-translate";
 const HISTORY_TRANSLATE_LANGS = [
   { value: "zh", label: "中文" },
@@ -1269,8 +1272,52 @@ export default function MeetingPage() {
     const meeting = data.meeting;
     if (!meeting) return;
     fullDetailLoadedRef.current = true;
-    setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, transcript: meeting.transcript } : prev));
+    // R2 修 F1：详情除了 transcript，还要把音频条目/hasAudio 一起并进来
+    // （以前只并 transcript，导致详情里的录音信息被丢掉）
+    setSelected((prev) =>
+      prev && prev.id === meetingId
+        ? {
+            ...prev,
+            transcript: meeting.transcript,
+            hasAudio: meeting.hasAudio,
+            audioRecordings: meeting.audioRecordings,
+          }
+        : prev
+    );
   }, [isActiveMeeting, requestJson]);
+
+  // R2 修 F2：「录音处理中…」自动变播放器 —— 有界轮询。
+  // 只在选中会议的音频里还存在 status==='recording' 时起定时器：8 秒一次、最多 12 次（≈96 秒），
+  // 全部离开 recording（变 ready/failed）或轮询次数用尽后自停；切会议 / 卸载时 cleanup 清定时器。
+  const pendingAudioSignature = (selected?.audioRecordings ?? [])
+    .filter((item) => item.status === "recording")
+    .map((item) => item.id)
+    .join(",");
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !pendingAudioSignature) return;
+
+    let disposed = false;
+    let attempts = 0;
+
+    const timer = window.setInterval(() => {
+      if (disposed) return;
+      attempts += 1;
+      if (attempts > AUDIO_PENDING_POLL_MAX_ATTEMPTS) {
+        window.clearInterval(timer);
+        return;
+      }
+      refreshMeeting(meetingId).catch((error) => {
+        if (!disposed) console.error("Failed to refresh meeting audio status:", error);
+      });
+    }, AUDIO_PENDING_POLL_INTERVAL_MS);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [pendingAudioSignature, refreshMeeting, selected?.id]);
 
   useEffect(() => {
     if (!selected?.id || selected.status !== "llm_processing") {

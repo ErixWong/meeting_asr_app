@@ -2579,6 +2579,12 @@ function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {
 // 会议录音（feat-261101-01 L5）：详情/列表输出 + 播放下载
 // ---------------------------------------------------------------------------
 
+// #region meeting-audio-projection
+// ⚠ 本区间是「列表与详情共用」的音频投影纯函数：不 import 任何模块、不碰 DB、不读文件。
+// scripts/audio-test.mjs 会按这两个标记把源码切出来（tsc 转译后在 vm 里跑）做防回归断言，
+// 所以：**别把这两个标记删了/挪到别的函数上**，也别往区间里塞有副作用的代码。
+// 字段白名单也在这里：磁盘路径（file_path / raw_file_path）永远不许出现在输出里。
+
 type MeetingAudioRow = {
   id: string;
   captureSessionId: string;
@@ -2632,12 +2638,29 @@ function toClientAudioRow(
   };
 }
 
+/**
+ * 列表与详情**共用**的音频投影（R2 修 F1/F2 的口径统一点）：
+ * - `audioRecordings`：白名单字段的客户端行，不含任何磁盘路径；
+ * - `hasAudio`：统一口径 = **存在 `status === "ready"` 的条目**（「有没有可听的」）。
+ *   历史列表曾经用 `COUNT(*) > 0`（recording 也算 true），与详情 `some(ready)` 不一致，已废弃。
+ */
+export function projectMeetingAudio(
+  rows: MeetingAudioRow[] | null | undefined,
+  meetingTitle: string
+): { hasAudio: boolean; audioRecordings: MeetingAudioClientRow[] } {
+  const list = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  const audioRecordings = list.map((row, index) => toClientAudioRow(row, meetingTitle, index, list.length));
+  return {
+    hasAudio: audioRecordings.some((item) => item.status === "ready"),
+    audioRecordings,
+  };
+}
+// #endregion meeting-audio-projection
+
 export function getMeetingAudioRecordings(meetingId: string): MeetingAudioClientRow[] {
   if (!meetingId || !ensureMeetingOwned(meetingId)) return [];
-  const row = queryMeetingRowById(meetingId);
-  const title = row?.title ?? "录音";
   const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
-  return rows.map((item, index) => toClientAudioRow(item, title, index, rows.length));
+  return projectMeetingAudio(rows, queryMeetingRowById(meetingId)?.title ?? "录音").audioRecordings;
 }
 
 /** 播放/下载用：属主校验后返回磁盘绝对路径 + 元信息。 */
@@ -2674,19 +2697,47 @@ export function getMeetingAudioFile(input: { meetingId: string; recordingId?: st
   };
 }
 
-/** 列表页用：一次性拿全部会议的录音就绪数（避免 N+1）。 */
-function listMeetingAudioSummaries(): Map<string, number> {
+/**
+ * 列表页用：一次 SQL 取出当前用户所有会议的音频行（避免 N+1），按 meetingId 分组。
+ * 只查投影需要的列 —— `file_path` / `raw_file_path` 在 SQL 层就不查，从源头杜绝磁盘路径外泄。
+ * 排序与 `listAudioRecordingsForMeeting` 一致（created_at, id），保证列表/详情下载文件名序号相同。
+ */
+function listMeetingAudioRowsByMeeting(): Map<string, MeetingAudioRow[]> {
   const actor = getCurrentActor();
   const rows = getDb()
     .prepare(`
-      SELECT r.meeting_id as meetingId, COUNT(*) as readyCount
+      SELECT
+        r.id,
+        r.capture_session_id as captureSessionId,
+        r.meeting_id as meetingId,
+        NULL as filePath,
+        NULL as rawFilePath,
+        r.format,
+        r.status,
+        r.bytes,
+        r.duration_seconds as durationSeconds,
+        r.sample_rate as sampleRate,
+        r.bitrate_kbps as bitrateKbps,
+        r.error_message as errorMessage,
+        r.created_at as createdAt,
+        r.updated_at as updatedAt,
+        r.expires_at as expiresAt
       FROM meeting_audio_recordings r
       INNER JOIN meetings m ON m.id = r.meeting_id
-      WHERE m.created_by_user_id = ? AND r.status = 'ready'
-      GROUP BY r.meeting_id
+      WHERE m.created_by_user_id = ?
+      ORDER BY r.created_at ASC, r.id ASC
     `)
-    .all(actor.id) as Array<{ meetingId: string; readyCount: number }>;
-  return new Map(rows.map((row) => [String(row.meetingId), Number(row.readyCount)]));
+    .all(actor.id) as MeetingAudioRow[];
+
+  const grouped = new Map<string, MeetingAudioRow[]>();
+  for (const row of rows) {
+    const meetingId = String(row.meetingId ?? "");
+    if (!meetingId) continue;
+    const list = grouped.get(meetingId);
+    if (list) list.push(row);
+    else grouped.set(meetingId, [row]);
+  }
+  return grouped;
 }
 
 export function listMeetings() {
@@ -2715,13 +2766,16 @@ export function listMeetings() {
     `)
     .all<MeetingRow>(actor.id);
 
-  const audioSummaries = listMeetingAudioSummaries();
+  const audioByMeeting = listMeetingAudioRowsByMeeting();
 
-  return rows.map((row) => ({
-    ...mapMeetingRow({ ...row, transcript: [] }),
-    hasAudio: (audioSummaries.get(String(row.id)) ?? 0) > 0,
-    audioRecordings: [],
-  }));
+  return rows.map((row) => {
+    const audio = projectMeetingAudio(audioByMeeting.get(String(row.id)) ?? [], row.title ?? "录音");
+    return {
+      ...mapMeetingRow({ ...row, transcript: [] }),
+      hasAudio: audio.hasAudio,
+      audioRecordings: audio.audioRecordings,
+    };
+  });
 }
 
 function queryMeetingRowById(id: string) {
@@ -2760,11 +2814,14 @@ export function getMeetingLightById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  const audioRecordings = getMeetingAudioRecordings(id);
+  const audio = projectMeetingAudio(
+    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    row.title ?? "录音"
+  );
   return {
     ...mapMeetingRow({ ...row, transcript: [] }),
-    hasAudio: audioRecordings.some((item) => item.status === "ready"),
-    audioRecordings,
+    hasAudio: audio.hasAudio,
+    audioRecordings: audio.audioRecordings,
   };
 }
 
@@ -2772,11 +2829,14 @@ export function getMeetingById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  const audioRecordings = getMeetingAudioRecordings(id);
+  const audio = projectMeetingAudio(
+    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    row.title ?? "录音"
+  );
   return {
     ...mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) }),
-    hasAudio: audioRecordings.some((item) => item.status === "ready"),
-    audioRecordings,
+    hasAudio: audio.hasAudio,
+    audioRecordings: audio.audioRecordings,
   };
 }
 

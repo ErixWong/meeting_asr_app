@@ -8,6 +8,7 @@
  *   L2 server/audio-transcode.mjs       —— PCM→MP3 头/码率/删 pcm/失败保留/幂等
  *   L3 meeting_audio_recordings 表       —— 建表 + 迁移到 v3（旧库路径）
  *   L4 绑定 / 孤儿清理                   —— meeting_id 写入、expires_at 置空、过期删除
+ *   R2 列表行音频摘要（F1）/ hasAudio 口径 —— admin-store.ts 音频投影纯函数（源码切片 + tsc 转译）
  *
  * 运行：npm run test:audio（= node --test scripts/audio-test.mjs，需 Node 24）
  * 说明：全部临时文件落在 os.tmpdir() 的沙箱里（测试开始 chdir 进去，data/ 也在
@@ -18,6 +19,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 
 const sandbox = mkdtempSync(join(tmpdir(), "audio-test-"));
 process.chdir(sandbox);
@@ -560,4 +562,198 @@ test("range: bytes=a-b / a- / -N 与越界 416 语义", async () => {
   assert.equal(parseRange("bytes=-", size), "invalid");
   assert.equal(parseRange("bytes=-0", size), "invalid");
   console.log("[L5] Range 语义 OK（200/206/416 三条分支）");
+});
+
+// ---------------------------------------------------------------------------
+// R2 返工防回归：列表行必须带出音频摘要（F1）+ hasAudio 口径统一
+//
+// 断言的是**哪一层**：`src/lib/admin-store.ts` 里 `#region meeting-audio-projection`
+// 区间的**真实源码**（不是测试里的副本）。admin-store.ts 依赖 `@/` 别名与 next 运行时，
+// 在 node --test 里不能直接 import，所以按标记切出纯函数区间，用项目自带 tsc
+// 转译后在 vm 里执行，断言 listMeetings / getMeetingById 共用的那个投影函数的输出。
+// 若有人把 `audioRecordings: []` 写回列表、或往输出里塞磁盘路径，这些用例会挂。
+// ---------------------------------------------------------------------------
+
+const ADMIN_STORE_PATH = join(repoRoot, "src", "lib", "admin-store.ts");
+
+function sliceBetween(source, startNeedle, endNeedle) {
+  const start = source.indexOf(startNeedle);
+  assert.ok(start >= 0, `admin-store.ts 里找不到起点标记: ${startNeedle}`);
+  const end = source.indexOf(endNeedle, start + startNeedle.length);
+  assert.ok(end > start, `admin-store.ts 里找不到终点标记: ${endNeedle}`);
+  return source.slice(start, end);
+}
+
+async function loadMeetingAudioProjection() {
+  const source = readFileSync(ADMIN_STORE_PATH, "utf-8");
+  const snippet = sliceBetween(
+    source,
+    "// #region meeting-audio-projection",
+    "// #endregion meeting-audio-projection"
+  );
+  const tsModule = await import(join(repoRoot, "node_modules", "typescript", "lib", "typescript.js"));
+  const ts = tsModule.default ?? tsModule;
+  const { outputText } = ts.transpileModule(snippet, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  });
+  const moduleShim = { exports: {} };
+  runInNewContext(outputText, { module: moduleShim, exports: moduleShim.exports, console });
+  assert.equal(
+    typeof moduleShim.exports.projectMeetingAudio,
+    "function",
+    "投影区间里应导出 projectMeetingAudio（列表与详情共用的口径函数）"
+  );
+  return moduleShim.exports;
+}
+
+const AUDIO_CLIENT_KEYS = [
+  "bitrateKbps",
+  "bytes",
+  "captureSessionId",
+  "createdAt",
+  "downloadFileName",
+  "durationSeconds",
+  "errorMessage",
+  "format",
+  "id",
+  "status",
+].sort();
+
+function audioRow(overrides = {}) {
+  return {
+    id: "aud-00000000-0000-0000-0000-000000000001",
+    captureSessionId: "capture-list-1",
+    meetingId: "meeting-list-1",
+    // 真实行里这两个字段是**磁盘路径**（存储相对路径），投影必须把它们挡在输出之外
+    filePath: "audio/meetings/capture-list-1.mp3",
+    rawFilePath: "audio/raw/capture-list-1.pcm",
+    format: "mp3",
+    status: "ready",
+    bytes: 1_048_576,
+    durationSeconds: 174,
+    sampleRate: 16000,
+    bitrateKbps: 48,
+    errorMessage: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: null,
+    ...overrides,
+  };
+}
+
+test("R2/F1: 列表行投影带出 audioRecordings 且字段齐全（白名单，含 id/status/durationSeconds/bytes/downloadFileName）", async () => {
+  const { projectMeetingAudio } = await loadMeetingAudioProjection();
+  const result = projectMeetingAudio([audioRow()], "周会");
+
+  assert.equal(Array.isArray(result.audioRecordings), true, "audioRecordings 必须是数组");
+  assert.equal(result.audioRecordings.length, 1, "列表行不能再是空数组");
+  const [item] = result.audioRecordings;
+
+  for (const key of ["id", "status", "durationSeconds", "bytes", "downloadFileName"]) {
+    assert.ok(key in item, `列表行缺字段 ${key}`);
+    assert.notEqual(item[key], undefined, `列表行字段 ${key} 不能是 undefined`);
+  }
+  assert.deepEqual(Object.keys(item).sort(), AUDIO_CLIENT_KEYS, "输出字段集合必须等于白名单（多一个都可能泄路径）");
+  assert.equal(item.status, "ready");
+  assert.equal(item.durationSeconds, 174);
+  assert.equal(item.bytes, 1_048_576);
+  assert.equal(item.downloadFileName, "周会.mp3");
+  console.log(`[R2] 列表行音频摘要字段齐全 OK: ${Object.keys(item).join(",")}`);
+});
+
+test("R2/F1: hasAudio 口径统一为「存在 status=ready」（列表与详情同一个函数）", async () => {
+  const { projectMeetingAudio } = await loadMeetingAudioProjection();
+
+  assert.equal(projectMeetingAudio([audioRow({ status: "ready" })], "会").hasAudio, true);
+
+  // 只有 recording（刚录完、转码中）→ 不算有可听录音
+  const recordingOnly = projectMeetingAudio([audioRow({ status: "recording" })], "会");
+  assert.equal(recordingOnly.hasAudio, false, "只有 recording 时 hasAudio 必须为 false（口径=存在 ready）");
+  assert.equal(recordingOnly.audioRecordings.length, 1, "但条目本身要带出来，UI 才能显示「录音处理中…」");
+
+  // 只有 failed → 同样 false，但条目要带出来（UI 要显示 errorMessage）
+  const failedOnly = projectMeetingAudio([audioRow({ status: "failed", errorMessage: "transcode failed" })], "会");
+  assert.equal(failedOnly.hasAudio, false);
+  assert.equal(failedOnly.audioRecordings[0].errorMessage, "transcode failed");
+
+  // 双通道：一条 ready 一条 failed → true
+  const mixed = projectMeetingAudio(
+    [audioRow({ id: "aud-a", status: "failed" }), audioRow({ id: "aud-b", status: "ready" })],
+    "会"
+  );
+  assert.equal(mixed.hasAudio, true);
+  assert.equal(mixed.audioRecordings.length, 2);
+  assert.equal(mixed.audioRecordings[0].downloadFileName, "会-1.mp3");
+  assert.equal(mixed.audioRecordings[1].downloadFileName, "会-2.mp3");
+
+  // 空 / null / undefined（没有录音的会议）
+  for (const empty of [[], null, undefined]) {
+    const result = projectMeetingAudio(empty, "会");
+    assert.equal(result.hasAudio, false);
+    // 注意：投影跑在 vm 里，返回的是另一个 realm 的数组，不能用 deepStrictEqual 比原型
+    assert.equal(Array.isArray(result.audioRecordings), true);
+    assert.equal(result.audioRecordings.length, 0);
+  }
+  console.log("[R2] hasAudio 口径统一 OK（ready→true；recording/failed/空→false）");
+});
+
+test("R2/F1: 列表行不透出磁盘绝对/存储路径（键名与值都检查）", async () => {
+  const { projectMeetingAudio } = await loadMeetingAudioProjection();
+  const absoluteRow = audioRow({
+    filePath: join(sandbox, "data", "audio", "meetings", "capture-list-1.mp3"),
+    rawFilePath: join(sandbox, "data", "audio", "raw", "capture-list-1.pcm"),
+  });
+  const result = projectMeetingAudio([absoluteRow], "周会");
+  const item = result.audioRecordings[0];
+
+  for (const key of Object.keys(item)) {
+    assert.doesNotMatch(key, /path|dir|raw/i, `输出字段 ${key} 看起来是路径字段`);
+  }
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /audio\/(meetings|raw)/, `输出里出现了存储路径: ${serialized}`);
+  assert.doesNotMatch(serialized, /sandbox|\/app\/data|\.pcm|\.mp3\?/, `输出里出现了磁盘路径: ${serialized}`);
+  assert.equal(serialized.includes(sandbox), false, "输出里出现了沙箱绝对路径");
+  // 唯一允许出现的 .mp3 是下载文件名
+  assert.match(item.downloadFileName, /^周会\.mp3$/);
+  console.log(`[R2] 无路径外泄 OK: ${serialized}`);
+});
+
+test("R2/F1: listMeetings 走同一投影 + 批量 SQL 不查路径列（防退回 N+1 / 防退回空数组）", () => {
+  const source = readFileSync(ADMIN_STORE_PATH, "utf-8");
+  const listMeetingsSource = sliceBetween(source, "export function listMeetings()", "function queryMeetingRowById");
+
+  assert.match(listMeetingsSource, /listMeetingAudioRowsByMeeting\(\)/, "列表必须用一次性批量查询");
+  assert.match(listMeetingsSource, /projectMeetingAudio\(/, "列表必须走与详情同一个投影函数");
+  assert.doesNotMatch(listMeetingsSource, /audioRecordings:\s*\[\]/, "列表行不许再写死 audioRecordings: []");
+  assert.doesNotMatch(listMeetingsSource, /listAudioRecordingsForMeeting/, "列表里不许出现按会议逐条查（N+1）");
+
+  const batchSource = sliceBetween(
+    source,
+    "function listMeetingAudioRowsByMeeting()",
+    "export function listMeetings()"
+  );
+  assert.doesNotMatch(batchSource, /r\.file_path|r\.raw_file_path/, "批量查询不许 SELECT 磁盘路径列");
+  assert.match(batchSource, /NULL as filePath/);
+
+  // hasAudio 只允许由投影结果赋值（口径一致），不许各处自算
+  const projectionRegion = sliceBetween(
+    source,
+    "// #region meeting-audio-projection",
+    "// #endregion meeting-audio-projection"
+  );
+  assert.equal(
+    (projectionRegion.match(/hasAudio: audioRecordings\.some/g) ?? []).length,
+    1,
+    "hasAudio 口径只应在投影函数里算一次"
+  );
+  const outsideProjection = source.replace(projectionRegion, "");
+  assert.doesNotMatch(outsideProjection, /hasAudio: audioRecordings\.some/, "投影之外不许再自算 hasAudio 口径");
+  assert.doesNotMatch(outsideProjection, /hasAudio:\s*\(audioSummaries/, "旧的 count>0 口径已废弃");
+  assert.doesNotMatch(source, /listMeetingAudioSummaries/, "旧的 count>0 口径已废弃");
+  assert.equal(
+    (source.match(/hasAudio: audio\.hasAudio/g) ?? []).length,
+    3,
+    "listMeetings / getMeetingLightById / getMeetingById 三处都应写 hasAudio: audio.hasAudio"
+  );
+  console.log("[R2] listMeetings 复用投影 + 批量查询无路径列 OK");
 });
