@@ -1,6 +1,6 @@
 # 数据库方言可移植性（SQLite / MariaDB / SQL Server）
 
-> 状态：PR-B 阶段①（issue #53）产出，阶段②（issue #54）更新。**本文件记录的是实测事实与待办边界，不是「已支持多库」的声明。**
+> 状态：PR-B 阶段①（issue #53）产出，阶段②（issue #54）与阶段③前半（issue #55 / #55a）更新。**本文件记录的是实测事实与待办边界，不是「已支持多库」的声明。**
 > 生产目前仅 SQLite 经过真机验证；`DB_TYPE=mysql|mssql` 已能「初始化 + 冒烟」（三库 CI 绿），
 > 但业务 SQL 的方言语法清零归 #55（见文末「待办边界」）。
 
@@ -38,7 +38,7 @@
 - **时间戳统一 `TEXT` 存 ISO8601 字符串**（`string(32)`），不依赖数据库时间类型/时区转换；knex 工厂对 mysql 显式 `dateStrings: true` + `timezone: "Z"` 保持同一语义。
 - **SQL 里 0 处** `strftime` / `julianday` / `datetime()` / `GROUP_CONCAT` / `json_extract`（全仓 grep 实测，含 legacy DDL 与业务 SQL）。
 - **`server/db/insert-ignore.mjs`** 已实现 mssql 分支：`INSERT INTO t SELECT ... WHERE NOT EXISTS(...)`（knex 的 `onConflict().ignore()` 不支持 mssql 客户端）；sqlite/mysql 走 `onConflict(keys).ignore()`。
-- **`AsyncDb.prepare(sql)`** 提供与 `node:sqlite` 同形的 `.all/.get/.run`（异步版），占位符 `?` 由 knex 翻译成各库绑定语法（mssql → `@p0`，**实测可用**，见 §4.7）；`extractRows()` 已消化三库返回结构差异，`extractRunInfo()` 在 mssql 上有已知缺口（见 §4.8）。
+- **`AsyncDb.prepare(sql)`** 提供与 `node:sqlite` 同形的 `.all/.get/.run`（异步版），占位符 `?` 由 knex 翻译成各库绑定语法（mssql → `@p0`，**实测可用**，见 §4.7）；`extractRows()` 已消化三库返回结构差异；`extractRunInfo()` 在 mssql 上原本拿不到受影响行数（#55 已修：同 batch 追加 `SELECT @@ROWCOUNT`，见 §4.8）。
 - **迁移 SQL 已用三库通用写法**：`ROW_NUMBER() OVER (PARTITION BY ...)`（三库都支持）、`COALESCE`、`DELETE` + `INSERT` 记账（不依赖 `ON CONFLICT`/唯一键，见 #52）。
 
 ## 3. 实测坐标（2026-11，本机容器）
@@ -80,7 +80,7 @@
 | 现象原文 | `BEGIN - Incorrect syntax near 'BEGIN'.`；改成 `BEGIN TRANSACTION` 后变成 `Transaction count after EXECUTE indicates a mismatching number of BEGIN and COMMIT statements. Previous count = 0, current count = 1.`（`Msg 266`） |
 | 触发条件 | knex 的 mssql 方言把 `knex.raw(sql)` 交给 `sp_executesql` 执行；语句内开启事务会让 SQL Server 在过程返回时发现 `@@TRANCOUNT` 前后不一致 |
 | 正确写法 | 走**驱动级事务 API**：`knex.transaction(async (trx) => ...)`（→ tedious `beginTransaction` / `commitTransaction` / `rollbackTransaction`），并让事务期间的语句都走 `trx` 连接 |
-| 本单是否已修 | ✅ 已修：`server/db/async-db.mjs` 的 `withTransaction()` 增加 mssql 分支（`async-db.mjs:92-116`），事务期间把 `this.knex` 换成 `trx`，使 `exec/prepare` 与调用方 `db.knex.xxx` 落在同一连接。sqlite/mysql 分支与它们下发的 SQL 文本**逐字节不变** |
+| 本单是否已修 | ✅ 已修：走**驱动级事务 API**（`knex.transaction` → tedious `beginTransaction` / `commitTransaction` / `rollbackTransaction`）。#54 时是「事务期间把 `this.knex` 换成 `trx`」；**#55 起改成把 `trx` 作为回调参数显式传给调用方**（`withTransaction(async (tx) => …)`），实例级可变状态已删除，见 §4.6 |
 
 ### 4.4 大小写语义：`=` 与主键唯一性
 
@@ -110,24 +110,31 @@
 - ⚠ SQLite 的 `lower()` **只折叠 ASCII**：`LOWER('Ä')` → `'Ä'`（不变），而 mysql/mssql 会折叠成 `'ä'`。**中文不受影响**（`LOWER('管理员')` 三库都返回 `'管理员'`），所以 `LOWER()` 方案对中文检索安全，对非 ASCII 拉丁字母（德语/北欧姓名）仍不一致——需要精确检索时应改用 `COLLATE` 方案或应用侧规范化。
 - 本单**不改业务 SQL**（SQLite 现网行为必须逐条不变），只记录差异 + 留断言。
 
-### 4.6 实例级事务状态：#54 已用「串行化」止血，#55 仍需「显式传递 trx」终解
+### 4.6 实例级事务状态：**#55 已删除**（事务句柄显式传递 + 运行期防线）
 
-`AsyncDb` 的事务状态原本是**实例级可变状态**（`this.knex = trx`、`_txDepth`）。同步驱动时代所有事务天然串行，缺陷看不出来；异步化后同一实例上的并发事务会互踩（后进入者把 `this.knex` 改写成自己的 `trx`，先退出者又指回自己的 `outerKnex` ⇒ 语句落在事务之外却仍返回「成功」，或 savepoint 名撞车）。
+#### 4.6.1 旧缺陷（#54 前的形态，已不再存在）
 
-#### 4.6.1 现状（#54 已修的部分）
+`AsyncDb` 的事务状态原本是**实例级可变状态**（`this.knex = trx`、`_txDepth`）。同步驱动时代所有事务天然串行，缺陷看不出来；异步化后同一实例上的并发事务会互踩：后进入者把 `this.knex` 改写成自己的 `trx`，先退出者又指回自己的 `outerKnex` ⇒ 语句落在事务之外却仍返回「成功」，或 savepoint 名撞车报 `no such savepoint: sp_1`。
 
-- **同一实例上的顶层事务串行化**：`AsyncDb.withTransaction()` 的顶层事务走 `_serialize()` 排队（后进者等前一个 settle 再进入），等价于同步时代的串行语义。嵌套层**不排队**（它本来就在外层事务的异步上下文里，排队会自锁），只按深度开 savepoint。
-- **事务深度从实例字段改为 AsyncLocalStorage**（`_txContext`）：深度按**异步上下文**隔离，savepoint 名 `sp_<depth>` 不再被并发事务撞车。这是 §4.6.1 原缺陷（`no such savepoint: sp_1`）的根因修复。
-- **SQLite 单连接语义保持**：SQLite 的 `pool.max = 1`，事务未提交时其他请求的普通语句会落进这个事务（同一个连接）。为保持「同步驱动时代语句不会插进别人事务」的语义，sqlite 下**语句执行也走同一把锁**（事务内直接放行，靠 `_txContext` 判重入）。
-- **断言**：`scripts/db-schema-test.mjs` 的「事务并发回归」套件真跑四条（sqlite + mariadb + mssql 三库都跑）：
-  ① 两个并发顶层事务都提交且互不丢失；② 并发下嵌套事务内层抛错只回滚内层；③ 并发下不出现 savepoint 报错；④（sqlite）事务回滚不吞掉并发的非事务写入。
-  **反向证据**：把串行化关掉后，同一用例立刻 FAIL（`BEGIN - cannot start a transaction within a transaction`）；把改动前的实现（实例级 `_txDepth` + 无串行化）拿来跑同一用例，报的正是 `ROLLBACK TO SAVEPOINT sp_1 - no such savepoint: sp_1`。
+#54 用「顶层事务串行化 + 深度改 `AsyncLocalStorage`」止血，但「用哪条连接」仍是实例级字段。
 
-#### 4.6.2 仍然存在的缺口（归 #55，本单不修）
+#### 4.6.2 现状（#55 D1/D2/D3）：句柄显式传递，实例级状态清零
 
-- **串行化是权宜，显式传递 `trx` 才是终解**：`this.knex = trx` 仍是实例级可变状态。串行化只保证「同一时刻只有一个顶层事务」，但**非事务语句**在 mssql 下仍会被 `this.knex = trx` 带进事务（并发请求的普通写可能随别人的事务一起回滚）。sqlite 由语句级锁兜住了；**mysql / mssql 没有**（连接池 > 1，语句可能落在别人的事务连接之外/之内，取决于方言实现）。
-- 正解：把事务句柄（`trx`）作为参数/上下文显式传递，不再存在实例字段上；届时 §4.6 整节可以删除。这也是 #55 的输入。
-- 并发事务的**吞吐**：sqlite 下所有语句串行（等价于同步时代），mssql/mysql 只串行事务本身。
+| 项 | 现状 |
+| --- | --- |
+| 事务句柄 | `withTransaction(async (tx) => …)`，`tx` 是**绑定事务连接**的 AsyncDb 视图（`.prepare().all/get/run` / `.exec` / `.knex` / `.dbType`），可直接交给 `listTableColumns(tx, …)` 这类工具函数 |
+| 实例级可变状态 | **已删除**：不再有 `this.knex = trx`。`AsyncDb` 实例的 `knex` 在生命周期内不变 |
+| 运行期防线（D2） | 事务上下文（`transactionDepth > 0`）中在**普通 db** 上调用 `prepare` / `exec` / `withTransaction`（以及 `listTableColumns(db, …)`）**直接抛错**：`[DB] prepare() 在事务上下文里被调用，但用的是普通 db 句柄：事务内请使用回调传入的 tx，否则语句会落在事务连接之外…`。这是「漏改一处就静默写错库」的唯一硬闸 |
+| 嵌套事务 | `tx.withTransaction(async (tx2) => …)`；三库统一走 knex 嵌套事务（sqlite/mysql `SAVEPOINT`、mssql `SAVE TRANSACTION`），**savepoint 一定发在事务连接上** ⇒ `no such savepoint: sp_1` 已修 |
+| 串行锁职责 | 收窄为**跨事务互斥**（同一实例上的顶层事务排队，等价于同步驱动时代的串行语义）；sqlite 的语句级锁保留（单连接下语句否则会落进别人的事务）。锁不再负责连接路由 |
+| 非事务语句落进别人事务 | **已关闭**：mssql 不再有 `this.knex = trx`，非事务语句一定走池连接；sqlite 仍由语句级锁兜住 |
+
+**断言**（`scripts/db-tx-test.mjs`，`npm run db:test-tx`，已挂进 `db:test-parity` 矩阵）：
+顶层提交 / 顶层回滚 / 嵌套内层回滚不影响外层 / **D2 防线（4 个入口全部抛错且文案含提示）** / 并发两个顶层事务不丢写 / 顶层事务串行化不交错 / 三库 affected-rows / 回调签名兼容。
+反向证据（变异验证，见 `docs/tasks/active/feat-261101-06-db-tx-explicit/report.md` §变异）：
+事务体内改用 `db.prepare` ⇒ 立即被 D2 抛错（`test:title` 4 条用例红）；关掉串行锁 ⇒ mariadb/mssql 的「不交错」断言立刻 FAIL。
+
+> sqlite 的 `pool.max = 1` 本身就把并发事务排到同一条连接上，所以「串行化」这条在 sqlite 上关掉锁也观测不到差别——观测点是连接池 > 1 的 mariadb / mssql。
 
 ### 4.7 mssql 的位置参数 `?`：**实测可用**（与 #53 工单假设相反）
 
@@ -150,15 +157,16 @@
   1. **SQL 文本里不能出现字面量 `?`**（字符串/注释里也不行）。全仓 grep 目前 **0 处**（`grep -rn "'?'\|\"?\"" src/lib server scripts` 为空），属于**潜在**约束，写新 SQL 时要注意。
   2. **类型严格性**：mssql 不做 SQLite 那种隐式类型转换（数字列传字符串会报 `Conversion failed`）。生产代码目前一律按列类型传值（`Number(...)` / 字符串），但没有方言级断言，属 #55 的三库业务回归范畴。
 
-### 4.8 mssql 的 `extractRunInfo()` 拿不到受影响行数（#55 的阻塞项）
+### 4.8 mssql 的 `extractRunInfo()`：**#55 已修**（同 batch 追加 `SELECT @@ROWCOUNT`）
 
-- 现象：`AsyncDb.prepare(sql).run(...)` 在 mssql 上**恒返回 `changes: 0`**。实测 `knex.raw("INSERT ...")` / `UPDATE` / `DELETE` 在 mssql 下返回的是**空数组 `[]`**（knex 的 mssql 方言不把 tedious 的 `rowsAffected` 透传出来），`extractRunInfo()` 因此取到 `{}` → `Number(undefined ?? 0) === 0`。
-- 影响（mssql 上会**静默判错**，不报错）：
-  - `src/lib/admin-store.ts` 的 `deleteHotword()` → `Number(result.changes ?? 0) > 0` 恒为 false；
-  - `updateMeetingStatus()` → `if (Number(result.changes ?? 0) === 0) throw ...` 恒抛「状态已被改动」；
-  - `cleanupExpiredAuditLogs()` 返回值恒 0（日志里永远显示清理 0 条）。
-- 建议解法（#55，本单不修）：mssql 分支把语句改写成同一 batch 里追加 `; SELECT @@ROWCOUNT AS changes`，从 `recordsets` 里取；或对 DML 改用 knex builder（`.update()/.delete()` 返回 rowCount）。
-- 本单的取证边界：只证明「`?` 能跑通 + 受影响行数拿不到」，**mssql 业务路径没有端到端跑过**（#54 对 mysql/mssql 的要求只有「初始化 + 冒烟」）。
+- 原现象：`AsyncDb.prepare(sql).run(...)` 在 mssql 上**恒返回 `changes: 0`**，`deleteHotword()` / `updateMeetingStatus()` / 审计清理静默判错。
+- **探针实测**（`DB_TYPE=mssql`，一次性库 `meeting_asr_ci_txprobe*`，原始输出见 `docs/tasks/active/feat-261101-06-db-tx-explicit/report.md`）：
+  - `knex.raw("INSERT/UPDATE/DELETE …")` → **空数组 `[]`**（knex 的 mssql 方言不透传 tedious 的 `rowsAffected`）；事务内 `trx.raw(...)` 同样是 `[]`；
+  - builder 形态：`.insert()` 返回 `[]`，`.update()` / `.del()` 返回 number；
+  - 同一 batch 末尾追加 `\n; SELECT @@ROWCOUNT AS changes` → `[{ changes: 1 }]` / `[{ changes: 0 }]`；
+  - 追加**必须换行**：SQL 末尾有 `-- 行注释` 时，同行的 SELECT 会被注释吞掉（不换行 → `[]`，换行 → `[{changes:1}]`）；语句本身以 `;` 结尾没问题。
+- 实现：`server/db/async-db.mjs` 的 `appendRowCountSelect(sql)`，只作用于 `prepare(sql).run()` 的 mssql 分支（`.all/.get` 与 `exec` 的 SQL 文本不变）。
+- 断言：`scripts/db-tx-test.mjs` 的 G1–G10（三库都跑）：INSERT=1、UPDATE 命中=1 / 不命中=0、DELETE 命中=1 / 不命中=0，事务内同样成立。
 
 ## 5. 裸 SQL 分布与方言点逐条
 
@@ -167,8 +175,8 @@
 
 | 文件 | #54 之前 | #54 之后 | 说明 |
 | --- | --- | --- | --- |
-| `src/lib/admin-store.ts` | 78 | 79 | +1 是 `getDb()` 的 `AsyncDatabase` 类型注释里那行示例；SQL 语句数不变，全部补 `await` |
-| `server/runtime-store.mjs` | 26 | 27 | +1 是 `statementsFor(database)` 里拆出的 `updateSession` 注释行；语句数不变 |
+| `src/lib/admin-store.ts` | 78 | 79 | +1 是 `getDb()` 的 `AsyncDatabase` 类型注释里那行示例；SQL 语句数不变，全部补 `await`。**#55 后仍 79**（`(await getDb()).prepare` 换成 `tx.prepare`，计数不变） |
+| `server/runtime-store.mjs` | 26 | 27 | +1 是 `statementsFor(database)` 里拆出的 `updateSession` 注释行；语句数不变。**#55 后仍 27** |
 | `server/database-schema.mjs` | 6 | **0** | **文件已退役删除**（DDL/迁移并入 `server/db/schema.mjs`） |
 | `server/db-shared.mjs` | 2 | 6 | 2 条业务（审计清理）+ 3 条 SQLite PRAGMA + 1 条 WAL 复核 |
 | `server/tts-gateway.mjs` | 1 | 1 | 只补 `await` |
@@ -212,14 +220,15 @@
 
 > 上表按「运行时业务 + 迁移路径」口径计 8 处（不含 `server/db/index.mjs:109-116` 的 3 条 SQLite 连接级优化 PRAGMA——那 3 条本来就只在 `dbType === "sqlite"` 分支里下发，天然安全）。knex 侧已有跨库替代：`server/db/async-db.mjs` 的 `listTableColumns()`（sqlite `PRAGMA table_info` / mysql `information_schema.COLUMNS` / mssql `INFORMATION_SCHEMA.COLUMNS`）。
 
-## 6. 三库测试脚手架（#53 新增，#54 扩展）
+## 6. 三库测试脚手架（#53 新增，#54 扩展，#55 加事务套件）
 
 ```bash
-# 全矩阵：sqlite（node:sqlite legacy + better-sqlite3 两驱动）+ mariadb + mssql
+# 全矩阵：sqlite（better-sqlite3 生产入口）+ mariadb + mssql，每个目标跑 3 个 job
 npm run db:test-parity
 
 # 单方言
 npm run db:test-semantic                     # 语义锁（默认 sqlite）
+npm run db:test-tx                           # 事务句柄/affected-rows（默认 sqlite；--dialect 单方言）
 DB_TYPE=mssql DB_HOST=... DB_USER=sa DB_PASSWORD=... npm run db:test-schema -- --dialect
 
 # 确认要放行 SKIP（例如本机暂时没有 mssql 靶子）
@@ -232,14 +241,17 @@ npm run db:test-parity -- --allow-skip
 - **容器到宿主的可达性**：mssql 发布在 `0.0.0.0:1433`，容器用 `--add-host=host.docker.internal:host-gateway` + `host.docker.internal:1433`；**mariadb 只发布在 `127.0.0.1:3306`（loopback-only），`host.docker.internal` 打不通**，容器必须挂到 `prod` 网络并用容器名 `mariadb:3306`。
 - 覆盖矩阵（#54 之后只剩一条实现路径，所有目标都打**生产入口**）：
 
-| 目标 | schema/迁移套件 | 语义锁 |
-| --- | --- | --- |
-| sqlite（生产入口 `getDb()` → `better-sqlite3`） | 场景 1/2/4/4b/5（幂等、污染库收敛、并发）+ **5b 事务并发回归** + 3（v0 旧库迁移）+ **3b 去重/孤儿丢弃** + 6/7/8（生产入口：单例、WAL/busy_timeout/外键、污染库收敛、两模块图并发） | A/B/C 共 11 项 |
-| mariadb 11.7 | 基线建表 → 建索引 → 迁移 → 记账单行 → 二次幂等 → v3/v4 迁移循环 + 事务并发回归 + **生产入口 getDb() 初始化** | A/B/C 共 11 项 |
-| SQL Server 2025 | 同上 + 嵌套事务提交/回滚 | A/B/C 共 11 项 |
+| 目标 | schema/迁移套件 | 语义锁 | 事务句柄/affected-rows |
+| --- | --- | --- | --- |
+| sqlite（生产入口 `getDb()` → `better-sqlite3`） | 场景 1/2/4/4b/5（幂等、污染库收敛、并发）+ **5b 事务并发回归** + 3（v0 旧库迁移）+ **3b 去重/孤儿丢弃** + 6/7/8（生产入口：单例、WAL/busy_timeout/外键、污染库收敛、两模块图并发） | A/B/C 共 11 项 | A–H 共 20 项 |
+| mariadb 11.7 | 基线建表 → 建索引 → 迁移 → 记账单行 → 二次幂等 → v3/v4 迁移循环 + 事务并发回归 + **生产入口 getDb() 初始化** | A/B/C 共 11 项 | A–H 共 20 项 |
+| SQL Server 2025 | 同上 + 嵌套事务提交/回滚 | A/B/C 共 11 项 | A–H 共 20 项 |
+
+> #55 起矩阵从 6 项变 **9 项**（每个目标多一个「事务句柄/affected-rows」job）。
 
 - **#54 的关键变化：`db:test-schema` 打的就是运行时那条**。`getDb()`（`server/db-shared.mjs`）是唯一入口，脚本不再直连 `node:sqlite`；`--dialect`/`--matrix` 额外跑一步「生产入口 `getDb()` 在本方言上初始化」，这就是 #54 对 mysql/mssql 的「初始化 + 冒烟可跑通」。
-- **事务并发回归**（#54 新增，三库都跑）：见 §4.6.1 的四条断言。
+- **事务并发回归**（#54 新增，三库都跑）：见 §4.6.1 的四条断言（#55 起嵌套断言也从「只在 mssql」放开到三库）。
+- **事务句柄/affected-rows 套件**（#55 新增，`scripts/db-tx-test.mjs`，三库都跑）：顶层提交/回滚、嵌套 savepoint、**D2 防线**、并发不丢写、串行化不交错、affected-rows（含事务内）、回调签名兼容。
 - **场景 3b**（#54 新增）：从已删除的 `tests/verify-migration.mjs` 折叠进来的「重复版本去重保留最新 / 孤儿 `llm_result` 丢弃 / 孤儿 `send_record` 丢弃 / 无空 `meeting_id` / 二次幂等 / 全新库直接新结构 + 索引」。
 - **脚本入口必须自己关池**（#54 交付项）：`db-smoke` / `db-schema-test` / `db-semantic-test` / `audio-test` / `ai-title-test` 都必须在收尾释放 knex 连接池（`db.destroy()` / `closeDb()`），否则进程挂着句柄不退出（cron/CI 里就是「永远跑不完」）。断言方式：`timeout 60 node scripts/db-smoke.mjs` 自行退出且退出码 0。
 
@@ -259,14 +271,16 @@ npm run db:test-parity -- --allow-skip
 4. ✅ 迁移期 `PRAGMA foreign_keys = OFF/ON` 只在 `dbType === "sqlite"` 时下发（mysql/mssql 的 RENAME/DROP COLUMN 不受外键阻碍）。
 5. ✅ `next.config.mjs` 加 `serverExternalPackages: ["knex","better-sqlite3","mysql2","tedious"]`（否则 webpack 静态解析 knex dialects 会撞未安装的可选驱动，build 失败）。
 
-### #55：方言语法清零 + 三库 CI（本单只登记）
+### #55：方言语法清零 + 三库 CI
 
-1. `ON CONFLICT` 7 处 → `insertIgnore()` / upsert 分支（`server/db/insert-ignore.mjs` 已有 mssql 分支）。
-2. `INSERT OR IGNORE` 3 处 → 同上。
-3. `PRAGMA table_info` 5 处 → `listTableColumns()`。
-4. 大小写语义落地：按 §4.4 给 `account_name` 等敏感列声明二进制排序规则（或在应用侧规范化账号名），并把 `LIKE` 检索改 `LOWER()` 方案（§4.5）。
-5. **实例级事务状态**（§4.6，两条同根因，必须一并解决）：① sqlite/mysql 的嵌套 savepoint 缺陷；② mssql 分支的 `this.knex = trx` / `_txDepth` 在并发事务下互踩（语句可能落在事务之外且不报错）。正解是把 `trx` 显式传递而不是存实例字段。
-6. 三库 CI：把 `npm run db:test-parity` 接进流水线（需要能起 mariadb/mssql 的 runner）。
-7. **mssql 的受影响行数**（§4.8）：`extractRunInfo()` 在 mssql 恒 0，`deleteHotword` / `updateMeetingStatus` / 审计清理会静默判错。
-8. **`?` 的字面量约束 + 类型严格性**（§4.7）：SQL 文本里不能出现字面量 `?`；mssql 不做隐式类型转换。
-9. **mysql/mssql 的非事务语句可能落进别人的事务**（§4.6.2 剩余缺口）：`this.knex = trx` 的实例级状态在连接池 > 1 的方言上没有语句级锁兜底。
+**#55a（本单，已完成）**：第 5 项（事务句柄显式传递 + 运行期防线 + 嵌套 savepoint）与第 7 项（mssql 受影响行数）、第 9 项（非事务语句落进别人事务）。
+
+1. `ON CONFLICT` 7 处 → `insertIgnore()` / upsert 分支（`server/db/insert-ignore.mjs` 已有 mssql 分支）。— 归 #55b
+2. `INSERT OR IGNORE` 3 处 → 同上。— 归 #55b
+3. `PRAGMA table_info` 5 处 → `listTableColumns()`。— 归 #55b
+4. 大小写语义落地：按 §4.4 给 `account_name` 等敏感列声明二进制排序规则（或在应用侧规范化账号名），并把 `LIKE` 检索改 `LOWER()` 方案（§4.5）。— 归 #55b
+5. ✅ **实例级事务状态**（§4.6）：① sqlite/mysql 的嵌套 savepoint 缺陷；② mssql 的 `this.knex = trx` 在并发事务下互踩。已改为「事务句柄显式传递 + D2 运行期防线」，实例字段清零。
+6. 三库 CI：把 `npm run db:test-parity` 接进流水线（需要能起 mariadb/mssql 的 runner）。— 归 #55b
+7. ✅ **mssql 的受影响行数**（§4.8）：同 batch 追加 `SELECT @@ROWCOUNT AS changes`，三库断言在 `db:test-tx` 的 G1–G10。
+8. **`?` 的字面量约束 + 类型严格性**（§4.7）：SQL 文本里不能出现字面量 `?`；mssql 不做隐式类型转换。— 归 #55b
+9. ✅ **mysql/mssql 的非事务语句可能落进别人的事务**：`this.knex = trx` 已删除，非事务语句不再被带进事务。
