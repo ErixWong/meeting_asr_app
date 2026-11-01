@@ -43,6 +43,9 @@ let segCounter = 0;
 const PARTIAL_RENDER_INTERVAL_MS = 150;
 const TRANSLATE_TRIGGER_INTERVAL_MS = 10_000;
 const TRANSLATE_BUFFER_CHARS_MAX = 2000;
+/** R2 F2：录音转码状态有界轮询（8 秒 × 12 次 ≈ 96 秒，用尽即停）。 */
+const AUDIO_PENDING_POLL_INTERVAL_MS = 8000;
+const AUDIO_PENDING_POLL_MAX_ATTEMPTS = 12;
 const SYSTEM_TRANSLATE_TEMPLATE_ID = "tpl-translate";
 const HISTORY_TRANSLATE_LANGS = [
   { value: "zh", label: "中文" },
@@ -50,6 +53,20 @@ const HISTORY_TRANSLATE_LANGS = [
   { value: "ja", label: "日语" },
   { value: "ko", label: "韩语" },
 ];
+
+/** 录音时长 mm:ss（feat-261101-01）。 */
+function formatAudioDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+/** 录音体积 MB（1 位小数）。 */
+function formatAudioSize(bytes: number): string {
+  const mb = (Number(bytes) || 0) / 1024 / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
+}
 
 function getTranslationLangLabel(result: MeetingLlmResultSummary): string | null {
   if (result.resultType !== "translation" || !result.generationConfigSnapshot) return null;
@@ -545,7 +562,10 @@ export default function MeetingPage() {
   const saveAsrCheckpoint = useCallback(async (segments: TranscriptSegment[], errorMessage: string) => {
     if (segments.length === 0 || !segments.some((segment) => segment.text.trim())) return;
 
-    const captureSessionId = asrClientsRef.current.values().next().value?.getCaptureSessionId() || `capture-${Date.now()}`;
+    const captureSessionIds = Array.from(asrClientsRef.current.values())
+      .map((activeClient) => activeClient.getCaptureSessionId())
+      .filter((id): id is string => Boolean(id));
+    const captureSessionId = captureSessionIds[0] || `capture-${Date.now()}`;
     let meetingId = persistedMeetingIdRef.current;
 
     if (!meetingId) {
@@ -561,6 +581,7 @@ export default function MeetingPage() {
           sourceFileName: null,
           durationSeconds: elapsedRef.current,
           captureSessionId,
+          captureSessionIds,
           transcriptSegments: segments,
           triggerLlm: false,
         }),
@@ -582,6 +603,7 @@ export default function MeetingPage() {
           body: JSON.stringify({
             appendTranscriptSegments: appendedSegments,
             captureSessionId,
+            captureSessionIds,
           }),
         });
         persistedSegmentCountRef.current = segments.length;
@@ -1038,12 +1060,16 @@ export default function MeetingPage() {
     setMicMuted(false);
 
     let recordingCaptureSessionId = "";
+    let recordingCaptureSessionIds: string[] = [];
     if (asrClientsRef.current.size > 0) {
-      const firstClient = asrClientsRef.current.values().next().value;
+      // feat-261101-01：双通道要上报**全部** capture session id（音频每条一个）
+      recordingCaptureSessionIds = Array.from(asrClientsRef.current.values())
+        .map((activeClient) => activeClient.getCaptureSessionId())
+        .filter((id): id is string => Boolean(id));
       for (const activeClient of asrClientsRef.current.values()) {
         await activeClient.stopRecording();
       }
-      recordingCaptureSessionId = firstClient?.getCaptureSessionId() ?? "";
+      recordingCaptureSessionId = recordingCaptureSessionIds[0] ?? "";
       asrClientsRef.current = new Map();
     }
 
@@ -1074,6 +1100,7 @@ export default function MeetingPage() {
             body: JSON.stringify({
               appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: recordingCaptureSessionIds,
               title,
               status: "transcribed",
               lastErrorMessage: null,
@@ -1089,6 +1116,7 @@ export default function MeetingPage() {
               sourceFileName: null,
               durationSeconds: elapsedRef.current,
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: recordingCaptureSessionIds,
               transcriptSegments: finalSegments,
             }),
           });
@@ -1244,8 +1272,52 @@ export default function MeetingPage() {
     const meeting = data.meeting;
     if (!meeting) return;
     fullDetailLoadedRef.current = true;
-    setSelected((prev) => (prev && prev.id === meetingId ? { ...prev, transcript: meeting.transcript } : prev));
+    // R2 修 F1：详情除了 transcript，还要把音频条目/hasAudio 一起并进来
+    // （以前只并 transcript，导致详情里的录音信息被丢掉）
+    setSelected((prev) =>
+      prev && prev.id === meetingId
+        ? {
+            ...prev,
+            transcript: meeting.transcript,
+            hasAudio: meeting.hasAudio,
+            audioRecordings: meeting.audioRecordings,
+          }
+        : prev
+    );
   }, [isActiveMeeting, requestJson]);
+
+  // R2 修 F2：「录音处理中…」自动变播放器 —— 有界轮询。
+  // 只在选中会议的音频里还存在 status==='recording' 时起定时器：8 秒一次、最多 12 次（≈96 秒），
+  // 全部离开 recording（变 ready/failed）或轮询次数用尽后自停；切会议 / 卸载时 cleanup 清定时器。
+  const pendingAudioSignature = (selected?.audioRecordings ?? [])
+    .filter((item) => item.status === "recording")
+    .map((item) => item.id)
+    .join(",");
+
+  useEffect(() => {
+    const meetingId = selected?.id;
+    if (!meetingId || !pendingAudioSignature) return;
+
+    let disposed = false;
+    let attempts = 0;
+
+    const timer = window.setInterval(() => {
+      if (disposed) return;
+      attempts += 1;
+      if (attempts > AUDIO_PENDING_POLL_MAX_ATTEMPTS) {
+        window.clearInterval(timer);
+        return;
+      }
+      refreshMeeting(meetingId).catch((error) => {
+        if (!disposed) console.error("Failed to refresh meeting audio status:", error);
+      });
+    }, AUDIO_PENDING_POLL_INTERVAL_MS);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [pendingAudioSignature, refreshMeeting, selected?.id]);
 
   useEffect(() => {
     if (!selected?.id || selected.status !== "llm_processing") {
@@ -1350,6 +1422,7 @@ export default function MeetingPage() {
         if (name !== null) {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
+          const uploadCaptureSessionId = client.getCaptureSessionId();
           const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1358,7 +1431,8 @@ export default function MeetingPage() {
               sourceType: "file_upload",
               sourceFileName: file.name,
               durationSeconds: null,
-              captureSessionId: client.getCaptureSessionId() || `capture-${Date.now()}`,
+              captureSessionId: uploadCaptureSessionId || `capture-${Date.now()}`,
+              captureSessionIds: uploadCaptureSessionId ? [uploadCaptureSessionId] : undefined,
               transcriptSegments: allSegments,
             }),
           });
@@ -1850,6 +1924,47 @@ export default function MeetingPage() {
                     </div>
                   </div>
                 </div>
+                {selected.audioRecordings && selected.audioRecordings.length > 0 && (
+                  <div className="mb-3 flex flex-col gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2">
+                    {selected.audioRecordings.map((recording, index) => (
+                      <div key={recording.id} className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="shrink-0 text-xs font-medium text-slate-500">
+                          录音{selected.audioRecordings && selected.audioRecordings.length > 1 ? ` ${index + 1}` : ""}
+                        </span>
+                        {recording.status === "ready" ? (
+                          <>
+                            <audio
+                              controls
+                              preload="none"
+                              className="h-9 min-w-0 flex-1"
+                              src={`/api/meetings/${selected.id}/audio?recording=${encodeURIComponent(recording.id)}`}
+                            />
+                            <span className="shrink-0 text-xs text-slate-400">
+                              {formatAudioDuration(recording.durationSeconds)} · {formatAudioSize(recording.bytes)}
+                              {recording.bitrateKbps ? ` · ${recording.bitrateKbps} kbps` : ""}
+                            </span>
+                            <a
+                              href={`/api/meetings/${selected.id}/audio?recording=${encodeURIComponent(recording.id)}&download=1`}
+                              download={recording.downloadFileName}
+                              className="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                            >
+                              下载
+                            </a>
+                          </>
+                        ) : recording.status === "failed" ? (
+                          <details className="min-w-0 text-xs text-red-500">
+                            <summary className="cursor-pointer">录音不可用（转码失败）</summary>
+                            <p className="mt-1 break-all text-red-400">{recording.errorMessage ?? "未知原因"}</p>
+                          </details>
+                        ) : (
+                          <span className="text-xs text-slate-400">
+                            录音处理中…（{formatAudioDuration(recording.durationSeconds)} · {formatAudioSize(recording.bytes)}）
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
                     <div className="flex min-h-0 flex-1 flex-col gap-3">

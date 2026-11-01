@@ -1,14 +1,22 @@
 ﻿import { DatabaseSync } from "node:sqlite";
+import { existsSync, statSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
 import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
+import { resolveStoredPath } from "../../server/audio-paths.mjs";
 import {
+  bindAudioRecordingsToMeeting,
+  collectCaptureSessionIds,
+  deleteAudioRecordingRowsForMeeting,
   drainCaptureEvents,
   getCaptureSessionStats,
   invalidateAsrRuntimeConfig,
+  invalidateAudioRuntimeConfig,
+  listAudioRecordingsForMeeting,
   releaseCaptureSession,
+  removeAudioFilesForRows,
 } from "../../server/runtime-store.mjs";
 import type { TranscriptSegment } from "@/types";
 import {
@@ -134,6 +142,7 @@ type MeetingInput = {
   sourceFileName: string | null;
   durationSeconds: number | null;
   captureSessionId: string;
+  captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
 };
 
@@ -306,6 +315,31 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemTitle: "ASR Workspace ID",
     itemDescription: "DashScope Workspace ID",
     validate: textSetting("ASR workspace ID", 256, false),
+  },
+  "audio:record_enabled": {
+    itemTitle: "录音落盘开关",
+    itemDescription: "转写的同时在服务端旁路录制原始音频，会议结束后转成 MP3 保存（默认开）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Audio record enabled", 16, false);
+      const lower = normalized.toLowerCase();
+      return normalized === "0" || lower === "false" || lower === "no" || lower === "off" ? "0" : "1";
+    },
+  },
+  "audio:bitrate_kbps": {
+    itemTitle: "录音码率（kbps）",
+    itemDescription: "会议结束后转码 MP3 的码率，可选 32 / 48 / 64 / 96 / 128（默认 48，约 21 MB/小时）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Audio bitrate", 32, true).trim();
+      if (!["32", "48", "64", "96", "128"].includes(normalized)) {
+        throw new Error("Audio bitrate must be one of 32/48/64/96/128");
+      }
+      return normalized;
+    },
+  },
+  "audio:orphan_ttl_hours": {
+    itemTitle: "孤儿录音保留（小时）",
+    itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
+    validate: integerSetting("Audio orphan TTL hours", 1, 24 * 365),
   },
   "llm:base_url": {
     itemTitle: "LLM URL",
@@ -633,6 +667,27 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "ASR Workspace ID",
         itemDescription: "DashScope Workspace ID",
         itemValue: "",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "record_enabled",
+        itemTitle: "录音落盘开关",
+        itemDescription: "转写的同时在服务端旁路录制原始音频，会议结束后转成 MP3 保存（默认开）",
+        itemValue: "1",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "bitrate_kbps",
+        itemTitle: "录音码率（kbps）",
+        itemDescription: "会议结束后转码 MP3 的码率，可选 32 / 48 / 64 / 96 / 128（默认 48，约 21 MB/小时）",
+        itemValue: "48",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "orphan_ttl_hours",
+        itemTitle: "孤儿录音保留（小时）",
+        itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
+        itemValue: "72",
       },
       {
         itemSection: "llm",
@@ -1235,6 +1290,7 @@ export function saveSettings(settings: unknown) {
       })),
     });
     invalidateAsrRuntimeConfig();
+    invalidateAudioRuntimeConfig();
   });
 }
 
@@ -2151,7 +2207,8 @@ export function createMeeting(input: MeetingInput) {
     throw new Error("transcriptSegments must include text");
   }
 
-  const captureSessionId = String(input.captureSessionId || "").trim();
+  const captureSessionIds = collectCaptureSessionIds(input);
+  const captureSessionId = String(input.captureSessionId || captureSessionIds[0] || "").trim();
   if (captureSessionId) {
     drainCaptureEvents(captureSessionId);
   }
@@ -2238,6 +2295,9 @@ export function createMeeting(input: MeetingInput) {
         .run(captureSessionId);
     }
 
+    // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
+    bindAudioRecordingsToMeeting({ meetingId, captureSessionIds });
+
     const meeting = getMeetingById(meetingId);
     writeAuditLog({
       actionType: "meeting.create",
@@ -2267,6 +2327,7 @@ export function createMeeting(input: MeetingInput) {
 export function appendMeetingTranscript(input: {
   meetingId: string;
   captureSessionId: string;
+  captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
 }) {
   const existing = getMeetingById(input.meetingId);
@@ -2343,6 +2404,12 @@ export function appendMeetingTranscript(input: {
     database
       .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
       .run(createdAt, input.meetingId);
+
+    // feat-261101-01：增量落定路径同样把录音绑定到会议（幂等，重复绑不报错）
+    bindAudioRecordingsToMeeting({
+      meetingId: input.meetingId,
+      captureSessionIds: collectCaptureSessionIds(input),
+    });
 
     return getMeetingById(input.meetingId);
   });
@@ -2454,15 +2521,19 @@ export function updateMeeting(id: string, patch: { title?: string }) {
 }
 
 export function deleteMeeting(id: string) {
-  return withTransaction(() => {
+  const { deleted, audioRows } = withTransaction(() => {
     const database = getDb();
     const actor = getCurrentActor();
     const before = getMeetingById(id);
+    // 先取录音行（meetings 删除后 meeting_audio_recordings 会被 FK 级联清掉）
+    const removedAudio = listAudioRecordingsForMeeting(id);
     const result = database
       .prepare("DELETE FROM meetings WHERE id = ? AND created_by_user_id = ?")
       .run(id, actor.id);
-    const deleted = Number(result.changes ?? 0) > 0;
-    if (deleted) {
+    const isDeleted = Number(result.changes ?? 0) > 0;
+    if (isDeleted) {
+      // 级联已清行；显式再删一次兜底（foreign_keys 未开时也不会留脏行）
+      deleteAudioRecordingRowsForMeeting(id);
       writeAuditLog({
         actionType: "meeting.delete",
         resourceType: "meeting",
@@ -2478,8 +2549,12 @@ export function deleteMeeting(id: string) {
           : null,
       });
     }
-    return deleted;
+    return { deleted: isDeleted, audioRows: isDeleted ? removedAudio : [] };
   });
+
+  // 文件删除放在事务提交之后：回滚时不会丢音频
+  removeAudioFilesForRows(audioRows);
+  return deleted;
 }
 
 function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {
@@ -2498,6 +2573,171 @@ function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {
     summary: row.summary ?? "",
     transcript: row.transcript,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 会议录音（feat-261101-01 L5）：详情/列表输出 + 播放下载
+// ---------------------------------------------------------------------------
+
+// #region meeting-audio-projection
+// ⚠ 本区间是「列表与详情共用」的音频投影纯函数：不 import 任何模块、不碰 DB、不读文件。
+// scripts/audio-test.mjs 会按这两个标记把源码切出来（tsc 转译后在 vm 里跑）做防回归断言，
+// 所以：**别把这两个标记删了/挪到别的函数上**，也别往区间里塞有副作用的代码。
+// 字段白名单也在这里：磁盘路径（file_path / raw_file_path）永远不许出现在输出里。
+
+type MeetingAudioRow = {
+  id: string;
+  captureSessionId: string;
+  meetingId: string | null;
+  filePath: string | null;
+  rawFilePath: string | null;
+  format: string;
+  status: string;
+  bytes: number;
+  durationSeconds: number;
+  sampleRate: number;
+  bitrateKbps: number | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string | null;
+};
+
+export type MeetingAudioClientRow = {
+  id: string;
+  captureSessionId: string;
+  status: string;
+  format: string;
+  bytes: number;
+  durationSeconds: number;
+  bitrateKbps: number | null;
+  errorMessage: string | null;
+  createdAt: string;
+  downloadFileName: string;
+};
+
+function toClientAudioRow(
+  row: MeetingAudioRow,
+  meetingTitle: string,
+  index: number,
+  total: number
+): MeetingAudioClientRow {
+  const baseName = String(meetingTitle || "录音").trim() || "录音";
+  return {
+    id: row.id,
+    captureSessionId: row.captureSessionId,
+    status: row.status,
+    format: row.format,
+    bytes: row.bytes,
+    durationSeconds: row.durationSeconds,
+    bitrateKbps: row.bitrateKbps,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt,
+    // 双通道时带序号，避免两个下载文件同名
+    downloadFileName: total > 1 ? `${baseName}-${index + 1}.mp3` : `${baseName}.mp3`,
+  };
+}
+
+/**
+ * 列表与详情**共用**的音频投影（R2 修 F1/F2 的口径统一点）：
+ * - `audioRecordings`：白名单字段的客户端行，不含任何磁盘路径；
+ * - `hasAudio`：统一口径 = **存在 `status === "ready"` 的条目**（「有没有可听的」）。
+ *   历史列表曾经用 `COUNT(*) > 0`（recording 也算 true），与详情 `some(ready)` 不一致，已废弃。
+ */
+export function projectMeetingAudio(
+  rows: MeetingAudioRow[] | null | undefined,
+  meetingTitle: string
+): { hasAudio: boolean; audioRecordings: MeetingAudioClientRow[] } {
+  const list = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  const audioRecordings = list.map((row, index) => toClientAudioRow(row, meetingTitle, index, list.length));
+  return {
+    hasAudio: audioRecordings.some((item) => item.status === "ready"),
+    audioRecordings,
+  };
+}
+// #endregion meeting-audio-projection
+
+export function getMeetingAudioRecordings(meetingId: string): MeetingAudioClientRow[] {
+  if (!meetingId || !ensureMeetingOwned(meetingId)) return [];
+  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  return projectMeetingAudio(rows, queryMeetingRowById(meetingId)?.title ?? "录音").audioRecordings;
+}
+
+/** 播放/下载用：属主校验后返回磁盘绝对路径 + 元信息。 */
+export function getMeetingAudioFile(input: { meetingId: string; recordingId?: string | null }) {
+  const { meetingId } = input;
+  if (!meetingId || !ensureMeetingOwned(meetingId)) return null;
+
+  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  const readyRows = rows.filter((row) => row.status === "ready" && row.filePath);
+  const recordingId = String(input.recordingId || "").trim();
+  const target = recordingId
+    ? readyRows.find((row) => row.id === recordingId || row.captureSessionId === recordingId)
+    : readyRows[0];
+  if (!target?.filePath) return null;
+
+  let absolutePath: string;
+  try {
+    absolutePath = resolveStoredPath(target.filePath) as string;
+  } catch (error) {
+    console.error("Invalid meeting audio path:", target.filePath, error);
+    return null;
+  }
+  if (!existsSync(absolutePath)) return null;
+
+  const stats = statSync(absolutePath);
+  if (!stats.isFile()) return null;
+
+  const meetingTitle = queryMeetingRowById(meetingId)?.title ?? "录音";
+  return {
+    filePath: absolutePath,
+    size: stats.size,
+    mimeType: "audio/mpeg",
+    recording: toClientAudioRow(target, meetingTitle, 0, readyRows.length),
+  };
+}
+
+/**
+ * 列表页用：一次 SQL 取出当前用户所有会议的音频行（避免 N+1），按 meetingId 分组。
+ * 只查投影需要的列 —— `file_path` / `raw_file_path` 在 SQL 层就不查，从源头杜绝磁盘路径外泄。
+ * 排序与 `listAudioRecordingsForMeeting` 一致（created_at, id），保证列表/详情下载文件名序号相同。
+ */
+function listMeetingAudioRowsByMeeting(): Map<string, MeetingAudioRow[]> {
+  const actor = getCurrentActor();
+  const rows = getDb()
+    .prepare(`
+      SELECT
+        r.id,
+        r.capture_session_id as captureSessionId,
+        r.meeting_id as meetingId,
+        NULL as filePath,
+        NULL as rawFilePath,
+        r.format,
+        r.status,
+        r.bytes,
+        r.duration_seconds as durationSeconds,
+        r.sample_rate as sampleRate,
+        r.bitrate_kbps as bitrateKbps,
+        r.error_message as errorMessage,
+        r.created_at as createdAt,
+        r.updated_at as updatedAt,
+        r.expires_at as expiresAt
+      FROM meeting_audio_recordings r
+      INNER JOIN meetings m ON m.id = r.meeting_id
+      WHERE m.created_by_user_id = ?
+      ORDER BY r.created_at ASC, r.id ASC
+    `)
+    .all(actor.id) as MeetingAudioRow[];
+
+  const grouped = new Map<string, MeetingAudioRow[]>();
+  for (const row of rows) {
+    const meetingId = String(row.meetingId ?? "");
+    if (!meetingId) continue;
+    const list = grouped.get(meetingId);
+    if (list) list.push(row);
+    else grouped.set(meetingId, [row]);
+  }
+  return grouped;
 }
 
 export function listMeetings() {
@@ -2526,7 +2766,16 @@ export function listMeetings() {
     `)
     .all<MeetingRow>(actor.id);
 
-  return rows.map((row) => mapMeetingRow({ ...row, transcript: [] }));
+  const audioByMeeting = listMeetingAudioRowsByMeeting();
+
+  return rows.map((row) => {
+    const audio = projectMeetingAudio(audioByMeeting.get(String(row.id)) ?? [], row.title ?? "录音");
+    return {
+      ...mapMeetingRow({ ...row, transcript: [] }),
+      hasAudio: audio.hasAudio,
+      audioRecordings: audio.audioRecordings,
+    };
+  });
 }
 
 function queryMeetingRowById(id: string) {
@@ -2565,14 +2814,30 @@ export function getMeetingLightById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  return mapMeetingRow({ ...row, transcript: [] });
+  const audio = projectMeetingAudio(
+    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    row.title ?? "录音"
+  );
+  return {
+    ...mapMeetingRow({ ...row, transcript: [] }),
+    hasAudio: audio.hasAudio,
+    audioRecordings: audio.audioRecordings,
+  };
 }
 
 export function getMeetingById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  return mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) });
+  const audio = projectMeetingAudio(
+    listAudioRecordingsForMeeting(id) as MeetingAudioRow[],
+    row.title ?? "录音"
+  );
+  return {
+    ...mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) }),
+    hasAudio: audio.hasAudio,
+    audioRecordings: audio.audioRecordings,
+  };
 }
 
 function getMeetingAsrRows(meetingId: string) {

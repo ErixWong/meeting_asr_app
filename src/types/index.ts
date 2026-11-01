@@ -18,6 +18,20 @@ export interface TranscriptSegment {
   isFinal: boolean;
 }
 
+export interface MeetingAudioRecording {
+  id: string;
+  captureSessionId: string;
+  /** recording = 已录到 PCM、转码未完成；ready = mp3 可播放；failed = 转码失败 */
+  status: "recording" | "ready" | "failed" | string;
+  format: string;
+  bytes: number;
+  durationSeconds: number;
+  bitrateKbps?: number | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  downloadFileName: string;
+}
+
 export interface MeetingRecord {
   id: string;
   title: string;
@@ -27,6 +41,13 @@ export interface MeetingRecord {
   lastErrorMessage?: string | null;
   transcript: TranscriptSegment[];
   summary: string;
+  /**
+   * feat-261101-01：是否有**可播放**的会议录音。
+   * 口径（R2 统一）：存在 `audioRecordings` 里 `status === "ready"` 的条目即为 true；
+   * 列表接口与详情接口走同一个投影函数（`admin-store.projectMeetingAudio`），不再各算一套。
+   */
+  hasAudio?: boolean;
+  audioRecordings?: MeetingAudioRecording[];
 }
 
 export interface MeetingLlmResultSummary {

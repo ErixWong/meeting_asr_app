@@ -1,10 +1,18 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
+import { existsSync, unlinkSync } from "fs";
 import { getDb as getSharedDb } from "./db-shared.mjs";
+import { resolveStoredPath } from "./audio-paths.mjs";
 
 const MAX_CAPTURE_EVENTS = 10000;
 const MAX_CAPTURE_EVENT_CHARS = 512 * 1024;
 const MAX_CAPTURE_EVENT_CHARS_TOTAL = 8 * 1024 * 1024;
 const ASR_GATEWAY_ROLE_KEYS = new Set(["user", "system_admin"]);
+
+// 录音默认值（后台 app_settings 的 audio:* 三项，缺行时按这些兜底）
+const AUDIO_DEFAULT_BITRATE_KBPS = 48;
+const AUDIO_DEFAULT_ORPHAN_TTL_HOURS = 72;
+const AUDIO_ALLOWED_BITRATES = [32, 48, 64, 96, 128];
+const AUDIO_DEFAULT_SAMPLE_RATE = 16000;
 
 let dbSeeded = false;
 
@@ -36,6 +44,9 @@ function seedAsrDefaults() {
   insertMissingSetting("asr", "endpoint", "FunASR Endpoint", "FunASR 服务地址", "ws://funasr.local:10095/ws");
   insertMissingSetting("asr", "api_key", "ASR API Key", "DashScope API Key", "");
   insertMissingSetting("asr", "workspace_id", "ASR Workspace ID", "DashScope Workspace ID", "");
+  insertMissingSetting("audio", "record_enabled", "录音落盘开关", "是否在转写的同时旁路录制原始音频", "1");
+  insertMissingSetting("audio", "bitrate_kbps", "录音码率（kbps）", "会议结束后转码 MP3 的码率，默认 48", String(AUDIO_DEFAULT_BITRATE_KBPS));
+  insertMissingSetting("audio", "orphan_ttl_hours", "孤儿录音保留（小时）", "未绑定会议的录音保留时长，默认 72", String(AUDIO_DEFAULT_ORPHAN_TTL_HOURS));
 }
 
 function settingValue(settings, section, mark) {
@@ -482,4 +493,334 @@ export function cleanupExpiredCaptureSessions() {
   getDb()
     .prepare("DELETE FROM asr_capture_sessions WHERE expires_at < ?")
     .run(nowIso());
+}
+
+// ---------------------------------------------------------------------------
+// Meeting audio recordings (feat-261101-01)
+//
+// 表 meeting_audio_recordings 的 node 侧读写，风格照 createCaptureSession /
+// finishCaptureSession / cleanupExpiredCaptureSessions 这一组。
+// 主键沿用本项目现状 `aud-<uuid>`（见工单 §4 与设计文档）。
+// ---------------------------------------------------------------------------
+
+const AUDIO_ROW_COLUMNS = `
+  id,
+  capture_session_id as captureSessionId,
+  meeting_id as meetingId,
+  file_path as filePath,
+  raw_file_path as rawFilePath,
+  format,
+  status,
+  bytes,
+  duration_seconds as durationSeconds,
+  sample_rate as sampleRate,
+  bitrate_kbps as bitrateKbps,
+  error_message as errorMessage,
+  created_at as createdAt,
+  updated_at as updatedAt,
+  expires_at as expiresAt
+`;
+
+function normalizeAudioRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    bytes: Number(row.bytes ?? 0),
+    durationSeconds: Number(row.durationSeconds ?? 0),
+    sampleRate: Number(row.sampleRate ?? AUDIO_DEFAULT_SAMPLE_RATE),
+    bitrateKbps: row.bitrateKbps === null || row.bitrateKbps === undefined
+      ? null
+      : Number(row.bitrateKbps),
+    meetingId: row.meetingId ?? null,
+    filePath: row.filePath ?? null,
+    rawFilePath: row.rawFilePath ?? null,
+    errorMessage: row.errorMessage ?? null,
+    expiresAt: row.expiresAt ?? null,
+  };
+}
+
+function normalizeBitrateKbps(value) {
+  const parsed = Number(String(value ?? "").trim());
+  if (Number.isFinite(parsed) && AUDIO_ALLOWED_BITRATES.includes(parsed)) return parsed;
+  return AUDIO_DEFAULT_BITRATE_KBPS;
+}
+
+function normalizeOrphanTtlHours(value) {
+  const parsed = Number(String(value ?? "").trim());
+  if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 24 * 365) return Math.round(parsed);
+  return AUDIO_DEFAULT_ORPHAN_TTL_HOURS;
+}
+
+function parseBooleanSetting(value, fallback) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") return false;
+  return true;
+}
+
+let cachedAudioRuntimeConfig = null;
+
+function loadAudioRuntimeConfig() {
+  const settings = getDb()
+    .prepare(`
+      SELECT
+        item_section as itemSection,
+        item_mark as itemMark,
+        item_value as itemValue
+      FROM app_settings
+      WHERE item_section = 'audio'
+    `)
+    .all();
+
+  return {
+    recordEnabled: parseBooleanSetting(settingValue(settings, "audio", "record_enabled"), true),
+    bitrateKbps: normalizeBitrateKbps(settingValue(settings, "audio", "bitrate_kbps")),
+    orphanTtlHours: normalizeOrphanTtlHours(settingValue(settings, "audio", "orphan_ttl_hours")),
+    sampleRate: AUDIO_DEFAULT_SAMPLE_RATE,
+  };
+}
+
+/**
+ * 录音配置（带缓存）。ASR 网关在会话开始时取一次，**不在 PCM 帧回调里查库**；
+ * 后台改设置后由 invalidateAudioRuntimeConfig() 失效。
+ */
+export function getAudioRuntimeConfig() {
+  if (!cachedAudioRuntimeConfig) {
+    cachedAudioRuntimeConfig = loadAudioRuntimeConfig();
+  }
+  return cachedAudioRuntimeConfig;
+}
+
+export function invalidateAudioRuntimeConfig() {
+  cachedAudioRuntimeConfig = null;
+}
+
+/** 开关关闭期间不登记行；capture_session_id unique，重复登记走 upsert。 */
+export function registerAudioRecording(input) {
+  const createdAt = nowIso();
+  const ttlHours = normalizeOrphanTtlHours(input?.orphanTtlHours ?? getAudioRuntimeConfig().orphanTtlHours);
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
+  const sampleRate = Number(input?.sampleRate) > 0 ? Number(input.sampleRate) : AUDIO_DEFAULT_SAMPLE_RATE;
+
+  getDb()
+    .prepare(`
+      INSERT INTO meeting_audio_recordings (
+        id, capture_session_id, meeting_id, file_path, raw_file_path, format, status,
+        bytes, duration_seconds, sample_rate, bitrate_kbps, error_message,
+        created_at, updated_at, expires_at
+      ) VALUES (?, ?, NULL, NULL, ?, 'mp3', 'recording', 0, 0, ?, NULL, NULL, ?, ?, ?)
+      ON CONFLICT(capture_session_id) DO UPDATE SET
+        raw_file_path = excluded.raw_file_path,
+        sample_rate = excluded.sample_rate,
+        status = 'recording',
+        error_message = NULL,
+        updated_at = excluded.updated_at,
+        expires_at = excluded.expires_at
+    `)
+    .run(
+      `aud-${randomUUID()}`,
+      input.captureSessionId,
+      input.rawFilePath ?? null,
+      sampleRate,
+      createdAt,
+      createdAt,
+      expiresAt
+    );
+
+  return getAudioRecording(input.captureSessionId);
+}
+
+export function getAudioRecording(captureSessionId) {
+  if (!captureSessionId) return null;
+  const row = getDb()
+    .prepare(`SELECT ${AUDIO_ROW_COLUMNS} FROM meeting_audio_recordings WHERE capture_session_id = ?`)
+    .get(captureSessionId);
+  return normalizeAudioRow(row);
+}
+
+export function getAudioRecordingById(id) {
+  if (!id) return null;
+  const row = getDb()
+    .prepare(`SELECT ${AUDIO_ROW_COLUMNS} FROM meeting_audio_recordings WHERE id = ?`)
+    .get(id);
+  return normalizeAudioRow(row);
+}
+
+export function listAudioRecordingsForMeeting(meetingId) {
+  if (!meetingId) return [];
+  return getDb()
+    .prepare(`
+      SELECT ${AUDIO_ROW_COLUMNS}
+      FROM meeting_audio_recordings
+      WHERE meeting_id = ?
+      ORDER BY created_at ASC, id ASC
+    `)
+    .all(meetingId)
+    .map(normalizeAudioRow);
+}
+
+/**
+ * 会话终态（finish / fail / 断连 close 三处都会调，必须幂等）。
+ * 有字节 → 保持 recording（pcm 已落盘、mp3 待转码），无字节/写失败 → failed。
+ */
+export function finishAudioRecording(input) {
+  const existing = getAudioRecording(input?.captureSessionId);
+  if (!existing) return null;
+
+  const bytes = Number(input?.bytes ?? 0);
+  const durationSeconds = Number(input?.durationSeconds ?? 0);
+  const hasAudio = Boolean(input?.ok) && bytes > 0;
+  const status = hasAudio ? "recording" : "failed";
+  const errorMessage = hasAudio
+    ? null
+    : String(input?.errorMessage || "no audio data recorded");
+
+  getDb()
+    .prepare(`
+      UPDATE meeting_audio_recordings
+      SET raw_file_path = ?, bytes = ?, duration_seconds = ?, status = ?,
+          error_message = ?, updated_at = ?
+      WHERE capture_session_id = ?
+    `)
+    .run(
+      input?.rawFilePath ?? existing.rawFilePath,
+      bytes,
+      durationSeconds,
+      status,
+      errorMessage,
+      nowIso(),
+      input.captureSessionId
+    );
+
+  return getAudioRecording(input.captureSessionId);
+}
+
+export function markAudioRecordingReady(input) {
+  getDb()
+    .prepare(`
+      UPDATE meeting_audio_recordings
+      SET file_path = ?, bytes = ?, duration_seconds = ?, status = 'ready',
+          bitrate_kbps = ?, raw_file_path = NULL, error_message = NULL, updated_at = ?
+      WHERE capture_session_id = ?
+    `)
+    .run(
+      input.filePath,
+      Number(input.bytes ?? 0),
+      Number(input.durationSeconds ?? 0),
+      Number(input.bitrateKbps ?? AUDIO_DEFAULT_BITRATE_KBPS),
+      nowIso(),
+      input.captureSessionId
+    );
+  return getAudioRecording(input.captureSessionId);
+}
+
+export function markAudioRecordingFailed(input) {
+  getDb()
+    .prepare(`
+      UPDATE meeting_audio_recordings
+      SET status = 'failed', error_message = ?, updated_at = ?
+      WHERE capture_session_id = ?
+    `)
+    .run(String(input.errorMessage || "transcode failed").slice(0, 2000), nowIso(), input.captureSessionId);
+  return getAudioRecording(input.captureSessionId);
+}
+
+/**
+ * 会议落定时把录音绑定到会议：meeting_id 写上、expires_at 置 NULL（永久）。
+ * 同时接受单数 captureSessionId（旧前端）与复数 captureSessionIds，取并集去重。
+ */
+export function bindAudioRecordingsToMeeting(input) {
+  const ids = collectCaptureSessionIds(input);
+  if (ids.length === 0) return [];
+
+  const database = getDb();
+  const updatedAt = nowIso();
+  const statement = database.prepare(`
+    UPDATE meeting_audio_recordings
+    SET meeting_id = ?, expires_at = NULL, updated_at = ?
+    WHERE capture_session_id = ?
+  `);
+  for (const captureSessionId of ids) {
+    statement.run(input.meetingId, updatedAt, captureSessionId);
+  }
+  return listAudioRecordingsForMeeting(input.meetingId);
+}
+
+/** 单数/复数入参归一：去空、去重、保持首次出现顺序。 */
+export function collectCaptureSessionIds(input) {
+  const candidates = [];
+  if (Array.isArray(input?.captureSessionIds)) {
+    for (const value of input.captureSessionIds) candidates.push(value);
+  }
+  if (input?.captureSessionId) candidates.push(input.captureSessionId);
+
+  const seen = new Set();
+  const ids = [];
+  for (const candidate of candidates) {
+    const id = String(candidate ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function removeAudioFile(storedPath) {
+  if (!storedPath) return 0;
+  try {
+    const absolutePath = resolveStoredPath(storedPath);
+    if (!absolutePath || !existsSync(absolutePath)) return 0;
+    unlinkSync(absolutePath);
+    return 1;
+  } catch (error) {
+    console.error("[Audio Store] failed to remove audio file:", storedPath, error);
+    return 0;
+  }
+}
+
+/** 删除磁盘文件（row 的 mp3 + 残留 pcm）。供事务提交后调用。 */
+export function removeAudioFilesForRows(rows) {
+  let files = 0;
+  for (const row of rows ?? []) {
+    files += removeAudioFile(row.filePath);
+    files += removeAudioFile(row.rawFilePath);
+  }
+  return { files };
+}
+
+/** 只删行，返回被删行（文件由调用方在事务提交后删，避免回滚丢文件）。 */
+export function deleteAudioRecordingRowsForMeeting(meetingId) {
+  if (!meetingId) return [];
+  const rows = listAudioRecordingsForMeeting(meetingId);
+  if (rows.length === 0) return [];
+  getDb()
+    .prepare("DELETE FROM meeting_audio_recordings WHERE meeting_id = ?")
+    .run(meetingId);
+  return rows;
+}
+
+/**
+ * 孤儿录音清理：meeting_id IS NULL 且 expires_at 已过期 → 删行 + 删文件
+ * （raw 与 mp3 都删）。已绑定会议的 expires_at 为 NULL，永远不在此集合里。
+ */
+export function cleanupExpiredAudioRecordings() {
+  const database = getDb();
+  const now = nowIso();
+  const rows = database
+    .prepare(`
+      SELECT ${AUDIO_ROW_COLUMNS}
+      FROM meeting_audio_recordings
+      WHERE meeting_id IS NULL AND expires_at IS NOT NULL AND expires_at < ?
+    `)
+    .all(now)
+    .map(normalizeAudioRow);
+
+  if (rows.length === 0) return { rows: 0, files: 0 };
+
+  database
+    .prepare("DELETE FROM meeting_audio_recordings WHERE meeting_id IS NULL AND expires_at IS NOT NULL AND expires_at < ?")
+    .run(now);
+
+  const { files } = removeAudioFilesForRows(rows);
+  return { rows: rows.length, files };
 }

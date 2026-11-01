@@ -23,6 +23,25 @@ async function createTableIfAbsent(db, tableName, builder) {
 
 // ---------- 建表定义（createTables 与迁移共用） ----------
 
+function defineMeetingAudioRecordingsTable(t) {
+  t.string("id", 64).primary();
+  t.string("capture_session_id", 64).notNullable().unique();
+  t.string("meeting_id", 64).nullable();
+  t.string("file_path", 500).nullable();
+  t.string("raw_file_path", 500).nullable();
+  t.string("format", 16).notNullable();
+  t.string("status", 32).notNullable();
+  t.bigInteger("bytes").notNullable().defaultTo(0);
+  t.float("duration_seconds").notNullable().defaultTo(0);
+  t.integer("sample_rate").notNullable().defaultTo(16000);
+  t.integer("bitrate_kbps").nullable();
+  t.text("error_message").nullable();
+  t.string("created_at", 32).notNullable();
+  t.string("updated_at", 32).notNullable();
+  t.string("expires_at", 32).nullable();
+  t.foreign("meeting_id").references("meetings.id").onDelete("CASCADE");
+}
+
 function defineMeetingLlmResultsTable(t) {
   t.string("id", 64).primary();
   t.string("meeting_id", 64).notNullable();
@@ -183,6 +202,8 @@ export async function createTables(db) {
 
   await createTableIfAbsent(db, "meeting_llm_results", defineMeetingLlmResultsTable);
 
+  await createTableIfAbsent(db, "meeting_audio_recordings", defineMeetingAudioRecordingsTable);
+
   await createTableIfAbsent(db, "meeting_send_records", defineMeetingSendRecordsTable);
 
   await createTableIfAbsent(db, "asr_capture_sessions", (t) => {
@@ -243,6 +264,8 @@ export async function createIndexes(db) {
     "CREATE INDEX IF NOT EXISTS idx_meetings_owner_created ON meetings(created_by_user_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_meeting_llm_results_meeting_version_created ON meeting_llm_results(meeting_id, version_no, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_meeting ON meeting_audio_recordings(meeting_id)",
+    "CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_expires ON meeting_audio_recordings(expires_at)",
   ];
   for (const sql of indexes) {
     await db.knex.raw(sql);
@@ -252,6 +275,15 @@ export async function createIndexes(db) {
 // ---------- 迁移 ----------
 
 const MIGRATIONS = [
+  {
+    version: 3,
+    name: "meeting-audio-recordings",
+    async up(db) {
+      // feat-261101-01：会议录音表。新库走 createTables 的基线建表，旧库在此补建，
+      // 两处共用同一个 defineMeetingAudioRecordingsTable（幂等）。
+      await createTableIfAbsent(db, "meeting_audio_recordings", defineMeetingAudioRecordingsTable);
+    },
+  },
   {
     version: 2,
     name: "drop-capture-sessions-raw-events-json",
