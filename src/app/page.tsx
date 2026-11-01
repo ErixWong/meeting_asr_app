@@ -969,8 +969,9 @@ export default function MeetingPage() {
                   );
                 }
               } else if (s === "disconnected" && !asrStopIntentRef.current) {
-                // 录音中链路被关掉（网络/服务重启）：以前这里只打 console，用户以为还在录
-                setAsrLinkError("与语音识别服务的连接已断开");
+                // 录音中链路被关掉（网络/服务重启）：以前这里只打 console，用户以为还在录。
+                // 握手失败已经带了更具体的原因（如 WebSocket connection failed），不覆盖它。
+                setAsrLinkError((prev) => prev ?? "与语音识别服务的连接已断开");
               }
             },
             lang: asrLang,
