@@ -12,7 +12,7 @@ export interface LlmQueueConfig {
   capacity: number;
 }
 
-type ConfigReader = () => LlmQueueConfig;
+type ConfigReader = () => LlmQueueConfig | Promise<LlmQueueConfig>;
 
 interface QueueTask {
   type: LlmTaskType;
@@ -41,8 +41,10 @@ class LlmQueue {
   private pending: QueueTask[] = [];
   private droppedCount = 0;
 
-  enqueue<T>(type: LlmTaskType, task: () => Promise<T>, waitMs = DEFAULT_WAIT_MS[type]): Promise<T> {
-    const { maxConcurrency, capacity } = configReader();
+  async enqueue<T>(type: LlmTaskType, task: () => Promise<T>, waitMs = DEFAULT_WAIT_MS[type]): Promise<T> {
+    // 配置读取是异步的（#54：app_settings 走 AsyncDb）；读到之前不占位、不排队，
+    // 与改动前「同步读配置再判定」的顺序一致。
+    const { maxConcurrency, capacity } = await configReader();
 
     if (this.inflight >= maxConcurrency && this.pending.length >= capacity) {
       this.droppedCount += 1;
@@ -94,7 +96,9 @@ class LlmQueue {
         })
         .finally(() => {
           this.inflight -= 1;
-          this.pump(configReader().maxConcurrency);
+          void Promise.resolve(configReader())
+            .then((config) => this.pump(config.maxConcurrency))
+            .catch(() => this.pump(DEFAULT_CONFIG.maxConcurrency));
         });
     }
   }

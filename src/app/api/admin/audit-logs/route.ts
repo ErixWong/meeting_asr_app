@@ -6,6 +6,6 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
-  return NextResponse.json({ auditLogs: listAuditLogs(100) });
+  return NextResponse.json({ auditLogs: await listAuditLogs(100) });
   });
 }

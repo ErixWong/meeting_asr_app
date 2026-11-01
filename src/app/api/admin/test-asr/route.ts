@@ -234,7 +234,7 @@ export async function POST(req: NextRequest) {
       const body = await req.json();
       const providerType = body.providerType || "local_funasr";
       const endpoint = String(body.endpoint || "");
-      const apiKey = String(body.apiKey || getSettingValue("asr", "api_key"));
+      const apiKey = String(body.apiKey || (await getSettingValue("asr", "api_key")));
       const workspaceId = String(body.workspaceId || "");
 
       const targetUrl = providerType === "dashscope"

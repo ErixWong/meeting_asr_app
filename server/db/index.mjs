@@ -9,9 +9,9 @@
  * 外部实例连接参数（DB_TYPE=mysql|mssql 时必填）：
  *   DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
  *
- * 说明：本模块是 PR-A 新增的独立基建，尚未接入业务代码。
- * PR-B 将把 database-schema.mjs / db-shared.mjs 切换到本工厂，
- * 届时 getKnex() 成为唯一数据库入口。
+ * 说明（issue #54 已接线）：`server/db-shared.mjs` 的 getDb() 已改为本工厂 + AsyncDb，
+ * `getKnex()` 是运行时唯一数据库入口；legacy 的 node:sqlite 路径（database-schema.mjs）
+ * 已退役。
  */
 import knex from "knex";
 import { existsSync, mkdirSync } from "fs";
@@ -42,13 +42,16 @@ export function getDbType() {
   return type;
 }
 
+function sqliteFilePath() {
+  return process.env.SQLITE_PATH || join(process.cwd(), "data", "meeting-asr-app.db");
+}
+
 function sqliteConfig() {
   const dataDir = join(process.cwd(), "data");
   if (!existsSync(dataDir)) {
     mkdirSync(dataDir, { recursive: true });
   }
-  const dbPath =
-    process.env.SQLITE_PATH || join(dataDir, "meeting-asr-app.db");
+  const dbPath = sqliteFilePath();
   return {
     client: "better-sqlite3",
     connection: { filename: dbPath },
@@ -104,8 +107,12 @@ export function createKnexInstance(dbType = getDbType()) {
   const db = knex(CONFIG_BUILDERS[dbType]());
 
   if (dbType === "sqlite") {
-    // SQLite 连接级优化：WAL + busy_timeout + 外键约束
+    // SQLite 连接级优化：WAL + busy_timeout + 外键约束（**只对 DB_TYPE=sqlite 下发**，
+    // mysql/mssql 没有 PRAGMA 语法）。
     // （better-sqlite3 每连接默认外键关闭，必须在连接上开启）
+    // 这三条在 #54 接线之前是「没人调用的死代码」（只有脚本走 getKnex）；接线后
+    // getDb() → AsyncDb → getKnex() 才是生产路径，busy_timeout 自此真正生效。
+    // WAL 的**显式告警**在 server/db-shared.mjs 里用可 await 的方式复核并打印。
     db.raw("PRAGMA foreign_keys = ON").catch(() => {});
     db.raw("PRAGMA journal_mode = WAL").catch((error) => {
       console.error(
@@ -140,4 +147,4 @@ export async function closeKnex() {
   }
 }
 
-export { SUPPORTED_DB_TYPES };
+export { SUPPORTED_DB_TYPES, sqliteFilePath };

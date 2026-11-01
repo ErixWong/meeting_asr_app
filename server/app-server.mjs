@@ -3,7 +3,14 @@ import next from "next";
 import { attachAsrGateway } from "./asr-gateway.mjs";
 import { createTtsGateway } from "./tts-gateway.mjs";
 import { cleanupExpiredAuditLogs } from "./db-shared.mjs";
-import { cleanupExpiredCaptureSessions, cleanupExpiredAudioRecordings, closeCaptureStore, startCaptureFlushTimer } from "./runtime-store.mjs";
+import {
+  cleanupExpiredCaptureSessions,
+  cleanupExpiredAudioRecordings,
+  closeCaptureStore,
+  getAsrRuntimeConfig,
+  getAudioRuntimeConfig,
+  startCaptureFlushTimer,
+} from "./runtime-store.mjs";
 
 const dev = process.argv.includes("--dev");
 const port = Number(process.env.PORT || 3123);
@@ -32,38 +39,46 @@ const gateway = attachAsrGateway(server, {
 
 startCaptureFlushTimer();
 
-cleanupExpiredAuditLogs();
+// 启动期先把 ASR/录音配置读进缓存（#54 async 传导）：WS 连接建立后取配置是同步语义
+// 的热路径，提前预热可避免「首条消息早于配置读取完成」的窗口。
+await getAsrRuntimeConfig();
+await getAudioRuntimeConfig();
+
+void cleanupExpiredAuditLogs().catch((error) => {
+  console.error("[App Server] audit cleanup failed:", error);
+});
 const auditCleanupTimer = setInterval(() => {
-  try {
-    cleanupExpiredAuditLogs();
-  } catch (error) {
+  void cleanupExpiredAuditLogs().catch((error) => {
     console.error("[App Server] audit cleanup failed:", error);
-  }
+  });
 }, 24 * 60 * 60 * 1000);
 auditCleanupTimer.unref();
 
-cleanupExpiredCaptureSessions();
+void cleanupExpiredCaptureSessions().catch((error) => {
+  console.error("[App Server] capture cleanup failed:", error);
+});
 const captureCleanupTimer = setInterval(() => {
-  try {
-    cleanupExpiredCaptureSessions();
-  } catch (error) {
+  void cleanupExpiredCaptureSessions().catch((error) => {
     console.error("[App Server] capture cleanup failed:", error);
-  }
+  });
 }, 60 * 60 * 1000);
 captureCleanupTimer.unref();
 
 // 孤儿录音清理（feat-261101-01）：未绑定会议且过期 → 删行 + 删文件。
 // 已绑定会议的录音 expires_at 为 NULL，永不被清。
-cleanupExpiredAudioRecordings();
+void cleanupExpiredAudioRecordings().catch((error) => {
+  console.error("[App Server] audio cleanup failed:", error);
+});
 const audioCleanupTimer = setInterval(() => {
-  try {
-    const result = cleanupExpiredAudioRecordings();
-    if (result.rows > 0) {
-      console.log(`[App Server] audio cleanup: removed ${result.rows} row(s), ${result.files} file(s)`);
-    }
-  } catch (error) {
-    console.error("[App Server] audio cleanup failed:", error);
-  }
+  void cleanupExpiredAudioRecordings()
+    .then((result) => {
+      if (result.rows > 0) {
+        console.log(`[App Server] audio cleanup: removed ${result.rows} row(s), ${result.files} file(s)`);
+      }
+    })
+    .catch((error) => {
+      console.error("[App Server] audio cleanup failed:", error);
+    });
 }, 60 * 60 * 1000);
 audioCleanupTimer.unref();
 
@@ -72,15 +87,15 @@ server.listen(port, hostname, () => {
   console.log(`[ASR Gateway] WebSocket endpoint: ws://localhost:${port}${gatewayPath}`);
 });
 
-function shutdown(signal) {
+async function shutdown(signal) {
   console.log(`[App Server] Received ${signal}, shutting down`);
   clearInterval(auditCleanupTimer);
   clearInterval(captureCleanupTimer);
   clearInterval(audioCleanupTimer);
-  closeCaptureStore();
+  await closeCaptureStore();
   gateway.close();
   server.close(() => process.exit(0));
 }
 
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));

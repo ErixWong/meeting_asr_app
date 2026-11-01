@@ -22,13 +22,13 @@ let cachedConfig = null;
 let cachedConfigAt = 0;
 
 function readSetting(db, section, mark) {
-  const row = db
+  return db
     .prepare("SELECT item_value FROM app_settings WHERE item_section = ? AND item_mark = ?")
-    .get(section, mark);
-  return row?.item_value ?? "";
+    .get(section, mark)
+    .then((row) => row?.item_value ?? "");
 }
 
-function loadTtsConfig() {
+async function loadTtsConfig() {
   const envEndpoint = process.env.TTS_ENDPOINT;
   const envVoice = process.env.TTS_DEFAULT_VOICE;
   const envProvider = process.env.TTS_PROVIDER;
@@ -36,16 +36,16 @@ function loadTtsConfig() {
   const envApiKey = process.env.TTS_API_KEY;
   let db = null;
   try {
-    db = getDb();
+    db = await getDb();
   } catch {
     db = null;
   }
 
-  const dbEndpoint = db ? readSetting(db, "tts", "endpoint") : "";
-  const dbVoice = db ? readSetting(db, "tts", "default_voice") : "";
-  const dbProvider = db ? readSetting(db, "tts", "provider") : "";
-  const dbModel = db ? readSetting(db, "tts", "model") : "";
-  const dbApiKey = db ? readSetting(db, "tts", "api_key") : "";
+  const dbEndpoint = db ? await readSetting(db, "tts", "endpoint") : "";
+  const dbVoice = db ? await readSetting(db, "tts", "default_voice") : "";
+  const dbProvider = db ? await readSetting(db, "tts", "provider") : "";
+  const dbModel = db ? await readSetting(db, "tts", "model") : "";
+  const dbApiKey = db ? await readSetting(db, "tts", "api_key") : "";
 
   const provider = (envProvider || dbProvider || DEFAULT_PROVIDER).trim().toLowerCase();
 
@@ -64,10 +64,10 @@ function loadTtsConfig() {
   };
 }
 
-export function getTtsRuntimeConfig() {
+export async function getTtsRuntimeConfig() {
   const now = Date.now();
   if (!cachedConfig || now - cachedConfigAt > CONFIG_TTL_MS) {
-    cachedConfig = loadTtsConfig();
+    cachedConfig = await loadTtsConfig();
     cachedConfigAt = now;
   }
   return cachedConfig;
@@ -392,7 +392,7 @@ async function handleSynthesize(request, response) {
   });
 
   try {
-    const config = getTtsRuntimeConfig();
+    const config = await getTtsRuntimeConfig();
     // 未指定音色时按文本语言自动选择（多语言自动切换）
     const voice = explicitVoice || (await pickVoiceForText(config, text));
 
@@ -476,7 +476,7 @@ async function handleOpenAiSpeech(request, response) {
   const timeout = setTimeout(() => controller.abort(), SENTENCE_TIMEOUT_MS * Math.max(splitSentences(text).length, 1));
 
   try {
-    const config = getTtsRuntimeConfig();
+    const config = await getTtsRuntimeConfig();
     // 未指定音色时按文本语言自动选择（多语言自动切换）
     const voice = explicitVoice || (await pickVoiceForText(config, text));
     const chunks = await enqueue(() => synthesizeSentences(config, text, voice, { signal: controller.signal }));
@@ -499,7 +499,7 @@ async function handleOpenAiSpeech(request, response) {
 }
 
 async function handleVoices(request, response) {
-  const config = getTtsRuntimeConfig();
+  const config = await getTtsRuntimeConfig();
   if (config.provider === "openai") {
     // OpenAI 标准协议没有音色列表 API，返回空列表（由前端提示按服务商文档手填）。
     // 这里不发任何上游请求，因此没有需要带 Authorization 的调用。
@@ -517,7 +517,7 @@ async function handleVoices(request, response) {
 }
 
 async function handleHealth(request, response) {
-  const config = getTtsRuntimeConfig();
+  const config = await getTtsRuntimeConfig();
   // cosyvoice 用私有 /health；openai 标准协议无 health，用 /v1/models 探测可达性
   const probe = config.provider === "openai" ? "/v1/models" : "/health";
   const headers = config.provider === "openai" ? openAiAuthHeaders(config) : {};

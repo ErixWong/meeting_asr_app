@@ -9,8 +9,8 @@ export async function POST(req: NextRequest) {
       const host = String(body.smtpHost || "");
       const port = Number(body.smtpPort || 465);
       const user = String(body.smtpUsername || "");
-      const pass = String(body.smtpPassword || getSettingValue("mail", "smtp_password"));
-      const secure = String(body.smtpSecure ?? getSettingValue("mail", "smtp_secure") ?? "1") !== "0";
+      const pass = String(body.smtpPassword || (await getSettingValue("mail", "smtp_password")));
+      const secure = String(body.smtpSecure ?? (await getSettingValue("mail", "smtp_secure")) ?? "1") !== "0";
 
       if (!host || !port) {
         return NextResponse.json({ ok: false, error: "Mail config incomplete" }, { status: 400 });

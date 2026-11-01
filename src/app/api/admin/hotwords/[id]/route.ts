@@ -7,7 +7,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json();
-      const hotword = updateHotword(id, {
+      const hotword = await updateHotword(id, {
         term: body.term,
         weight: body.weight === undefined ? undefined : Number(body.weight),
         status: body.status,
@@ -30,7 +30,7 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
   const { id } = await params;
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
-      const deleted = deleteHotword(id);
+      const deleted = await deleteHotword(id);
       if (!deleted) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

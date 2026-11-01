@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string; resultId: string }> }) {
   const { id, resultId } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const llmResult = getMeetingLlmResultDetail(id, resultId);
+    const llmResult = await getMeetingLlmResultDetail(id, resultId);
     if (!llmResult) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }

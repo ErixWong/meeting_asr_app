@@ -34,7 +34,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         return NextResponse.json({ error: "Translation payload too large" }, { status: 400 });
       }
 
-      const saved = persistLiveTranslation(id, targetLang, blocks);
+      const saved = await persistLiveTranslation(id, targetLang, blocks);
       if (!saved) {
         return NextResponse.json({ error: "Meeting not found or nothing to persist" }, { status: 404 });
       }

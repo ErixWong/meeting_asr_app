@@ -7,7 +7,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   return withRequiredRoles(req, ADMIN_ROLES, async () => {
     try {
       const body = await req.json();
-      const template = updatePromptTemplate(id, body);
+      const template = await updatePromptTemplate(id, body);
       if (!template) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }

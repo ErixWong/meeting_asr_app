@@ -104,11 +104,11 @@ export interface ChatStreamResult {
 
 const CHAT_TIMEOUT_MS = 180_000;
 
-function readLlmConfig() {
-  const baseUrl = getSettingValue("llm", "base_url");
-  const apiKey = getSettingValue("llm", "api_key");
-  const model = getSettingValue("llm", "model");
-  const timeoutRaw = getSettingValue("llm", "timeout_ms");
+async function readLlmConfig() {
+  const baseUrl = await getSettingValue("llm", "base_url");
+  const apiKey = await getSettingValue("llm", "api_key");
+  const model = await getSettingValue("llm", "model");
+  const timeoutRaw = await getSettingValue("llm", "timeout_ms");
   if (!baseUrl || !model) throw new Error("LLM 配置不完整，请先在系统管理中配置 base_url 和 model");
   const timeoutMs = Number(timeoutRaw);
   return {
@@ -119,8 +119,8 @@ function readLlmConfig() {
   };
 }
 
-function buildThinkingParams(): Record<string, unknown> {
-  if (getSettingValue("llm", "thinking_model") === "0") return {};
+async function buildThinkingParams(): Promise<Record<string, unknown>> {
+  if ((await getSettingValue("llm", "thinking_model")) === "0") return {};
   return {
     enable_thinking: false,
     chat_template_kwargs: { enable_thinking: false },
@@ -202,7 +202,7 @@ export async function runChatStream(
   return llmQueue.enqueue("chat", async () => {
     const conversation = getConversation(conversationId);
     if (!conversation) throw new Error("会话不存在或已过期");
-    const { baseUrl, apiKey, model, timeoutMs } = readLlmConfig();
+    const { baseUrl, apiKey, model, timeoutMs } = await readLlmConfig();
 
     const trimmed = userMessage.trim();
     appendMessage(conversationId, "user", trimmed);
@@ -226,7 +226,7 @@ export async function runChatStream(
         ],
         temperature: 0.6,
         stream: true,
-        ...buildThinkingParams(),
+        ...(await buildThinkingParams()),
       });
 
       await llmChatRequest(

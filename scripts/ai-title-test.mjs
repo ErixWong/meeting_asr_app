@@ -36,7 +36,10 @@ const repoRoot = new URL("..", import.meta.url).pathname;
 const sandbox = mkdtempSync(join(tmpdir(), "ai-title-test-"));
 process.chdir(sandbox);
 
-after(() => {
+after(async () => {
+  // 关掉连接池：不关 node --test 会挂在未释放的池句柄上（#54 脚本入口必须自己退出）
+  const { closeDb } = await import("../server/db-shared.mjs");
+  await closeDb();
   rmSync(sandbox, { recursive: true, force: true });
 });
 
@@ -57,7 +60,6 @@ registerHooks({
 });
 
 const { DatabaseSync } = await import("node:sqlite");
-const { initializeDatabase } = await import(join(repoRoot, "server", "database-schema.mjs"));
 
 // 「老库」现场：库文件已存在且 `llm_prompt_templates` 里已经有一条（非内置的）模板。
 // 这样 admin-store 的 seedDefaults 里 `if (templateCount === 0) { …tpl-1/tpl-2… }` 整块不会跑，
@@ -65,9 +67,19 @@ const { initializeDatabase } = await import(join(repoRoot, "server", "database-s
 const dataDir = join(sandbox, "data");
 const dbPath = join(dataDir, "meeting-asr-app.db");
 mkdirSync(dataDir, { recursive: true });
+process.env.SQLITE_PATH = dbPath;
 {
+  // 建库走新的 schema 实现（legacy 的 server/database-schema.mjs 已在 #54 退役）。
+  // 刻意**不**走 admin-store 的 getDb()：那会跑 seedDefaults，把 tpl-1/tpl-2/tpl-title
+  // 一并种进去，就不是「老库里已有一条自定义模板」这个现场了。
+  const { AsyncDb } = await import("../server/db/async-db.mjs");
+  const { createKnexInstance } = await import("../server/db/index.mjs");
+  const { initializeSchema } = await import("../server/db/schema.mjs");
+  const bootstrapKnex = createKnexInstance("sqlite");
+  await initializeSchema(new AsyncDb(bootstrapKnex, "sqlite"));
+  await bootstrapKnex.destroy();
+
   const bootstrap = new DatabaseSync(dbPath);
-  initializeDatabase(bootstrap);
   bootstrap
     .prepare(`
       INSERT INTO llm_prompt_templates (
@@ -99,22 +111,26 @@ const { llmQueue } = await import(pathToFileURL(join(repoRoot, "src", "lib", "ll
 
 const db = () => new DatabaseSync(dbPath);
 
-function withDb(fn) {
+async function withDb(fn) {
   const handle = db();
   try {
-    return fn(handle);
+    return await fn(handle);
   } finally {
     handle.close();
   }
 }
 
-function rows(sql, ...params) {
-  return withDb((handle) => handle.prepare(sql).all(...params));
+function rowsSync(sql, ...params) {
+  const handle = db();
+  try {
+    return handle.prepare(sql).all(...params);
+  } finally {
+    handle.close();
+  }
 }
 
-function one(sql, ...params) {
-  return rows(sql, ...params)[0];
-}
+const rows = rowsSync;
+const one = (sql, ...params) => rowsSync(sql, ...params)[0];
 
 /** 造一段「1 小时会议」级别的正文：约 4 万字，中段/结尾各埋一个哨兵。 */
 const TRANSCRIPT_MARK_HEAD = "【开头哨兵：本季度产品路线评审】";
@@ -145,14 +161,14 @@ function buildLongTranscriptSegments() {
   return segments;
 }
 
-const ADMIN = store.getActorByAccountName("admin");
+const ADMIN = await store.getActorByAccountName("admin");
 assert.ok(ADMIN, "种子里的 admin 账号应存在");
 
 let meetingSeq = 0;
 
-function createMeetingWithSegments(segments, title = "未命名的原始标题") {
+async function createMeetingWithSegments(segments, title = "未命名的原始标题") {
   meetingSeq += 1;
-  return store.runWithActor(ADMIN, () =>
+  return await store.runWithActor(ADMIN, () =>
     store.createMeeting({
       title: `${title}-${meetingSeq}`,
       sourceType: "file_upload",
@@ -194,7 +210,7 @@ llmQueue.enqueue = (type, task, waitMs) => {
 // T1 清洗纯函数
 // ---------------------------------------------------------------------------
 
-test("T1 清洗：中英文引号、书名号、反引号、Markdown 粗体都要剥掉", () => {
+test("T1 清洗：中英文引号、书名号、反引号、Markdown 粗体都要剥掉", async () => {
   const cases = [
     ['"季度复盘会"', "季度复盘会"],
     ["'季度复盘会'", "季度复盘会"],
@@ -213,14 +229,14 @@ test("T1 清洗：中英文引号、书名号、反引号、Markdown 粗体都�
   console.log("[T1] 引号/书名号/Markdown 剥离 OK");
 });
 
-test("T1 清洗：换行与连续空白压缩成单个空格", () => {
+test("T1 清洗：换行与连续空白压缩成单个空格", async () => {
   assert.equal(aiTitle.sanitizeMeetingTitle("第一行\n\n第二行\t\t第三行", "兜底"), "第一行 第二行 第三行");
   assert.equal(aiTitle.sanitizeMeetingTitle("  多   个    空格  ", "兜底"), "多 个 空格");
   assert.equal(aiTitle.sanitizeMeetingTitle("带\r\n回车换行", "兜底"), "带 回车换行");
   console.log("[T1] 换行/空白压缩 OK");
 });
 
-test("T1 清洗：首尾标点与空白剥掉，中间标点保留", () => {
+test("T1 清洗：首尾标点与空白剥掉，中间标点保留", async () => {
   assert.equal(aiTitle.sanitizeMeetingTitle("，项目周会。", "兜底"), "项目周会");
   assert.equal(aiTitle.sanitizeMeetingTitle("【重要】架构评审！！", "兜底"), "重要】架构评审");
   assert.equal(aiTitle.sanitizeMeetingTitle("…… 预算对齐 ：", "兜底"), "预算对齐");
@@ -229,7 +245,7 @@ test("T1 清洗：首尾标点与空白剥掉，中间标点保留", () => {
   console.log("[T1] 首尾标点/空白 OK");
 });
 
-test("T1 清洗：去掉「标题：」这类前缀", () => {
+test("T1 清洗：去掉「标题：」这类前缀", async () => {
   assert.equal(aiTitle.sanitizeMeetingTitle("标题：周会", "兜底"), "周会");
   assert.equal(aiTitle.sanitizeMeetingTitle("标题: 周会", "兜底"), "周会");
   assert.equal(aiTitle.sanitizeMeetingTitle("会议主题：周会", "兜底"), "周会");
@@ -237,7 +253,7 @@ test("T1 清洗：去掉「标题：」这类前缀", () => {
   console.log("[T1] 前缀剥离 OK");
 });
 
-test("T1 清洗：长度上限 30 字符（按码点，不是字节；emoji 不许切出半个代理对）", () => {
+test("T1 清洗：长度上限 30 字符（按码点，不是字节；emoji 不许切出半个代理对）", async () => {
   const long = "会".repeat(31);
   const trimmed = aiTitle.sanitizeMeetingTitle(long, "兜底");
   assert.equal(aiTitle.titleCharCount(trimmed), 30, `31 个字应截到 30，实际 ${aiTitle.titleCharCount(trimmed)}`);
@@ -266,7 +282,7 @@ test("T1 清洗：长度上限 30 字符（按码点，不是字节；emoji 不�
   console.log("[T1] 30 字符边界 / 码点 / emoji 安全 OK");
 });
 
-test("T1 清洗：空与异常输入必须兜底，绝不返回空串", () => {
+test("T1 清洗：空与异常输入必须兜底，绝不返回空串", async () => {
   const fallback = "原始会议名";
   for (const empty of ["", "   ", "\n\n", "。。。。。", "“”", "''", "「」", "---", "标题："]) {
     assert.equal(aiTitle.sanitizeMeetingTitle(empty, fallback), fallback, `输入 ${JSON.stringify(empty)}`);
@@ -285,7 +301,7 @@ test("T1 清洗：空与异常输入必须兜底，绝不返回空串", () => {
 // T2 送模型的正文窗口
 // ---------------------------------------------------------------------------
 
-test("T2 窗口：几万字正文必须截断后再送模型（开头 + 结尾，中间省略）", () => {
+test("T2 窗口：几万字正文必须截断后再送模型（开头 + 结尾，中间省略）", async () => {
   const transcript = `${TRANSCRIPT_MARK_HEAD}${"讨论内容".repeat(3000)}${TRANSCRIPT_MARK_MIDDLE}${"后续内容".repeat(3000)}${TRANSCRIPT_MARK_TAIL}`;
   const window = aiTitle.selectTitleTranscript(transcript);
 
@@ -305,7 +321,7 @@ test("T2 窗口：几万字正文必须截断后再送模型（开头 + 结尾�
   console.log(`[T2] 正文窗口 OK（${window.totalChars} → ${window.sentChars} 字，省略 ${window.omittedChars}）`);
 });
 
-test("T2 prompt：正文只以窗口形式进 prompt，模板占位符被替换", () => {
+test("T2 prompt：正文只以窗口形式进 prompt，模板占位符被替换", async () => {
   const transcript = `${TRANSCRIPT_MARK_HEAD}${"讨论内容".repeat(3000)}${TRANSCRIPT_MARK_MIDDLE}${"后续内容".repeat(3000)}${TRANSCRIPT_MARK_TAIL}`;
   const built = aiTitle.buildTitlePrompt(aiTitle.TITLE_TEMPLATE_CONTENT, transcript);
 
@@ -328,8 +344,8 @@ test("T2 prompt：正文只以窗口形式进 prompt，模板占位符被替换"
 // T3 tpl-title 无条件 upsert（老库场景）
 // ---------------------------------------------------------------------------
 
-test("T3 老库（templateCount>0）也必须拿到 tpl-title", () => {
-  const templates = store.listPromptTemplates();
+test("T3 老库（templateCount>0）也必须拿到 tpl-title", async () => {
+  const templates = await store.listPromptTemplates();
   const ids = templates.map((item) => item.id);
 
   assert.ok(ids.includes("tpl-legacy"), "老库里的模板还在");
@@ -344,14 +360,14 @@ test("T3 老库（templateCount>0）也必须拿到 tpl-title", () => {
   console.log("[T3] 老库 tpl-title 无条件插入 OK");
 });
 
-test("T3 已存在同名模板时不覆盖用户改过的内容；缺失则重新插入", () => {
-  withDb((handle) => {
+test("T3 已存在同名模板时不覆盖用户改过的内容；缺失则重新插入", async () => {
+  await withDb(async (handle) => {
     const now = new Date().toISOString();
     handle
       .prepare("UPDATE llm_prompt_templates SET content = ? WHERE id = ?")
       .run("用户自己改过的标题提示词 {transcript}", "tpl-title");
 
-    assert.equal(aiTitle.ensureTitleTemplate(handle, now), "kept");
+    assert.equal(await aiTitle.ensureTitleTemplate(handle, now), "kept");
     assert.equal(
       one("SELECT content FROM llm_prompt_templates WHERE id = ?", "tpl-title").content,
       "用户自己改过的标题提示词 {transcript}",
@@ -367,12 +383,12 @@ test("T3 已存在同名模板时不覆盖用户改过的内容；缺失则重�
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run("tpl-other-id", "system_title", "改过 id 的同名模板", "title", "同 key 正文 {transcript}", "", "active", 1, now, now);
-    assert.equal(aiTitle.ensureTitleTemplate(handle, now), "kept", "template_key 已存在时也不许插");
+    assert.equal(await aiTitle.ensureTitleTemplate(handle, now), "kept", "template_key 已存在时也不许插");
     assert.equal(rows("SELECT id FROM llm_prompt_templates WHERE template_key = 'system_title'").length, 1);
 
     // 彻底缺失 → 重新插入
     handle.prepare("DELETE FROM llm_prompt_templates WHERE template_key = ?").run("system_title");
-    assert.equal(aiTitle.ensureTitleTemplate(handle, now), "inserted");
+    assert.equal(await aiTitle.ensureTitleTemplate(handle, now), "inserted");
     const inserted = one("SELECT template_key, template_type, is_system, status FROM llm_prompt_templates WHERE id = ?", "tpl-title");
     assert.equal(inserted.template_key, "system_title");
     assert.equal(inserted.template_type, "title");
@@ -387,8 +403,8 @@ test("T3 已存在同名模板时不覆盖用户改过的内容；缺失则重�
 // ---------------------------------------------------------------------------
 
 test("T4 真实链路：入队 title → 改名 → 记账 → 审计 → 列表与详情同源", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "原始标题");
-  const llmSettings = store.listSettings().filter((item) => item.itemSection === "llm");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "原始标题");
+  const llmSettings = (await store.listSettings()).filter((item) => item.itemSection === "llm");
   const configuredModel = llmSettings.find((item) => item.itemMark === "model")?.itemValue ?? "";
   const configuredBaseUrl = llmSettings.find((item) => item.itemMark === "base_url")?.itemValue ?? "";
   const configuredApiKey = llmSettings.find((item) => item.itemMark === "api_key")?.itemValue ?? "";
@@ -430,12 +446,12 @@ test("T4 真实链路：入队 title → 改名 → 记账 → 审计 → 列表
 
   // 5) 真的改名了（DB 与投影都变了）
   assert.equal(one("SELECT title FROM meetings WHERE id = ?", meeting.id).title, result.title);
-  const listRow = store.runWithActor(ADMIN, () => store.listMeetings()).find((item) => item.id === meeting.id);
+  const listRow = (await store.runWithActor(ADMIN, () => store.listMeetings())).find((item) => item.id === meeting.id);
   assert.equal(listRow.title, result.title, "列表行必须反映新标题");
-  const detail = store.runWithActor(ADMIN, () => store.getMeetingById(meeting.id));
+  const detail = await store.runWithActor(ADMIN, () => store.getMeetingById(meeting.id));
   assert.equal(detail.title, result.title, "详情必须反映新标题");
   // 列表与详情走同一个投影函数 → 返回的 meeting 对象与 getMeetingLightById 逐字段一致
-  const light = store.runWithActor(ADMIN, () => store.getMeetingLightById(meeting.id));
+  const light = await store.runWithActor(ADMIN, () => store.getMeetingLightById(meeting.id));
   assert.deepEqual(result.meeting, light, "接口返回的 meeting 必须就是共享投影函数的产物");
 
   // 6) 记账：meeting_llm_results 一行 succeeded，result_type = title
@@ -462,7 +478,7 @@ test("T4 真实链路：入队 title → 改名 → 记账 → 审计 → 列表
   assert.equal(JSON.parse(audit.after_snapshot).title, result.title);
 
   // 8) 标题记账行不能污染「生成结果」版本列表与列表摘要
-  const summaries = store.runWithActor(ADMIN, () => store.listMeetingLlmResultSummaries(meeting.id));
+  const summaries = await store.runWithActor(ADMIN, () => store.listMeetingLlmResultSummaries(meeting.id));
   assert.ok(summaries.every((item) => item.resultType !== "title"), "标题行不许出现在纪要版本列表里");
   assert.equal(listRow.summary, "", "标题行不许被当成会议摘要");
 
@@ -475,7 +491,7 @@ test("T4 真实链路：入队 title → 改名 → 记账 → 审计 → 列表
 // ---------------------------------------------------------------------------
 
 test("T5 失败路径：上游 500 → 不改标题、落 failed 记账行、审计 failed", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "失败用例原标题");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "失败用例原标题");
   installTransport(() => ({ status: 500, text: "upstream exploded" }));
 
   const rowsBefore = rows("SELECT id FROM meeting_llm_results WHERE meeting_id = ?", meeting.id).length;
@@ -513,7 +529,7 @@ test("T5 失败路径：上游 500 → 不改标题、落 failed 记账行、审
 // ---------------------------------------------------------------------------
 
 test("T6 模型只回引号/空壳 → 标题退回原名，绝不改成空串", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "兜底用例原标题");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "兜底用例原标题");
   installTransport(() => ({ text: chatCompletionBody("“”") }));
 
   const result = await store.runWithActor(ADMIN, () => store.generateMeetingTitle(meeting.id));
@@ -538,7 +554,7 @@ test("T6 模型只回引号/空壳 → 标题退回原名，绝不改成空串",
 // ---------------------------------------------------------------------------
 
 test("T7 并发点击：两个都成功，后者覆盖前者，不留半更新状态", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "并发用例原标题");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "并发用例原标题");
   installTransport((call, index) => ({
     text: chatCompletionBody(index === 1 ? "并发标题甲" : "并发标题乙"),
   }));
@@ -574,7 +590,7 @@ test("T7 并发点击：两个都成功，后者覆盖前者，不留半更新�
 // ---------------------------------------------------------------------------
 
 test("T8 别人的会议 → 404，且不动任何数据", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "越权用例原标题");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "越权用例原标题");
 
   const other = await store.runWithActor(ADMIN, () =>
     store.createUser({
@@ -588,7 +604,7 @@ test("T8 别人的会议 → 404，且不动任何数据", async () => {
     })
   );
   assert.ok(other?.id);
-  const otherActor = store.getActorByAccountName("ai-title-other");
+  const otherActor = await store.getActorByAccountName("ai-title-other");
   assert.ok(otherActor);
 
   installTransport(() => ({ text: chatCompletionBody("不该出现的标题") }));
@@ -627,7 +643,7 @@ function sliceBetween(source, startNeedle, endNeedle, fileLabel) {
   return source.slice(start, end);
 }
 
-test("T9 UI 接线：列表/详情两个入口 + 撤销 + 共用投影函数", () => {
+test("T9 UI 接线：列表/详情两个入口 + 撤销 + 共用投影函数", async () => {
   const pagePath = join(repoRoot, "src", "app", "page.tsx");
   const historyPath = join(repoRoot, "src", "components", "main", "HistoryList.tsx");
   const routePath = join(repoRoot, "src", "app", "api", "meetings", "[id]", "ai-title", "route.ts");
@@ -684,12 +700,12 @@ test("T9 UI 接线：列表/详情两个入口 + 撤销 + 共用投影函数", (
 // ---------------------------------------------------------------------------
 
 test("T10 标题模板被删 → 生成链路运行期补回，不因外键挂掉", async () => {
-  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "模板缺失用例原标题");
+  const meeting = await createMeetingWithSegments(buildLongTranscriptSegments(), "模板缺失用例原标题");
 
   // 注意：`meeting_llm_results.prompt_template_id` 是 ON DELETE RESTRICT 外键，
   // 所以「模板被删」只可能出现在「还没有任何记账行引用它」的库上 —— 先清掉前面用例
   // 产生的记账行（沙箱库，T10 是最后一个用例，不影响其它断言），再删模板。
-  withDb((handle) => {
+  await withDb(async (handle) => {
     handle.prepare("DELETE FROM meeting_llm_results").run();
     handle.prepare("DELETE FROM llm_prompt_templates WHERE template_key = ?").run("system_title");
   });
@@ -725,7 +741,7 @@ test("T10 标题模板被删 → 生成链路运行期补回，不因外键挂�
 //   3. 撤销动作把 notice 换成**不带 action** 的普通提示（一次性撤销，不给第二次入口）。
 // ---------------------------------------------------------------------------
 
-test("T11 toast 撤销条：带 action 的提示不自动消失，撤销后降级为普通提示", () => {
+test("T11 toast 撤销条：带 action 的提示不自动消失，撤销后降级为普通提示", async () => {
   const pageSource = readFileSync(join(repoRoot, "src", "app", "page.tsx"), "utf-8");
 
   // 1) 自动消失 effect：action 短路在注册定时器之前

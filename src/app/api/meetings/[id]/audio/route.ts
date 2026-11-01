@@ -68,7 +68,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     const url = new URL(req.url);
-    const audio = getMeetingAudioFile({
+    const audio = await getMeetingAudioFile({
       meetingId: id,
       recordingId: url.searchParams.get("recording"),
     });

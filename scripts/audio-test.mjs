@@ -30,9 +30,11 @@ const { createRecorder, durationSecondsForBytes } = await load("../server/audio-
 const { rawAudioPath, meetingAudioPath, toStoredPath, resolveStoredPath, ensureAudioDirs } =
   await load("../server/audio-paths.mjs");
 const runtimeStore = await load("../server/runtime-store.mjs");
-const { getDb: getSharedDb } = await load("../server/db-shared.mjs");
+const { getDb: getSharedDb, closeDb } = await load("../server/db-shared.mjs");
 
-after(() => {
+after(async () => {
+  // 关掉连接池：不关 node --test 会挂在未释放的池句柄上
+  await closeDb();
   rmSync(sandbox, { recursive: true, force: true });
   rmSync(rangeCompileDir, { recursive: true, force: true });
 });
@@ -52,7 +54,7 @@ function synthesizePcm({ sampleRate = 16000, seconds = 1, freq = 440 } = {}) {
 // L1 audio-paths
 // ---------------------------------------------------------------------------
 
-test("audio-paths: raw/mp3 落在 data/audio 下，存储路径相对 data 且可还原", () => {
+test("audio-paths: raw/mp3 落在 data/audio 下，存储路径相对 data 且可还原", async () => {
   ensureAudioDirs();
   const raw = rawAudioPath("capture-abc");
   const mp3 = meetingAudioPath("capture-abc");
@@ -65,7 +67,7 @@ test("audio-paths: raw/mp3 落在 data/audio 下，存储路径相对 data 且�
   console.log(`[L1] audio-paths OK: ${stored} → ${resolveStoredPath(stored)}`);
 });
 
-test("audio-paths: 路径穿越与非法文件名被拒绝", () => {
+test("audio-paths: 路径穿越与非法文件名被拒绝", async () => {
   assert.throws(() => resolveStoredPath("../../etc/passwd"), /escapes the data directory/);
   assert.equal(rawAudioPath("../../evil"), join(sandbox, "data", "audio", "raw", ".._.._evil.pcm"));
   assert.throws(() => rawAudioPath(".."), /Invalid audio file name/);
@@ -150,8 +152,8 @@ test("audio-recorder: 未写入任何数据时 finalize 不报错、字节为 0"
 // L1 audio:* 配置（开关关闭时不落盘的前提）
 // ---------------------------------------------------------------------------
 
-test("audio-config: 默认开 + 码率 48 + 孤儿 TTL 72", () => {
-  const config = runtimeStore.getAudioRuntimeConfig();
+test("audio-config: 默认开 + 码率 48 + 孤儿 TTL 72", async () => {
+  const config = await runtimeStore.getAudioRuntimeConfig();
   assert.equal(config.recordEnabled, true);
   assert.equal(config.bitrateKbps, 48);
   assert.equal(config.orphanTtlHours, 72);
@@ -159,35 +161,35 @@ test("audio-config: 默认开 + 码率 48 + 孤儿 TTL 72", () => {
   console.log(`[L1] audio 默认配置 OK: ${JSON.stringify(config)}`);
 });
 
-test("audio-config: record_enabled=0 时关闭、非法码率回落到 48", () => {
-  const database = getSharedDb();
-  database
+test("audio-config: record_enabled=0 时关闭、非法码率回落到 48", async () => {
+  const database = await getSharedDb();
+  await database
     .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
     .run("0", "record_enabled");
-  database
+  await database
     .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
     .run("999", "bitrate_kbps");
   runtimeStore.invalidateAudioRuntimeConfig();
 
-  const config = runtimeStore.getAudioRuntimeConfig();
+  const config = await runtimeStore.getAudioRuntimeConfig();
   assert.equal(config.recordEnabled, false);
   assert.equal(config.bitrateKbps, 48, "非法码率应回落到 48");
 
-  database
+  await database
     .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
     .run("1", "record_enabled");
-  database
+  await database
     .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
     .run("64", "bitrate_kbps");
   runtimeStore.invalidateAudioRuntimeConfig();
-  assert.equal(runtimeStore.getAudioRuntimeConfig().bitrateKbps, 64);
+  assert.equal((await runtimeStore.getAudioRuntimeConfig()).bitrateKbps, 64);
 
   // 复位，避免影响后续转码用例
-  database
+  await database
     .prepare("UPDATE app_settings SET item_value = ? WHERE item_section = 'audio' AND item_mark = ?")
     .run("48", "bitrate_kbps");
   runtimeStore.invalidateAudioRuntimeConfig();
-  assert.equal(runtimeStore.getAudioRuntimeConfig().bitrateKbps, 48);
+  assert.equal((await runtimeStore.getAudioRuntimeConfig()).bitrateKbps, 48);
   console.log("[L1] audio 配置校验 OK（0 关闭 / 999→48 / 64 生效 / 复位 48）");
 });
 
@@ -258,12 +260,12 @@ test("transcode job: 成功 → 行 status=ready + pcm 已删", async () => {
   const rawPath = rawAudioPath("capture-tc-job-ok");
   ensureAudioDirs();
   writeFileSync(rawPath, pcm);
-  runtimeStore.registerAudioRecording({
+  await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-tc-job-ok",
     sampleRate: 16000,
     rawFilePath: toStoredPath(rawPath),
   });
-  runtimeStore.finishAudioRecording({
+  await runtimeStore.finishAudioRecording({
     captureSessionId: "capture-tc-job-ok",
     rawFilePath: toStoredPath(rawPath),
     bytes: pcm.length,
@@ -272,7 +274,7 @@ test("transcode job: 成功 → 行 status=ready + pcm 已删", async () => {
   });
 
   const result = await runAudioTranscodeJob("capture-tc-job-ok");
-  const row = runtimeStore.getAudioRecording("capture-tc-job-ok");
+  const row = await runtimeStore.getAudioRecording("capture-tc-job-ok");
   assert.equal(result.ok, true);
   assert.equal(row.status, "ready");
   assert.equal(row.bitrateKbps, 48);
@@ -292,14 +294,14 @@ test("transcode job: 失败 → 行 status=failed + pcm 保留 + error_message",
   const { mkdirSync } = await import("node:fs");
   mkdirSync(meetingAudioPath("capture-tc-job-fail"), { recursive: true });
 
-  runtimeStore.registerAudioRecording({
+  await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-tc-job-fail",
     sampleRate: 16000,
     rawFilePath: toStoredPath(rawPath),
   });
 
   const result = await runAudioTranscodeJob("capture-tc-job-fail");
-  const row = runtimeStore.getAudioRecording("capture-tc-job-fail");
+  const row = await runtimeStore.getAudioRecording("capture-tc-job-fail");
   assert.equal(result.ok, false);
   assert.equal(row.status, "failed");
   assert.match(String(row.errorMessage), /transcode failed/);
@@ -319,11 +321,11 @@ test("transcode job: 已 ready 且文件在 → 直接跳过（幂等）", async
 // L3 schema：meeting_audio_recordings（node:sqlite 运行时路径）
 // ---------------------------------------------------------------------------
 
-test("schema: 运行时建表包含 meeting_audio_recordings 全 15 列 + unique capture_session_id", () => {
-  const database = getSharedDb();
-  const columns = database
+test("schema: 运行时建表包含 meeting_audio_recordings 全 15 列 + unique capture_session_id", async () => {
+  const database = await getSharedDb();
+  const columns = (await database
     .prepare("PRAGMA table_info(meeting_audio_recordings)")
-    .all()
+    .all())
     .map((row) => row.name)
     .sort();
   const expected = [
@@ -333,30 +335,31 @@ test("schema: 运行时建表包含 meeting_audio_recordings 全 15 列 + unique
   ];
   assert.deepEqual(columns, expected);
 
-  const indexes = database
+  const indexes = (await database
     .prepare("PRAGMA index_list(meeting_audio_recordings)")
-    .all()
+    .all())
     .map((row) => row.name);
-  const uniqueIndex = indexes.some((name) => {
-    const cols = database.prepare(`PRAGMA index_info(${name})`).all().map((row) => row.name);
-    return cols.length === 1 && cols[0] === "capture_session_id";
-  });
+  let uniqueIndex = false;
+  for (const name of indexes) {
+    const cols = (await database.prepare(`PRAGMA index_info(${name})`).all()).map((row) => row.name);
+    if (cols.length === 1 && cols[0] === "capture_session_id") uniqueIndex = true;
+  }
   assert.equal(uniqueIndex, true, `capture_session_id 缺 unique 索引: ${indexes.join(",")}`);
 
   // fix-261101-02（issue #51）：版本记账改为单行语义，当前版本 = MIGRATIONS.length（v4）
-  const versionRows = database.prepare("SELECT version FROM schema_version").all();
+  const versionRows = await database.prepare("SELECT version FROM schema_version").all();
   assert.equal(versionRows.length, 1, `schema_version 应恰好 1 行，实际 ${versionRows.length} 行`);
   assert.equal(Number(versionRows[0].version), 4, `schema_version 应为 4，实际 ${versionRows[0].version}`);
   console.log(`[L3] 运行时 schema OK: 15 列 + unique(capture_session_id) + schema_version=4（单行）`);
 });
 
-test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键冲突", () => {
-  const first = runtimeStore.registerAudioRecording({
+test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键冲突", async () => {
+  const first = await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-upsert-1",
     sampleRate: 16000,
     rawFilePath: "audio/raw/capture-upsert-1.pcm",
   });
-  const second = runtimeStore.registerAudioRecording({
+  const second = await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-upsert-1",
     sampleRate: 16000,
     rawFilePath: "audio/raw/capture-upsert-1.pcm",
@@ -364,9 +367,11 @@ test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键�
   assert.equal(first.id, second.id, "upsert 应保留同一行");
   assert.match(first.id, /^aud-[0-9a-f-]{36}$/, `主键应为 aud-<uuid>，实际 ${first.id}`);
   assert.equal(second.status, "recording");
-  const count = getSharedDb()
-    .prepare("SELECT COUNT(*) as c FROM meeting_audio_recordings WHERE capture_session_id = ?")
-    .get("capture-upsert-1").c;
+  const count = (
+    await (await getSharedDb())
+      .prepare("SELECT COUNT(*) as c FROM meeting_audio_recordings WHERE capture_session_id = ?")
+      .get("capture-upsert-1")
+  ).c;
   assert.equal(Number(count), 1);
   console.log(`[L3] upsert OK: id=${first.id}`);
 });
@@ -375,17 +380,17 @@ test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键�
 // L4 绑定 / 孤儿清理 / 删除会议连带删文件
 // ---------------------------------------------------------------------------
 
-function seedMeetingRow(meetingId, userId = "user-audio-test") {
-  const database = getSharedDb();
+async function seedMeetingRow(meetingId, userId = "user-audio-test") {
+  const database = await getSharedDb();
   const now = new Date().toISOString();
-  database
+  await database
     .prepare(`
       INSERT INTO users (id, account_name, display_name, status, created_at, updated_at)
       VALUES (?, ?, ?, 'active', ?, ?)
       ON CONFLICT(id) DO NOTHING
     `)
     .run(userId, userId, "录音测试用户", now, now);
-  database
+  await database
     .prepare(`
       INSERT INTO meetings (
         id, title, source_type, duration_seconds, status, status_updated_at,
@@ -397,21 +402,21 @@ function seedMeetingRow(meetingId, userId = "user-audio-test") {
   return meetingId;
 }
 
-test("bind: 双通道两个 captureSessionId 都绑定到会议且 expires_at 置空（永久）", () => {
-  const meetingId = seedMeetingRow("meeting-bind-1");
+test("bind: 双通道两个 captureSessionId 都绑定到会议且 expires_at 置空（永久）", async () => {
+  const meetingId = await seedMeetingRow("meeting-bind-1");
   ensureAudioDirs();
   for (const captureSessionId of ["capture-dual-mic", "capture-dual-spk"]) {
     writeFileSync(rawAudioPath(captureSessionId), synthesizePcm({ seconds: 1 }));
-    runtimeStore.registerAudioRecording({
+    await runtimeStore.registerAudioRecording({
       captureSessionId,
       sampleRate: 16000,
       rawFilePath: toStoredPath(rawAudioPath(captureSessionId)),
     });
   }
-  const beforeRow = runtimeStore.getAudioRecording("capture-dual-mic");
+  const beforeRow = await runtimeStore.getAudioRecording("capture-dual-mic");
   assert.ok(beforeRow.expiresAt, "绑定前应有 expires_at（孤儿 TTL）");
 
-  const bound = runtimeStore.bindAudioRecordingsToMeeting({
+  const bound = await runtimeStore.bindAudioRecordingsToMeeting({
     meetingId,
     captureSessionIds: ["capture-dual-mic", "capture-dual-spk"],
   });
@@ -423,14 +428,14 @@ test("bind: 双通道两个 captureSessionId 都绑定到会议且 expires_at �
   console.log(`[L4] 双通道绑定 OK: ${bound.map((row) => row.captureSessionId).join(", ")}`);
 });
 
-test("bind: 单数 captureSessionId 与复数取并集去重（向后兼容旧前端）", () => {
-  const meetingId = seedMeetingRow("meeting-bind-2");
-  runtimeStore.registerAudioRecording({
+test("bind: 单数 captureSessionId 与复数取并集去重（向后兼容旧前端）", async () => {
+  const meetingId = await seedMeetingRow("meeting-bind-2");
+  await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-legacy-single",
     sampleRate: 16000,
     rawFilePath: "audio/raw/capture-legacy-single.pcm",
   });
-  const bound = runtimeStore.bindAudioRecordingsToMeeting({
+  const bound = await runtimeStore.bindAudioRecordingsToMeeting({
     meetingId,
     captureSessionId: "capture-legacy-single",
     captureSessionIds: ["capture-legacy-single", "capture-legacy-single", ""],
@@ -444,72 +449,72 @@ test("bind: 单数 captureSessionId 与复数取并集去重（向后兼容旧�
   console.log("[L4] 单数/复数并集去重 OK");
 });
 
-test("cleanup: 只清 meeting_id IS NULL 且过期的孤儿，删行 + 删文件", () => {
-  const database = getSharedDb();
+test("cleanup: 只清 meeting_id IS NULL 且过期的孤儿，删行 + 删文件", async () => {
+  const database = await getSharedDb();
   ensureAudioDirs();
   const orphanId = "capture-orphan-expired";
   const orphanMp3 = meetingAudioPath(orphanId);
   writeFileSync(rawAudioPath(orphanId), synthesizePcm({ seconds: 1 }));
   writeFileSync(orphanMp3, Buffer.from("mp3"));
-  runtimeStore.registerAudioRecording({
+  await runtimeStore.registerAudioRecording({
     captureSessionId: orphanId,
     sampleRate: 16000,
     rawFilePath: toStoredPath(rawAudioPath(orphanId)),
   });
-  database
+  await database
     .prepare("UPDATE meeting_audio_recordings SET file_path = ?, expires_at = ? WHERE capture_session_id = ?")
     .run(toStoredPath(orphanMp3), new Date(Date.now() - 60_000).toISOString(), orphanId);
 
-  const result = runtimeStore.cleanupExpiredAudioRecordings();
+  const result = await runtimeStore.cleanupExpiredAudioRecordings();
   assert.ok(result.rows >= 1, `应至少清掉 1 行孤儿，实际 ${result.rows}`);
-  assert.equal(runtimeStore.getAudioRecording(orphanId), null, "孤儿行应被删除");
+  assert.equal(await runtimeStore.getAudioRecording(orphanId), null, "孤儿行应被删除");
   assert.equal(existsSync(rawAudioPath(orphanId)), false, "孤儿 raw 文件应被删除");
   assert.equal(existsSync(orphanMp3), false, "孤儿 mp3 文件应被删除");
 
   // 已绑定会议的录音（expires_at IS NULL）绝不能被清
-  assert.notEqual(runtimeStore.getAudioRecording("capture-dual-mic"), null);
+  assert.notEqual(await runtimeStore.getAudioRecording("capture-dual-mic"), null);
   console.log(`[L4] 孤儿清理 OK: rows=${result.rows} files=${result.files}`);
 });
 
-test("cleanup: 未过期的孤儿不动", () => {
-  runtimeStore.registerAudioRecording({
+test("cleanup: 未过期的孤儿不动", async () => {
+  await runtimeStore.registerAudioRecording({
     captureSessionId: "capture-orphan-fresh",
     sampleRate: 16000,
     rawFilePath: "audio/raw/capture-orphan-fresh.pcm",
   });
-  const before = runtimeStore.getAudioRecording("capture-orphan-fresh");
-  runtimeStore.cleanupExpiredAudioRecordings();
-  assert.notEqual(runtimeStore.getAudioRecording("capture-orphan-fresh"), null);
+  const before = await runtimeStore.getAudioRecording("capture-orphan-fresh");
+  await runtimeStore.cleanupExpiredAudioRecordings();
+  assert.notEqual(await runtimeStore.getAudioRecording("capture-orphan-fresh"), null);
   assert.ok(new Date(before.expiresAt).getTime() > Date.now(), "默认 TTL 72h 应远未过期");
   console.log("[L4] 未过期孤儿保留 OK");
 });
 
-test("delete: 删会议时音频行与文件一并清掉（含残留 pcm）", () => {
-  const meetingId = seedMeetingRow("meeting-delete-1");
+test("delete: 删会议时音频行与文件一并清掉（含残留 pcm）", async () => {
+  const meetingId = await seedMeetingRow("meeting-delete-1");
   const captureSessionId = "capture-del-1";
   ensureAudioDirs();
   writeFileSync(rawAudioPath(captureSessionId), synthesizePcm({ seconds: 1 }));
   writeFileSync(meetingAudioPath(captureSessionId), Buffer.from("mp3"));
-  runtimeStore.registerAudioRecording({
+  await runtimeStore.registerAudioRecording({
     captureSessionId,
     sampleRate: 16000,
     rawFilePath: toStoredPath(rawAudioPath(captureSessionId)),
   });
-  runtimeStore.bindAudioRecordingsToMeeting({ meetingId, captureSessionIds: [captureSessionId] });
-  getSharedDb()
+  await runtimeStore.bindAudioRecordingsToMeeting({ meetingId, captureSessionIds: [captureSessionId] });
+  (await getSharedDb())
     .prepare("UPDATE meeting_audio_recordings SET file_path = ?, status = 'ready' WHERE capture_session_id = ?")
     .run(toStoredPath(meetingAudioPath(captureSessionId)), captureSessionId);
 
   // deleteMeeting 的内部两步：事务内取行 + 删行，提交后删文件
-  const rows = runtimeStore.listAudioRecordingsForMeeting(meetingId);
+  const rows = await runtimeStore.listAudioRecordingsForMeeting(meetingId);
   assert.equal(rows.length, 1);
-  runtimeStore.deleteAudioRecordingRowsForMeeting(meetingId);
+  await runtimeStore.deleteAudioRecordingRowsForMeeting(meetingId);
   const { files } = runtimeStore.removeAudioFilesForRows(rows);
 
   assert.equal(files, 2, `应删除 mp3 + pcm 两个文件，实际 ${files}`);
   assert.equal(existsSync(meetingAudioPath(captureSessionId)), false);
   assert.equal(existsSync(rawAudioPath(captureSessionId)), false);
-  assert.equal(runtimeStore.listAudioRecordingsForMeeting(meetingId).length, 0);
+  assert.equal((await runtimeStore.listAudioRecordingsForMeeting(meetingId)).length, 0);
   console.log("[L4] 删会议连带删文件 OK（mp3 + 残留 pcm）");
 });
 
@@ -720,9 +725,9 @@ test("R2/F1: 列表行不透出磁盘绝对/存储路径（键名与值都检查
   console.log(`[R2] 无路径外泄 OK: ${serialized}`);
 });
 
-test("R2/F1: listMeetings 走同一投影 + 批量 SQL 不查路径列（防退回 N+1 / 防退回空数组）", () => {
+test("R2/F1: listMeetings 走同一投影 + 批量 SQL 不查路径列（防退回 N+1 / 防退回空数组）", async () => {
   const source = readFileSync(ADMIN_STORE_PATH, "utf-8");
-  const listMeetingsSource = sliceBetween(source, "export function listMeetings()", "function queryMeetingRowById");
+  const listMeetingsSource = sliceBetween(source, "export async function listMeetings()", "function queryMeetingRowById");
 
   assert.match(listMeetingsSource, /listMeetingAudioRowsByMeeting\(\)/, "列表必须用一次性批量查询");
   assert.match(listMeetingsSource, /projectMeetingAudio\(/, "列表必须走与详情同一个投影函数");
@@ -731,8 +736,8 @@ test("R2/F1: listMeetings 走同一投影 + 批量 SQL 不查路径列（防退�
 
   const batchSource = sliceBetween(
     source,
-    "function listMeetingAudioRowsByMeeting()",
-    "export function listMeetings()"
+    "function listMeetingAudioRowsByMeeting(",
+    "export async function listMeetings()"
   );
   assert.doesNotMatch(batchSource, /r\.file_path|r\.raw_file_path/, "批量查询不许 SELECT 磁盘路径列");
   assert.match(batchSource, /NULL as filePath/);

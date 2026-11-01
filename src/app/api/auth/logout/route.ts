@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   const token = req.cookies.get(SESSION_COOKIE_NAME)?.value || "";
-  deleteAuthSession(token);
+  await deleteAuthSession(token);
 
   const response = NextResponse.json({ ok: true });
   response.cookies.set({

@@ -15,22 +15,32 @@ const AUDIO_ALLOWED_BITRATES = [32, 48, 64, 96, 128];
 const AUDIO_DEFAULT_SAMPLE_RATE = 16000;
 
 let dbSeeded = false;
+let seedPromise = null;
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function getDb() {
-  const database = getSharedDb();
-  if (!dbSeeded) {
-    dbSeeded = true;
-    seedAsrDefaults();
+/**
+ * 取数据库句柄（异步）。
+ *
+ * 与 legacy 的差异：legacy 用 `dbSeeded` 布尔值保证只 seed 一次；异步化后首次 seed
+ * 本身要 await，用 single-flight promise 代替布尔值，避免并发首调重复 seed。
+ */
+async function getDb() {
+  const database = await getSharedDb();
+  if (!seedPromise) {
+    seedPromise = seedAsrDefaults(database).catch((error) => {
+      seedPromise = null;
+      throw error;
+    });
   }
+  await seedPromise;
   return database;
 }
 
-function insertMissingSetting(section, mark, title, description, value) {
-  getDb()
+async function insertMissingSetting(database, section, mark, title, description, value) {
+  await database
     .prepare(`
       INSERT INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -39,14 +49,14 @@ function insertMissingSetting(section, mark, title, description, value) {
     .run(section, mark, title, description, value, nowIso());
 }
 
-function seedAsrDefaults() {
-  insertMissingSetting("asr", "provider", "ASR Provider", "当前 ASR 提供方", "local_funasr");
-  insertMissingSetting("asr", "endpoint", "FunASR Endpoint", "FunASR 服务地址", "ws://funasr.local:10095/ws");
-  insertMissingSetting("asr", "api_key", "ASR API Key", "DashScope API Key", "");
-  insertMissingSetting("asr", "workspace_id", "ASR Workspace ID", "DashScope Workspace ID", "");
-  insertMissingSetting("audio", "record_enabled", "录音落盘开关", "是否在转写的同时旁路录制原始音频", "1");
-  insertMissingSetting("audio", "bitrate_kbps", "录音码率（kbps）", "会议结束后转码 MP3 的码率，默认 48", String(AUDIO_DEFAULT_BITRATE_KBPS));
-  insertMissingSetting("audio", "orphan_ttl_hours", "孤儿录音保留（小时）", "未绑定会议的录音保留时长，默认 72", String(AUDIO_DEFAULT_ORPHAN_TTL_HOURS));
+async function seedAsrDefaults(database) {
+  await insertMissingSetting(database, "asr", "provider", "ASR Provider", "当前 ASR 提供方", "local_funasr");
+  await insertMissingSetting(database, "asr", "endpoint", "FunASR Endpoint", "FunASR 服务地址", "ws://funasr.local:10095/ws");
+  await insertMissingSetting(database, "asr", "api_key", "ASR API Key", "DashScope API Key", "");
+  await insertMissingSetting(database, "asr", "workspace_id", "ASR Workspace ID", "DashScope Workspace ID", "");
+  await insertMissingSetting(database, "audio", "record_enabled", "录音落盘开关", "是否在转写的同时旁路录制原始音频", "1");
+  await insertMissingSetting(database, "audio", "bitrate_kbps", "录音码率（kbps）", "会议结束后转码 MP3 的码率，默认 48", String(AUDIO_DEFAULT_BITRATE_KBPS));
+  await insertMissingSetting(database, "audio", "orphan_ttl_hours", "孤儿录音保留（小时）", "未绑定会议的录音保留时长，默认 72", String(AUDIO_DEFAULT_ORPHAN_TTL_HOURS));
 }
 
 function settingValue(settings, section, mark) {
@@ -57,16 +67,16 @@ function hashSessionToken(token) {
   return createHash("sha256").update(token).digest("hex");
 }
 
-export function authorizeAsrGatewaySession(sessionToken, devAccountName = "") {
+export async function authorizeAsrGatewaySession(sessionToken, devAccountName = "") {
   const normalizedToken = String(sessionToken || "").trim();
   const normalizedDevAccount = String(devAccountName || "").trim();
   if (!normalizedToken && !normalizedDevAccount) {
     return { ok: false, status: 401, error: "Authentication required" };
   }
 
-  const database = getDb();
+  const database = await getDb();
   const session = normalizedToken
-    ? database
+    ? await database
       .prepare(`
         SELECT
           s.user_id as userId,
@@ -79,7 +89,7 @@ export function authorizeAsrGatewaySession(sessionToken, devAccountName = "") {
         WHERE s.token_hash = ? AND s.expires_at > ?
       `)
       .get(hashSessionToken(normalizedToken), nowIso())
-    : database
+    : await database
       .prepare(`
         SELECT
           id as userId,
@@ -100,22 +110,23 @@ export function authorizeAsrGatewaySession(sessionToken, devAccountName = "") {
     return { ok: false, status: 403, error: "Password change required" };
   }
 
-  const roleKeys = database
-    .prepare(`
-      SELECT r.role_key as roleKey
-      FROM user_roles ur
-      INNER JOIN roles r ON r.id = ur.role_id
-      WHERE ur.user_id = ?
-    `)
-    .all(session.userId)
-    .map((row) => String(row.roleKey));
+  const roleKeys = (
+    await database
+      .prepare(`
+        SELECT r.role_key as roleKey
+        FROM user_roles ur
+        INNER JOIN roles r ON r.id = ur.role_id
+        WHERE ur.user_id = ?
+      `)
+      .all(session.userId)
+  ).map((row) => String(row.roleKey));
 
   if (!roleKeys.some((roleKey) => ASR_GATEWAY_ROLE_KEYS.has(roleKey))) {
     return { ok: false, status: 403, error: "ASR access is not allowed for this role" };
   }
 
   if (normalizedToken) {
-    database
+    await database
       .prepare("UPDATE auth_sessions SET last_seen_at = ? WHERE token_hash = ?")
       .run(nowIso(), hashSessionToken(normalizedToken));
   }
@@ -148,9 +159,9 @@ function normalizeFunasrUrl(rawUrl) {
 
 let cachedRuntimeConfig = null;
 
-function loadAsrRuntimeConfig() {
-  const database = getDb();
-  const settings = database
+async function loadAsrRuntimeConfig() {
+  const database = await getDb();
+  const settings = await database
     .prepare(`
       SELECT
         item_section as itemSection,
@@ -160,7 +171,7 @@ function loadAsrRuntimeConfig() {
     `)
     .all();
 
-  const hotwordRows = database
+  const hotwordRows = await database
     .prepare(`
       SELECT term, weight
       FROM asr_hotwords
@@ -196,9 +207,9 @@ function loadAsrRuntimeConfig() {
   };
 }
 
-export function getAsrRuntimeConfig() {
+export async function getAsrRuntimeConfig() {
   if (!cachedRuntimeConfig) {
-    cachedRuntimeConfig = loadAsrRuntimeConfig();
+    cachedRuntimeConfig = await loadAsrRuntimeConfig();
   }
   return cachedRuntimeConfig;
 }
@@ -207,11 +218,12 @@ export function invalidateAsrRuntimeConfig() {
   cachedRuntimeConfig = null;
 }
 
-export function createCaptureSession(input) {
+export async function createCaptureSession(input) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
 
-  getDb()
+  const database = await getDb();
+  await database
     .prepare(`
       INSERT INTO asr_capture_sessions (
         capture_session_id, task_id, asr_provider, asr_config_snapshot,
@@ -310,13 +322,12 @@ export function releaseCaptureSession(captureSessionId) {
   pendingQueues.delete(captureSessionId);
 }
 
-let prepared = null;
-
-function getPreparedStatements() {
-  const database = getDb();
-  if (prepared) return prepared;
-
-  prepared = {
+// 语句包装器不再跨调用缓存：`AsyncDb.prepare()` 现在只是闭包工厂（无真实 prepared
+// statement 开销），而缓存会把 `this.knex` 钉在创建时的那条连接上——事务期间（mssql 的
+// `this.knex = trx`）会用外层连接执行，落在事务之外。每次调用重新 prepare 后，
+// 事务内的语句与事务同连接。
+function statementsFor(database) {
+  return {
     sessionExpires: database.prepare(
       "SELECT expires_at as expiresAt FROM asr_capture_sessions WHERE capture_session_id = ?"
     ),
@@ -332,15 +343,14 @@ function getPreparedStatements() {
       "UPDATE asr_capture_sessions SET updated_at = ? WHERE capture_session_id = ?"
     ),
   };
-
-  return prepared;
 }
 
-function getQueueState(captureSessionId) {
+async function getQueueState(captureSessionId) {
   let state = pendingQueues.get(captureSessionId);
   if (state) return state;
 
-  const session = getPreparedStatements().sessionExpires.get(captureSessionId);
+  const database = await getDb();
+  const session = await statementsFor(database).sessionExpires.get(captureSessionId);
   if (!session) return null;
 
   state = {
@@ -358,11 +368,11 @@ function getQueueState(captureSessionId) {
  * Returns false when the session is missing/expired or a limit is exceeded
  * (same semantics as the previous synchronous insert).
  */
-export function appendCaptureEvent(captureSessionId, event) {
+export async function appendCaptureEvent(captureSessionId, event) {
   const eventJson = JSON.stringify(event);
   if (typeof eventJson !== "string" || eventJson.length > MAX_CAPTURE_EVENT_CHARS) return false;
 
-  const state = getQueueState(captureSessionId);
+  const state = await getQueueState(captureSessionId);
   if (!state || String(state.expiresAt) < nowIso()) {
     if (state) {
       pendingQueues.delete(captureSessionId);
@@ -380,46 +390,42 @@ export function appendCaptureEvent(captureSessionId, event) {
   return true;
 }
 
-function flushQueueState(database, captureSessionId, state) {
+async function flushQueueState(database, captureSessionId, state) {
   const events = state.events;
   state.events = [];
   state.bytes = 0;
 
-  const statements = getPreparedStatements();
+  const statements = statementsFor(database);
 
-  database.exec("BEGIN IMMEDIATE");
   try {
-    const session = statements.sessionExpires.get(captureSessionId);
-    if (!session || String(session.expiresAt) < nowIso()) {
-      database.exec("ROLLBACK");
-      pendingQueues.delete(captureSessionId);
-      captureStats.delete(captureSessionId);
-      return 0;
-    }
+    return await database.withTransaction(async () => {
+      const session = await statements.sessionExpires.get(captureSessionId);
+      if (!session || String(session.expiresAt) < nowIso()) {
+        pendingQueues.delete(captureSessionId);
+        captureStats.delete(captureSessionId);
+        // legacy 这里是 BEGIN → ROLLBACK；此时还没写入任何行，提交空事务与回滚
+        // 的数据效果相同（见报告「行为差异清单」）。
+        return 0;
+      }
 
-    let sequenceNo = Number(
-      statements.nextSequence.get(captureSessionId)?.nextSequence ?? 1
-    );
-    for (const item of events) {
-      statements.insertEvent.run(
-        `${captureSessionId}-${sequenceNo}`,
-        captureSessionId,
-        sequenceNo,
-        item.eventJson,
-        item.receivedAt
+      let sequenceNo = Number(
+        (await statements.nextSequence.get(captureSessionId))?.nextSequence ?? 1
       );
-      sequenceNo++;
-    }
+      for (const item of events) {
+        await statements.insertEvent.run(
+          `${captureSessionId}-${sequenceNo}`,
+          captureSessionId,
+          sequenceNo,
+          item.eventJson,
+          item.receivedAt
+        );
+        sequenceNo++;
+      }
 
-    statements.updateSession.run(events[events.length - 1].receivedAt, captureSessionId);
-    database.exec("COMMIT");
-    return events.length;
+      await statements.updateSession.run(events[events.length - 1].receivedAt, captureSessionId);
+      return events.length;
+    });
   } catch (error) {
-    try {
-      database.exec("ROLLBACK");
-    } catch {
-      // Preserve the original database error if rollback itself fails.
-    }
     // Batching is best-effort by design (analysis.md C4: loss window <= flush
     // interval is acceptable for capture/replay data). Never throw into the
     // gateway hot path.
@@ -432,8 +438,8 @@ function flushQueueState(database, captureSessionId, state) {
  * Persist queued capture events. With an argument, flushes only that capture
  * session (used as drain before reading events for a saved meeting).
  */
-export function flushCaptureEvents(captureSessionId) {
-  const database = getDb();
+export async function flushCaptureEvents(captureSessionId) {
+  const database = await getDb();
 
   if (captureSessionId) {
     const state = pendingQueues.get(captureSessionId);
@@ -444,7 +450,7 @@ export function flushCaptureEvents(captureSessionId) {
   let flushed = 0;
   for (const [sessionId, state] of pendingQueues) {
     if (state.events.length === 0) continue;
-    flushed += flushQueueState(database, sessionId, state);
+    flushed += await flushQueueState(database, sessionId, state);
   }
   return flushed;
 }
@@ -458,18 +464,16 @@ let flushTimer = null;
 export function startCaptureFlushTimer(intervalMs = 500) {
   if (flushTimer) return;
   flushTimer = setInterval(() => {
-    try {
-      flushCaptureEvents();
-    } catch (error) {
+    flushCaptureEvents().catch((error) => {
       console.error("[Capture Store] timer flush failed:", error);
-    }
+    });
   }, intervalMs);
   flushTimer.unref();
 }
 
-export function closeCaptureStore() {
+export async function closeCaptureStore() {
   try {
-    flushCaptureEvents();
+    await flushCaptureEvents();
   } catch (error) {
     console.error("[Capture Store] final flush failed:", error);
   }
@@ -479,8 +483,9 @@ export function closeCaptureStore() {
   }
 }
 
-export function finishCaptureSession(captureSessionId, status = "completed") {
-  getDb()
+export async function finishCaptureSession(captureSessionId, status = "completed") {
+  const database = await getDb();
+  await database
     .prepare(`
       UPDATE asr_capture_sessions
       SET status = ?, updated_at = ?
@@ -489,8 +494,9 @@ export function finishCaptureSession(captureSessionId, status = "completed") {
     .run(status, nowIso(), captureSessionId);
 }
 
-export function cleanupExpiredCaptureSessions() {
-  getDb()
+export async function cleanupExpiredCaptureSessions() {
+  const database = await getDb();
+  await database
     .prepare("DELETE FROM asr_capture_sessions WHERE expires_at < ?")
     .run(nowIso());
 }
@@ -560,8 +566,9 @@ function parseBooleanSetting(value, fallback) {
 
 let cachedAudioRuntimeConfig = null;
 
-function loadAudioRuntimeConfig() {
-  const settings = getDb()
+async function loadAudioRuntimeConfig() {
+  const database = await getDb();
+  const settings = await database
     .prepare(`
       SELECT
         item_section as itemSection,
@@ -584,9 +591,9 @@ function loadAudioRuntimeConfig() {
  * 录音配置（带缓存）。ASR 网关在会话开始时取一次，**不在 PCM 帧回调里查库**；
  * 后台改设置后由 invalidateAudioRuntimeConfig() 失效。
  */
-export function getAudioRuntimeConfig() {
+export async function getAudioRuntimeConfig() {
   if (!cachedAudioRuntimeConfig) {
-    cachedAudioRuntimeConfig = loadAudioRuntimeConfig();
+    cachedAudioRuntimeConfig = await loadAudioRuntimeConfig();
   }
   return cachedAudioRuntimeConfig;
 }
@@ -596,13 +603,16 @@ export function invalidateAudioRuntimeConfig() {
 }
 
 /** 开关关闭期间不登记行；capture_session_id unique，重复登记走 upsert。 */
-export function registerAudioRecording(input) {
+export async function registerAudioRecording(input) {
   const createdAt = nowIso();
-  const ttlHours = normalizeOrphanTtlHours(input?.orphanTtlHours ?? getAudioRuntimeConfig().orphanTtlHours);
+  const ttlHours = normalizeOrphanTtlHours(
+    input?.orphanTtlHours ?? (await getAudioRuntimeConfig()).orphanTtlHours
+  );
   const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
   const sampleRate = Number(input?.sampleRate) > 0 ? Number(input.sampleRate) : AUDIO_DEFAULT_SAMPLE_RATE;
 
-  getDb()
+  const database = await getDb();
+  await database
     .prepare(`
       INSERT INTO meeting_audio_recordings (
         id, capture_session_id, meeting_id, file_path, raw_file_path, format, status,
@@ -630,41 +640,44 @@ export function registerAudioRecording(input) {
   return getAudioRecording(input.captureSessionId);
 }
 
-export function getAudioRecording(captureSessionId) {
+export async function getAudioRecording(captureSessionId) {
   if (!captureSessionId) return null;
-  const row = getDb()
+  const database = await getDb();
+  const row = await database
     .prepare(`SELECT ${AUDIO_ROW_COLUMNS} FROM meeting_audio_recordings WHERE capture_session_id = ?`)
     .get(captureSessionId);
   return normalizeAudioRow(row);
 }
 
-export function getAudioRecordingById(id) {
+export async function getAudioRecordingById(id) {
   if (!id) return null;
-  const row = getDb()
+  const database = await getDb();
+  const row = await database
     .prepare(`SELECT ${AUDIO_ROW_COLUMNS} FROM meeting_audio_recordings WHERE id = ?`)
     .get(id);
   return normalizeAudioRow(row);
 }
 
-export function listAudioRecordingsForMeeting(meetingId) {
+export async function listAudioRecordingsForMeeting(meetingId) {
   if (!meetingId) return [];
-  return getDb()
+  const database = await getDb();
+  const rows = await database
     .prepare(`
       SELECT ${AUDIO_ROW_COLUMNS}
       FROM meeting_audio_recordings
       WHERE meeting_id = ?
       ORDER BY created_at ASC, id ASC
     `)
-    .all(meetingId)
-    .map(normalizeAudioRow);
+    .all(meetingId);
+  return rows.map(normalizeAudioRow);
 }
 
 /**
  * 会话终态（finish / fail / 断连 close 三处都会调，必须幂等）。
  * 有字节 → 保持 recording（pcm 已落盘、mp3 待转码），无字节/写失败 → failed。
  */
-export function finishAudioRecording(input) {
-  const existing = getAudioRecording(input?.captureSessionId);
+export async function finishAudioRecording(input) {
+  const existing = await getAudioRecording(input?.captureSessionId);
   if (!existing) return null;
 
   const bytes = Number(input?.bytes ?? 0);
@@ -675,7 +688,8 @@ export function finishAudioRecording(input) {
     ? null
     : String(input?.errorMessage || "no audio data recorded");
 
-  getDb()
+  const database = await getDb();
+  await database
     .prepare(`
       UPDATE meeting_audio_recordings
       SET raw_file_path = ?, bytes = ?, duration_seconds = ?, status = ?,
@@ -695,8 +709,9 @@ export function finishAudioRecording(input) {
   return getAudioRecording(input.captureSessionId);
 }
 
-export function markAudioRecordingReady(input) {
-  getDb()
+export async function markAudioRecordingReady(input) {
+  const database = await getDb();
+  await database
     .prepare(`
       UPDATE meeting_audio_recordings
       SET file_path = ?, bytes = ?, duration_seconds = ?, status = 'ready',
@@ -714,8 +729,9 @@ export function markAudioRecordingReady(input) {
   return getAudioRecording(input.captureSessionId);
 }
 
-export function markAudioRecordingFailed(input) {
-  getDb()
+export async function markAudioRecordingFailed(input) {
+  const database = await getDb();
+  await database
     .prepare(`
       UPDATE meeting_audio_recordings
       SET status = 'failed', error_message = ?, updated_at = ?
@@ -729,11 +745,11 @@ export function markAudioRecordingFailed(input) {
  * 会议落定时把录音绑定到会议：meeting_id 写上、expires_at 置 NULL（永久）。
  * 同时接受单数 captureSessionId（旧前端）与复数 captureSessionIds，取并集去重。
  */
-export function bindAudioRecordingsToMeeting(input) {
+export async function bindAudioRecordingsToMeeting(input) {
   const ids = collectCaptureSessionIds(input);
   if (ids.length === 0) return [];
 
-  const database = getDb();
+  const database = await getDb();
   const updatedAt = nowIso();
   const statement = database.prepare(`
     UPDATE meeting_audio_recordings
@@ -741,7 +757,7 @@ export function bindAudioRecordingsToMeeting(input) {
     WHERE capture_session_id = ?
   `);
   for (const captureSessionId of ids) {
-    statement.run(input.meetingId, updatedAt, captureSessionId);
+    await statement.run(input.meetingId, updatedAt, captureSessionId);
   }
   return listAudioRecordingsForMeeting(input.meetingId);
 }
@@ -789,11 +805,12 @@ export function removeAudioFilesForRows(rows) {
 }
 
 /** 只删行，返回被删行（文件由调用方在事务提交后删，避免回滚丢文件）。 */
-export function deleteAudioRecordingRowsForMeeting(meetingId) {
+export async function deleteAudioRecordingRowsForMeeting(meetingId) {
   if (!meetingId) return [];
-  const rows = listAudioRecordingsForMeeting(meetingId);
+  const rows = await listAudioRecordingsForMeeting(meetingId);
   if (rows.length === 0) return [];
-  getDb()
+  const database = await getDb();
+  await database
     .prepare("DELETE FROM meeting_audio_recordings WHERE meeting_id = ?")
     .run(meetingId);
   return rows;
@@ -803,21 +820,22 @@ export function deleteAudioRecordingRowsForMeeting(meetingId) {
  * 孤儿录音清理：meeting_id IS NULL 且 expires_at 已过期 → 删行 + 删文件
  * （raw 与 mp3 都删）。已绑定会议的 expires_at 为 NULL，永远不在此集合里。
  */
-export function cleanupExpiredAudioRecordings() {
-  const database = getDb();
+export async function cleanupExpiredAudioRecordings() {
+  const database = await getDb();
   const now = nowIso();
-  const rows = database
-    .prepare(`
-      SELECT ${AUDIO_ROW_COLUMNS}
-      FROM meeting_audio_recordings
-      WHERE meeting_id IS NULL AND expires_at IS NOT NULL AND expires_at < ?
-    `)
-    .all(now)
-    .map(normalizeAudioRow);
+  const rows = (
+    await database
+      .prepare(`
+        SELECT ${AUDIO_ROW_COLUMNS}
+        FROM meeting_audio_recordings
+        WHERE meeting_id IS NULL AND expires_at IS NOT NULL AND expires_at < ?
+      `)
+      .all(now)
+  ).map(normalizeAudioRow);
 
   if (rows.length === 0) return { rows: 0, files: 0 };
 
-  database
+  await database
     .prepare("DELETE FROM meeting_audio_recordings WHERE meeting_id IS NULL AND expires_at IS NOT NULL AND expires_at < ?")
     .run(now);
 

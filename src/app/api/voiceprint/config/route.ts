@@ -31,7 +31,7 @@ async function probeService(model: keyof typeof VOICEPRINT_MODELS): Promise<{
   threshold: number | null;
   speakers: number | null;
 }> {
-  const endpoint = (getSettingValue("voiceprint", ENDPOINT_KEYS[model]) || VOICEPRINT_MODELS[model].defaultEndpoint).replace(/\/+$/, "");
+  const endpoint = ((await getSettingValue("voiceprint", ENDPOINT_KEYS[model])) || VOICEPRINT_MODELS[model].defaultEndpoint).replace(/\/+$/, "");
   try {
     const health = await proxyVoiceprint<{ modelLoaded: boolean; speakers: number; threshold: number }>(
       "/health",
@@ -58,18 +58,18 @@ async function probeService(model: keyof typeof VOICEPRINT_MODELS): Promise<{
 /** GET /api/voiceprint/config — 声纹配置 + 双服务连通性（登录用户） */
 export async function GET(req: NextRequest) {
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const enabled = isVoiceprintEnabled();
-    const model = getVoiceprintModel();
+    const enabled = await isVoiceprintEnabled();
+    const model = await getVoiceprintModel();
     const [zh, zhEn] = await Promise.all([probeService("zh"), probeService("zh_en")]);
     return NextResponse.json({
       enabled,
       model,
       models: {
-        zh: { ...zh, endpoint: maskEndpoint(getSettingValue("voiceprint", "endpoint_zh") || VOICEPRINT_MODELS.zh.defaultEndpoint) },
-        zh_en: { ...zhEn, endpoint: maskEndpoint(getSettingValue("voiceprint", "endpoint_zh_en") || VOICEPRINT_MODELS.zh_en.defaultEndpoint) },
+        zh: { ...zh, endpoint: maskEndpoint((await getSettingValue("voiceprint", "endpoint_zh")) || VOICEPRINT_MODELS.zh.defaultEndpoint) },
+        zh_en: { ...zhEn, endpoint: maskEndpoint((await getSettingValue("voiceprint", "endpoint_zh_en")) || VOICEPRINT_MODELS.zh_en.defaultEndpoint) },
       },
       // 兼容旧客户端字段
-      endpoint: maskEndpoint(getVoiceprintEndpoint()),
+      endpoint: maskEndpoint(await getVoiceprintEndpoint()),
       threshold: model === "zh_en" ? zhEn.threshold : zh.threshold,
       serviceReachable: model === "zh_en" ? zhEn.reachable : zh.reachable,
       serviceStatus: model === "zh_en" ? zhEn.status : zh.status,
@@ -114,7 +114,7 @@ export async function PUT(req: NextRequest) {
         }
       }
       if (changes.length > 0) {
-        saveSettings(changes);
+        await saveSettings(changes);
       }
 
       if (body.threshold !== undefined) {
@@ -136,7 +136,12 @@ export async function PUT(req: NextRequest) {
         }
       }
 
-      return NextResponse.json({ ok: true, enabled: isVoiceprintEnabled(), model: getVoiceprintModel(), messages });
+      return NextResponse.json({
+        ok: true,
+        enabled: await isVoiceprintEnabled(),
+        model: await getVoiceprintModel(),
+        messages,
+      });
     } catch (error) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "save voiceprint config failed" },

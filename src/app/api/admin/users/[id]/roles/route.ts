@@ -11,7 +11,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
         return NextResponse.json({ error: "roleKeys must be an array" }, { status: 400 });
       }
 
-      const user = setUserRoleKeys(id, body.roleKeys);
+      const user = await setUserRoleKeys(id, body.roleKeys);
 
       if (!user) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });

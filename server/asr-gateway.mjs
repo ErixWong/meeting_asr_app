@@ -281,14 +281,14 @@ function createProviderAdapter(runtimeConfig, session) {
 export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, devMode = false } = {}) {
   const wss = new WebSocketServer({ noServer: true });
 
-  wss.on("connection", (clientWs, req) => {
+  wss.on("connection", async (clientWs, req) => {
   if (!isAllowedClientOrigin(req)) {
     console.warn(`[ASR Gateway] Rejected client origin: ${req.headers.origin || "(missing)"}`);
     clientWs.close(1008, "Origin is not allowed");
     return;
   }
 
-  const runtimeConfig = getAsrRuntimeConfig();
+  const runtimeConfig = await getAsrRuntimeConfig();
   let targetWs = null;
   let targetReady = false;
   let sessionStarted = false;
@@ -309,13 +309,31 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   const UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
   const MAX_SEND_BUFFERED_BYTES = 16 * 1024 * 1024;
 
+  /**
+   * 消息处理串行化（#54 async 传导）：`on("message")` 的回调若直接写成 async，
+   * 下一条消息会在前一条的 await 未完成时就开始处理 —— 音频帧可能先于 session.start
+   * 落库、上游事件顺序会颠倒。用一条 promise 链把同一连接上的消息按到达顺序执行，
+   * 与同步驱动时代的语义等价。
+   */
+  let messageChain = Promise.resolve();
+  function enqueueMessage(task) {
+    messageChain = messageChain.then(task, task).catch((error) => {
+      console.error("[ASR Gateway] message handling failed:", error);
+      failSession(
+        error instanceof Error ? `ASR gateway message handling failed: ${error.message}` : "ASR gateway message handling failed"
+      );
+    });
+  }
+
   function failSession(errorMessage) {
     if (sessionFinished || sessionFailed) return;
     sessionFailed = true;
     partialAccumText = "";
     console.error("[ASR Gateway] Session failed:", errorMessage);
     if (captureSessionId) {
-      finishCaptureSession(captureSessionId, "failed");
+      void finishCaptureSession(captureSessionId, "failed").catch((error) => {
+        console.error("[ASR Gateway] finish capture session failed:", error);
+      });
     }
     finalizeAudioRecording();
     sendAppMessage(clientWs, "session.failed", { sessionId, error: errorMessage });
@@ -326,16 +344,16 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
    * 旁路录制（feat-261101-01 L1）：受 audio:record_enabled 开关控制，开关关闭时
    * 不建文件也不登记 DB 行。录制失败一律只记日志，绝不影响 ASR 转发。
    */
-  function startAudioRecording() {
+  async function startAudioRecording() {
     try {
-      const audioConfig = getAudioRuntimeConfig();
+      const audioConfig = await getAudioRuntimeConfig();
       if (!audioConfig.recordEnabled) return;
 
       audioRecorder = createRecorder({
         captureSessionId,
         sampleRate: sessionSampleRate,
       });
-      registerAudioRecording({
+      await registerAudioRecording({
         captureSessionId,
         sampleRate: sessionSampleRate,
         rawFilePath: audioRecorder.storedPath,
@@ -356,9 +374,9 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
 
     void activeRecorder
       .finalize()
-      .then((result) => {
+      .then(async (result) => {
         try {
-          finishAudioRecording({
+          await finishAudioRecording({
             captureSessionId: targetCaptureSessionId,
             rawFilePath: result.storedPath,
             bytes: result.bytes,
@@ -389,11 +407,11 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     }
   }
 
-  function ensureCaptureSession() {
+  async function ensureCaptureSession() {
     if (captureSessionId) return captureSessionId;
 
     captureSessionId = `capture-${randomUUID()}`;
-    createCaptureSession({
+    await createCaptureSession({
       captureSessionId,
       taskId: sessionId,
       asrProvider: runtimeConfig.providerType,
@@ -406,7 +424,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       hotwords: runtimeConfig.hotwords,
     });
 
-    startAudioRecording();
+    await startAudioRecording();
 
     return captureSessionId;
   }
@@ -433,14 +451,16 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     sessionFinished = true;
     partialAccumText = "";
     if (captureSessionId) {
-      finishCaptureSession(captureSessionId);
+      void finishCaptureSession(captureSessionId).catch((error) => {
+        console.error("[ASR Gateway] finish capture session failed:", error);
+      });
     }
     finalizeAudioRecording();
     sendAppMessage(clientWs, "session.finished", { sessionId });
     clientWs.close();
   }
 
-  function startSession(message) {
+  async function startSession(message) {
     if (sessionStarted) {
       failSession("ASR session has already started");
       return;
@@ -458,7 +478,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       : 16000;
 
     try {
-      ensureCaptureSession();
+      await ensureCaptureSession();
       providerAdapter = createProviderAdapter(runtimeConfig, { ...message, sessionId });
     } catch (error) {
       // 会话初始化（如捕获会话落库）失败时，将错误透传给客户端而不是抛出
@@ -495,10 +515,11 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     });
 
     targetWs.on("message", (data) => {
+      enqueueMessage(async () => {
       const rawMessage = typeof data === "string" ? data : data.toString();
       const messageFromAsr = parseJsonMessage(rawMessage);
       if (captureSessionId && messageFromAsr) {
-        const accepted = appendCaptureEvent(captureSessionId, messageFromAsr);
+        const accepted = await appendCaptureEvent(captureSessionId, messageFromAsr);
         if (!accepted) {
           failSession("ASR capture event limit exceeded or session expired");
           return;
@@ -543,6 +564,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
         finishRequested = false;
         finishSession();
       }
+      });
     });
 
     targetWs.on("error", (error) => {
@@ -576,6 +598,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   }
 
   clientWs.on("message", (data, isBinary) => {
+    enqueueMessage(async () => {
     if (isBinary) {
       if (!sessionStarted) {
         failSession("Audio received before session.start");
@@ -605,7 +628,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     }
 
     if (message.type === "session.start") {
-      startSession(message);
+      await startSession(message);
       return;
     }
 
@@ -615,6 +638,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     }
 
     failSession(`Unsupported ASR gateway message: ${message.type}`);
+    });
   });
 
   clientWs.on("close", () => {
@@ -633,7 +657,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   });
   });
 
-  function handleUpgrade(req, socket, head) {
+  async function handleUpgrade(req, socket, head) {
     const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     if (requestUrl.pathname !== path) {
       onUnhandledUpgrade?.(req, socket, head);
@@ -647,7 +671,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     }
 
     const devAccountName = devMode ? process.env.DEV_ACTOR_ACCOUNT || "" : "";
-    const authorization = authorizeAsrGatewaySession(
+    const authorization = await authorizeAsrGatewaySession(
       readCookie(req, "meeting_asr_session"),
       devAccountName
     );
@@ -662,11 +686,19 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     });
   }
 
-  server.on("upgrade", handleUpgrade);
+  // upgrade 事件不关心返回值，但 async 处理器的异常必须自己接住（否则 unhandledRejection）。
+  const onUpgrade = (req, socket, head) => {
+    handleUpgrade(req, socket, head).catch((error) => {
+      console.error("[ASR Gateway] upgrade failed:", error);
+      rejectUpgrade(socket, 500, "Internal error");
+    });
+  };
+
+  server.on("upgrade", onUpgrade);
 
   return {
     close: () => {
-      server.off("upgrade", handleUpgrade);
+      server.off("upgrade", onUpgrade);
       wss.close();
     },
   };

@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
-    const llmResults = listMeetingLlmResultSummaries(id);
+    const llmResults = await listMeetingLlmResultSummaries(id);
     if (llmResults === null) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
@@ -26,7 +26,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
       const body = await req.json().catch(() => ({}));
-      const claim = claimMeetingLlmGeneration(id);
+      const claim = await claimMeetingLlmGeneration(id);
       if (!claim.ok) {
         return NextResponse.json({ error: claim.error }, { status: claim.status });
       }
@@ -53,7 +53,7 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       if (!resultId) {
         return NextResponse.json({ error: "resultId query param required" }, { status: 400 });
       }
-      const deleted = deleteMeetingLlmResult(id, resultId);
+      const deleted = await deleteMeetingLlmResult(id, resultId);
       if (!deleted) {
         return NextResponse.json({ error: "Not found" }, { status: 404 });
       }
@@ -72,7 +72,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
       const body = await req.json();
-      const llmResult = updateMeetingLlmResult(id, body.id, {
+      const llmResult = await updateMeetingLlmResult(id, body.id, {
         resultMarkdown: body.resultMarkdown,
         resultTitle: body.resultTitle,
       });
