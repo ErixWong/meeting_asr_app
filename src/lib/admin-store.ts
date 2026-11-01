@@ -566,7 +566,6 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
   },
 };
 
-let dbSeeded = false;
 let seedPromise: Promise<void> | null = null;
 const actorContext = new AsyncLocalStorage<ActorContext>();
 
@@ -581,16 +580,16 @@ const globalForLlmReconcile = globalThis as unknown as { __llmStuckReconciled?: 
  */
 type SqliteRow = Record<string, unknown>;
 
-type AsyncStatement = {
+type AsyncStatement<T = SqliteRow> = {
   run: (...params: unknown[]) => Promise<{ changes?: number; lastInsertRowid?: number | null }>;
-  get: <U = SqliteRow>(...params: unknown[]) => Promise<U | undefined>;
-  all: <U = SqliteRow>(...params: unknown[]) => Promise<U[]>;
+  get: <U = T>(...params: unknown[]) => Promise<U | undefined>;
+  all: <U = T>(...params: unknown[]) => Promise<U[]>;
 };
 
 type AsyncDatabase = {
   exec: (sql: string) => Promise<void>;
-  prepare: <T = SqliteRow>(sql: string) => AsyncStatement;
-  withTransaction: <T>(callback: () => Promise<T>) => Promise<T>;
+  prepare: <T = SqliteRow>(sql: string) => AsyncStatement<T>;
+  withTransaction: <U>(callback: () => Promise<U>) => Promise<U>;
 };
 
 /**
