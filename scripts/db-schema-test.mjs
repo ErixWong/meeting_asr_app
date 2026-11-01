@@ -754,6 +754,36 @@ async function versionRow(db) {
   return { maxVersion: Number(row.max_version), rowCount: Number(row.row_count) };
 }
 
+/**
+ * 生产入口 getDb() 在本方言上必须能初始化 + 冒烟（#54 对 mysql/mssql 的硬要求）。
+ *
+ * 这一步是「测的那条 = 跑的那条」的方言版：`--dialect` 前面的套件走的是脚本自建的
+ * knex + AsyncDb，而这里走的是运行时真正的入口（server/db-shared.mjs 的 getDb()），
+ * 顺带证明 SQLite 专属 PRAGMA 的 `DB_TYPE=sqlite` 条件化是必需的（去掉它 mssql 会挂）。
+ */
+async function runProductionEntryCheck(dbType) {
+  const { getDb, closeDb } = await import("../server/db-shared.mjs");
+  const prodDb = await getDb();
+  try {
+    assert(prodDb.dbType === dbType, `生产入口 dbType 应为 ${dbType}，实际 ${prodDb.dbType}`);
+    const tables = await listTableNames(prodDb);
+    assert(
+      JSON.stringify(tables) === JSON.stringify(EXPECTED_TABLES),
+      `生产入口建表清单不符: ${tables.length} 张 ${tables.join(", ")}`
+    );
+    const version = await versionRow(prodDb);
+    assert(
+      version.rowCount === 1 && version.maxVersion === KNEX_SCHEMA_VERSION,
+      `生产入口版本记账应为单行 v${KNEX_SCHEMA_VERSION}，实际 MAX=${version.maxVersion} COUNT=${version.rowCount}`
+    );
+    console.log(
+      `✅ 生产入口 getDb() 在 ${dbType} 上初始化 OK — ${tables.length} 张表 + 单行 v${KNEX_SCHEMA_VERSION}`
+    );
+  } finally {
+    await closeDb();
+  }
+}
+
 /** 单方言套件：基线建表 → 建索引 → 迁移到 SCHEMA_VERSION → 版本记账单行 → 二次幂等 */
 async function runDialectSuite(db, dbType) {
   const check = (name, condition, detail) => {
@@ -922,6 +952,7 @@ async function mainDialect({ allowSkip = false } = {}) {
     const db = new AsyncDb(knex, dbType);
     await db.knex.raw("SELECT 1");
     await runDialectSuite(db, dbType);
+    await runProductionEntryCheck(dbType);
     console.log(`🎉 方言套件全部通过（db_type=${dbType}）`);
     console.log("RESULT: PASS");
   } catch (error) {
@@ -997,7 +1028,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
 
   const targets = [
     {
-      label: "sqlite（node:sqlite legacy + better-sqlite3 knex）",
+      label: "sqlite（生产入口 getDb() → better-sqlite3，legacy 已退役）",
       jobs: [
         { name: "schema/迁移全量", args: [self], env: {} },
         { name: "语义锁", args: [semanticScript], env: {} },
