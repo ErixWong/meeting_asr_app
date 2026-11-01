@@ -160,6 +160,50 @@ cp backup-xxx.db .docker/data/meeting-asr-app.db
 docker compose restart app
 ```
 
+## 5.1 会议录音（MP3）存储
+
+feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，会议结束后转成 MP3 保存在本地磁盘。设计细节见 `docs/design/meeting-audio-recording.md`。
+
+### 落点
+
+```text
+宿主机 <项目目录>/.docker/data/          ← 容器内 /app/data（compose 已 bind mount）
+├── meeting-asr-app.db                  # 数据库（meeting_audio_recordings 表存元数据）
+└── audio/
+    ├── raw/<captureSessionId>.pcm      # 临时：旁路录制的原始 PCM，转码成功后自动删除
+    └── meetings/<captureSessionId>.mp3 # 正式产物：绑定会议后永久保留
+```
+
+- **音频在本地磁盘，不在数据库里**：SQLite 只存路径（相对 `data` 目录）、字节数、时长、状态。
+- **多实例 / MySQL / MSSQL 部署必须共享卷**：`data/audio` 是本地目录，`DB_TYPE=mysql|mssql` 只是把元数据外置到外部数据库，**音频文件仍在本机**。多个应用实例同时提供服务时，必须把 `data`（或至少 `data/audio`）挂成同一份共享卷（NFS/CIFS/云盘），否则 A 实例录的音在 B 实例上 404。
+- 单实例（默认 compose 形态）零配置，无需改动。
+
+### 容量估算
+
+| 内容 | 体积 | 说明 |
+|:---|:---|:---|
+| 临时原始 PCM | **≈ 115 MB/小时/通道** | 16 kHz × 16 bit × 单声道 = 32 KB/s；双通道翻倍；转码成功后立即删除 |
+| 正式 MP3（48 kbps） | **≈ 21 MB/小时/通道** | 48 kbps × 3600 / 8 ≈ 21.6 MB；码率可在后台「录音配置」调 32/48/64/96/128 |
+| 峰值占用 | ≈ 136 MB/小时/通道 | 录制期间 PCM 与（转码后的）MP3 短暂共存 |
+
+参考：100 场 1 小时双通道会议 ≈ 4.3 GB MP3。**已绑定会议的录音永久保留**（删会议才删文件），规划磁盘时按「一年内不删会议」估算。
+未绑定会议的孤儿录音默认 72 小时后由后台定时任务清理（后台「录音配置」可调 1..8760 小时）。
+
+### 备份与迁移
+
+- 备份数据库的同时**必须一并备份 `data/audio/`**，否则恢复后会议详情里的播放器会 404（DB 行还在、文件没了）。最小可用备份：
+  ```bash
+  cp -a .docker/data/meeting-asr-app.db backup-$(date +%F).db
+  tar czf backup-audio-$(date +%F).tar.gz -C .docker/data audio
+  ```
+- 换部署机迁移时，源码 + `.env` + `.docker/data`（**含 `audio/`**）三者一并迁移。
+- `.docker/data/audio` 以 root 写入（容器以 root 运行），宿主机侧清理时注意权限。
+
+### 开关与回滚
+
+- 后台「录音配置」→ 关闭「服务端旁路录制会议音频」后，**新会议**不再落盘；已录好的音频不受影响。开关值存 `app_settings.audio:record_enabled`。
+- 若需彻底停止录音能力，关闭开关即可；`data/audio` 中的既有文件可手工删除（DB 行残留会在详情页表现为 404，删除会议可连带清行）。
+
 ## 6. 安全注意事项
 
 - **必须**设置 `BOOTSTRAP_ADMIN_PASSWORD`，默认 `admin123` 仅限开发。
@@ -176,4 +220,6 @@ docker compose restart app
 | 页面能打开，但录音/转写 WebSocket 失败 | `ASR_GATEWAY_ALLOWED_ORIGINS` 未包含实际 Origin |
 | 修改代码后不生效 | 容器启动时自动检测源码并重建，直接执行 `docker compose restart app`；若仍未生效，确认 `docker-compose.yml` 已是最新（`docker compose up -d` 应用新配置） |
 | 需要彻底重置（重装依赖 + 重新构建） | `docker compose down` 后清空 `.docker/node_modules` 与 `.docker/.next` 再 `up -d` |
-| 换部署机迁移 | 源码 + `.env` + `.docker/data`（数据库）三者一并迁移即可 |
+| 换部署机迁移 | 源码 + `.env` + `.docker/data`（数据库 + `audio/`）三者一并迁移即可 |
+| 会议详情里播放器 404 / 没有录音 | ① 后台「录音配置」开关是否关闭；② `data/audio/meetings/` 是否有对应 mp3（迁移时漏了 `audio/` 目录最常见）；③ 转码失败时 DB 行 `status=failed`，`error_message` 记录原因且 `.pcm` 保留 |
+| 磁盘被音频占满 | 调小 `audio:bitrate_kbps`、删除不需要的会议（连带删文件）、缩短 `audio:orphan_ttl_hours`；注意已绑定会议的录音不会自动过期 |
