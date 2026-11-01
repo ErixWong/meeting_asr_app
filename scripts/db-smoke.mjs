@@ -11,6 +11,10 @@
  *   2. 建临时表 / 插入 / 查询 / 更新
  *   3. upsert（onConflict().ignore()）—— knex 跨库方言的关键能力
  *   4. 删除临时表
+ *
+ * ⚠ 脚本入口必须自己关连接池（`db.destroy()`）：不关的话进程不会退出（池里挂着句柄），
+ * 只能靠外部 kill —— cron / CI 里就是「任务永远跑不完」。本脚本在 finally 里 destroy，
+ * 断言方式是 `timeout 60 node scripts/db-smoke.mjs` 自行退出且退出码 0。
  */
 import { getDbType, createKnexInstance } from "../server/db/index.mjs";
 import { insertIgnore } from "../server/db/insert-ignore.mjs";
@@ -66,7 +70,7 @@ async function main() {
 
     console.log(`[smoke] ✅ 全部通过 (db_type=${dbType})`);
   } finally {
-    // 6. 清理
+    // 6. 清理 + 关池（脚本入口必须自己释放连接池，否则进程不退出）
     await db.schema.dropTableIfExists(TABLE).catch(() => {});
     await db.destroy().catch(() => {});
   }
