@@ -136,6 +136,128 @@ function polluteLegacyVersion(database, versions) {
   }
 }
 
+// ==================== 事务并发回归（issue #54，§4.6.1 / §4.6.2） ====================
+//
+// AsyncDb 的事务状态原本是**实例级可变状态**（`this.knex = trx` / `_txDepth`）。同步
+// 驱动时代所有事务天然串行，缺陷看不出来；异步化后同一实例上的并发事务会互踩：
+// 后进入者把 `this.knex` 改写成自己的 trx，先退出者又指回自己的 outerKnex ⇒ 语句
+// 可能落在事务之外却仍返回「成功」，或 savepoint 名撞车报 `no such savepoint: sp_1`。
+//
+// 本套件真跑（不是源码级断言）四条：
+//   A 两个并发顶层事务：都提交、互不丢失、不报 savepoint 错
+//   B 并发下的嵌套事务：内层抛错只回滚内层，外层与另一个事务照常提交
+//   C（sqlite）事务回滚不吞掉并发的非事务写入（单连接语义保持）
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runTransactionConcurrencySuite(db, dbType) {
+  const check = (name, condition, detail) => {
+    if (!condition) throw new Error(`${name} 失败: ${detail}`);
+    console.log(`✅ ${name}${detail ? ` — ${detail}` : ""}`);
+  };
+  const describeError = (error) =>
+    error instanceof Error ? error.message : String(error);
+
+  await db.knex.schema.dropTableIfExists("tx_probe");
+  await db.knex.schema.createTable("tx_probe", (t) => {
+    t.string("id", 64).primary();
+    t.string("tag", 32).notNullable();
+  });
+
+  const ids = async () =>
+    (await db.prepare("SELECT id FROM tx_probe ORDER BY id").all()).map((row) => String(row.id));
+
+  try {
+    // --- A. 两个并发顶层事务 ---
+    await db.prepare("DELETE FROM tx_probe").run();
+    let concurrentError = null;
+    try {
+      await Promise.all([
+        db.withTransaction(async () => {
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a1", "A");
+          await sleep(20);
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("a2", "A");
+        }),
+        db.withTransaction(async () => {
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b1", "B");
+          await sleep(20);
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("b2", "B");
+        }),
+      ]);
+    } catch (error) {
+      concurrentError = error;
+    }
+    const afterConcurrent = await ids();
+    check(
+      "并发两个顶层事务：都提交且互不丢失（无 savepoint 冲突）",
+      concurrentError === null &&
+        JSON.stringify(afterConcurrent) === JSON.stringify(["a1", "a2", "b1", "b2"]),
+      concurrentError
+        ? `抛错 ${describeError(concurrentError)}`
+        : `行 ${JSON.stringify(afterConcurrent)}`
+    );
+
+    // --- B. 并发下的嵌套：内层抛错只回滚内层 ---
+    await db.prepare("DELETE FROM tx_probe").run();
+    let nestedError = null;
+    try {
+      await Promise.all([
+        db.withTransaction(async () => {
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-outer", "C");
+          try {
+            await db.withTransaction(async () => {
+              await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-inner", "C");
+              throw new Error("inner-rollback");
+            });
+          } catch {
+            // 内层异常被外层吞掉 → 外层应提交，内层那行必须已回滚
+          }
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("c-after", "C");
+        }),
+        db.withTransaction(async () => {
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("d-1", "D");
+        }),
+      ]);
+    } catch (error) {
+      nestedError = error;
+    }
+    const afterNested = await ids();
+    check(
+      "并发下嵌套事务：内层抛错只回滚内层、外层与另一事务照常提交",
+      nestedError === null &&
+        JSON.stringify(afterNested) === JSON.stringify(["c-after", "c-outer", "d-1"]),
+      nestedError
+        ? `抛错 ${describeError(nestedError)}`
+        : `行 ${JSON.stringify(afterNested)}（c-inner 应被回滚）`
+    );
+
+    // --- C. 事务回滚不吞掉并发的非事务写入（sqlite 单连接语义保持）---
+    if (dbType === "sqlite") {
+      await db.prepare("DELETE FROM tx_probe").run();
+      const rollbackTx = db
+        .withTransaction(async () => {
+          await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("tx-doomed", "T");
+          await sleep(30);
+          throw new Error("rollback-whole");
+        })
+        .catch(() => "rolled-back");
+      const outsideWrite = (async () => {
+        await sleep(5);
+        await db.prepare("INSERT INTO tx_probe (id, tag) VALUES (?, ?)").run("outside-1", "X");
+      })();
+      const [, txOutcome] = await Promise.all([outsideWrite, rollbackTx]);
+      const afterRollback = await ids();
+      check(
+        "事务回滚不吞掉并发的非事务写入（sqlite 单连接）",
+        txOutcome === "rolled-back" &&
+          JSON.stringify(afterRollback) === JSON.stringify(["outside-1"]),
+        `行 ${JSON.stringify(afterRollback)}（tx-doomed 应回滚，outside-1 应保留）`
+      );
+    }
+  } finally {
+    await db.knex.schema.dropTableIfExists("tx_probe");
+  }
+}
+
 async function main() {
   assertSameSchemaVersion();
   console.log(`[info] SCHEMA_VERSION = ${LEGACY_SCHEMA_VERSION}（两条路径一致）`);
@@ -209,6 +331,10 @@ async function main() {
     `场景5: 并发初始化不应重复跑 v${LEGACY_SCHEMA_VERSION}，实际 ${JSON.stringify(appliedLogs(logs5))}`
   );
   console.log("✅ 场景5 并发两次 initializeSchema: 单行、无重复迁移、无 savepoint 崩溃");
+
+  // --- 场景 5b：事务并发回归（issue #54，串行化语义）---
+  await runTransactionConcurrencySuite(db, "sqlite");
+  console.log("✅ 场景5b 事务并发回归（sqlite）: 并发事务不互踩、内层回滚不伤外层");
 
   await db.knex.destroy();
 
@@ -563,6 +689,9 @@ async function runDialectSuite(db, dbType) {
       version.maxVersion === KNEX_SCHEMA_VERSION,
     `日志 ${applied3.length} 条, 单行 v${version.maxVersion}`
   );
+
+  // --- 3b. 事务并发回归（issue #54）：三库都跑 ---
+  await runTransactionConcurrencySuite(db, dbType);
 
   // --- 4. 嵌套事务语义（MSSQL 分支走 knex.transaction 后必须真测） ---
   //    已知缺口：sqlite/mysql 的嵌套 savepoint 有独立缺陷（_txDepth 实例级 +

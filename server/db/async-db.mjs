@@ -13,6 +13,7 @@
  * 内部通过 knex.raw() 执行，`?` 占位符由 knex 自动翻译为各库绑定语法
  * （SQLite ? / MySQL ? / MSSQL @p0），结果形态差异在此统一消化。
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getKnex, getDbType } from "./index.mjs";
 
 /** 从 knex.raw 返回结果中提取行数组（三库结构差异统一） */
@@ -47,40 +48,91 @@ export function extractRunInfo(result) {
 /**
  * Promise 化 prepared-statement 风格的数据库句柄。
  * 每个实例绑定一个 knex 连接池，支持嵌套事务（savepoint，分方言）。
+ *
+ * 并发语义（issue #54）：同一实例上的事务**串行化**（`_serialize`），事务深度
+ * 记录在 AsyncLocalStorage 里（`_txContext`，按异步上下文隔离）。
+ *
+ * 为什么必须这样：`AsyncDb` 的事务状态原本是实例级可变状态（`this.knex = trx`、
+ * `_txDepth`），同步驱动时代天然串行所以看不出来；改成异步之后，两个并发请求会在
+ * 同一实例上同时开事务——后进入者会把 `this.knex` 改写成自己的 `trx`，先退出者又
+ * 把它指回自己的 `outerKnex`，于是部分语句落在事务之外却仍然「成功」。串行化是
+ * 今天同步运行时等价语义的最小实现；终解是把 `trx` 显式穿透到调用点（归 #55）。
+ *
+ * 另：SQLite（pool max=1，单连接）下事务未提交时，**其他请求的普通语句会落进这个
+ * 事务**（同一个连接）。为了保持「同步驱动时代语句不会插进别人事务」的语义，
+ * sqlite 的语句执行也走同一把锁（事务内直接放行，靠 `_txContext` 判重入）。
  */
 export class AsyncDb {
   constructor(knex = getKnex(), dbType = getDbType()) {
     this.knex = knex;
     this.dbType = dbType;
-    this._txDepth = 0;
+    /** 事务/语句串行化队列尾（同一个 Promise 链，先进先执行） */
+    this._lockTail = Promise.resolve();
+    /** 当前异步上下文的事务深度（0/1/2…），替代原来的实例级 `_txDepth` */
+    this._txContext = new AsyncLocalStorage();
+  }
+
+  /** 当前异步上下文的事务深度（0 = 不在事务里） */
+  get transactionDepth() {
+    return this._txContext.getStore() ?? 0;
+  }
+
+  /** 取实例级串行锁（先到先执行，后到排队） */
+  async _serialize(fn) {
+    const previous = this._lockTail;
+    let release;
+    this._lockTail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * 语句级串行化：只有 SQLite（单连接）需要；事务内的语句直接放行（同一连接，
+   * 重入加锁会自锁）。mysql/mssql 连接池 > 1，语句不会落在别人的事务连接上。
+   */
+  async _serializeStatement(fn) {
+    if (this.dbType !== "sqlite") return fn();
+    if (this.transactionDepth > 0) return fn();
+    return this._serialize(fn);
   }
 
   async exec(sql) {
-    await this.knex.raw(sql);
+    await this._serializeStatement(() => this.knex.raw(sql));
   }
 
   prepare(sql) {
     const knex = this.knex;
+    const query = (params) =>
+      this._serializeStatement(async () =>
+        knex.raw(sql, params.length > 0 ? params : undefined)
+      );
     return {
-      all: async (...params) =>
-        extractRows(await knex.raw(sql, params.length > 0 ? params : undefined)),
-      get: async (...params) =>
-        extractRows(await knex.raw(sql, params.length > 0 ? params : undefined))[0] ?? null,
-      run: async (...params) =>
-        extractRunInfo(await knex.raw(sql, params.length > 0 ? params : undefined)),
+      all: async (...params) => extractRows(await query(params)),
+      get: async (...params) => extractRows(await query(params))[0] ?? null,
+      run: async (...params) => extractRunInfo(await query(params)),
     };
   }
 
   /**
    * 嵌套事务：顶层 BEGIN/COMMIT；嵌套层用 savepoint。
    * MSSQL 使用 SAVE/ROLLBACK TRANSACTION 语法，其余库用标准 SAVEPOINT。
+   *
+   * 顶层事务在同一实例上排队执行（串行化）；嵌套层不排队（它本来就在外层事务
+   * 的异步上下文里，排队会和外层互锁），只按上下文深度取 savepoint 名。
    */
   async withTransaction(callback) {
-    if (this._txDepth > 0) {
-      const name = `sp_${this._txDepth}`;
+    const depth = this.transactionDepth;
+    if (depth > 0) {
+      const name = `sp_${depth}`;
       await this._savepoint(name);
       try {
-        const result = await callback();
+        const result = await this._txContext.run(depth + 1, () => callback());
         await this._releaseSavepoint(name);
         return result;
       } catch (error) {
@@ -89,7 +141,11 @@ export class AsyncDb {
       }
     }
 
-    this._txDepth = 1;
+    return this._serialize(() => this._txContext.run(1, () => this._runTopLevelTransaction(callback)));
+  }
+
+  /** 顶层事务本体（调用方已持有串行锁、上下文深度 = 1） */
+  async _runTopLevelTransaction(callback) {
     if (this.dbType === "mssql") {
       // MSSQL 不能用 knex.raw("BEGIN")：knex 的 mssql 方言把语句交给 sp_executesql，
       // 语句内开启事务会让 SQL Server 在过程返回时发现 @@TRANCOUNT 前后不一致，
@@ -101,18 +157,16 @@ export class AsyncDb {
       // （knex.transaction 绑定单连接，池里另取连接会跑在事务之外）。
       // sqlite / mysql 分支不经过这里，下发的 SQL 文本与改动前逐字节一致。
       const outerKnex = this.knex;
-      try {
-        return await outerKnex.transaction(async (trx) => {
-          this.knex = trx;
-          try {
-            return await callback();
-          } finally {
-            this.knex = outerKnex;
-          }
-        });
-      } finally {
-        this._txDepth = 0;
-      }
+      // 事务期间 this.knex 指向 trx，退出时在回调的 finally 里还原；串行锁保证同一
+      // 实例同一时刻只有一个顶层事务，所以这里的还原不会覆盖别人的 trx。
+      return await outerKnex.transaction(async (trx) => {
+        this.knex = trx;
+        try {
+          return await callback();
+        } finally {
+          this.knex = outerKnex;
+        }
+      });
     }
     await this.knex.raw("BEGIN");
     try {
@@ -122,8 +176,6 @@ export class AsyncDb {
     } catch (error) {
       await this.knex.raw("ROLLBACK");
       throw error;
-    } finally {
-      this._txDepth = 0;
     }
   }
 
