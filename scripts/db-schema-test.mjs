@@ -1,11 +1,16 @@
 /**
- * schema 初始化/迁移验证（sqlite）
+ * schema 初始化/迁移验证（sqlite 全量 + 三库方言矩阵）
  *
- * 覆盖两条实现路径（issue #51 的教训：判据必须打到生产实际入口）：
+ * 三种运行模式：
+ *   node scripts/db-schema-test.mjs              # sqlite 全量（默认；两种驱动都跑）
+ *   node scripts/db-schema-test.mjs --dialect    # 单方言「基线→迁移→记账」套件（DB_TYPE 决定目标）
+ *   node scripts/db-schema-test.mjs --matrix     # 三库矩阵：sqlite(两驱动) + mariadb + mssql 各跑一遍
+ *
+ * 默认模式覆盖两条实现路径（issue #51 的教训：判据必须打到生产实际入口）：
  *   - legacy 路径：server/database-schema.mjs 的 initializeDatabase()
- *     —— 生产实际入口，经 server/db-shared.mjs 的 getDb() 调用
+ *     —— 生产实际入口，经 server/db-shared.mjs 的 getDb() 调用（驱动 node:sqlite）
  *   - knex 路径：server/db/schema.mjs 的 initializeSchema()
- *     —— 脚本/新基建入口，与 legacy 必须保持同一版本号、同一效果
+ *     —— 脚本/新基建入口，与 legacy 必须保持同一版本号、同一效果（驱动 better-sqlite3）
  *
  * 场景：
  *   1. 全新库初始化（knex）→ 16 张表 + schema_version = SCHEMA_VERSION（单行）
@@ -16,10 +21,18 @@
  *   6. 生产入口（legacy getDb()）：连续两次 → 单行、第二次无 Migration applied
  *   7. 被污染库（legacy）：[2,3,3] / [2,2] → 收敛成单行 = SCHEMA_VERSION（v3 重复执行不报错）
  *   8. 并发两次初始化（legacy）：两个连接 Promise.all → 单行
+ *
+ * --dialect / --matrix 的库生命周期与安全边界：
+ *   mysql / mssql 只允许建/删名字以 `meeting_asr_ci_` 开头的一次性库（共享实例红线），
+ *   跑完 DROP；目标库不可达时打印 SKIP 原因并以退出码 3 结束（不许静默假绿）。
  */
-import { createKnexInstance } from "../server/db/index.mjs";
-import { AsyncDb, listTableColumns } from "../server/db/async-db.mjs";
-import { initializeSchema, SCHEMA_VERSION as KNEX_SCHEMA_VERSION } from "../server/db/schema.mjs";
+import { createKnexInstance, getDbType } from "../server/db/index.mjs";
+import { AsyncDb, extractRows, listTableColumns } from "../server/db/async-db.mjs";
+import {
+  INDEXES,
+  initializeSchema,
+  SCHEMA_VERSION as KNEX_SCHEMA_VERSION,
+} from "../server/db/schema.mjs";
 import {
   initializeDatabase,
   SCHEMA_VERSION as LEGACY_SCHEMA_VERSION,
@@ -28,6 +41,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { spawn } from "child_process";
+import { fileURLToPath } from "url";
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`断言失败: ${msg}`);
@@ -362,7 +377,416 @@ async function main() {
   console.log("🎉 schema 验证全部通过");
 }
 
-main().catch((e) => {
-  console.error("❌", e);
-  process.exit(1);
-});
+// ==================== 三库脚手架（--dialect / --matrix） ====================
+
+/** 一次性测试库命名前缀（共享实例红线：只准碰 meeting_asr_ci_*） */
+export const CI_DB_PREFIX = "meeting_asr_ci_";
+
+/** 期望的基线表清单（createTables 产出，含 schema_version） */
+const EXPECTED_TABLES = [
+  "app_settings", "asr_capture_events", "asr_capture_sessions", "asr_hotwords",
+  "audit_logs", "auth_sessions", "llm_prompt_templates", "meeting_asr_results",
+  "meeting_llm_results", "meeting_send_records", "meetings", "roles",
+  "schema_version", "user_roles", "users", "meeting_audio_recordings",
+].sort();
+
+export function assertSafeDbName(name) {
+  if (!name.startsWith(CI_DB_PREFIX)) {
+    throw new Error(
+      `拒绝操作库 ${name}：三库脚手架只允许建/删 ${CI_DB_PREFIX}* 的一次性库（共享实例红线）`
+    );
+  }
+}
+
+/** 用同一套连接参数连到管理库（mssql: master / mysql: mysql）执行一句 DDL */
+async function withAdminKnex(dbType, fn) {
+  const target = process.env.DB_NAME;
+  process.env.DB_NAME = dbType === "mysql" ? "mysql" : "master";
+  const adminKnex = createKnexInstance(dbType);
+  try {
+    return await fn(adminKnex);
+  } finally {
+    process.env.DB_NAME = target;
+    await adminKnex.destroy().catch(() => {});
+  }
+}
+
+export async function createThrowawayDatabase(dbType, dbName) {
+  assertSafeDbName(dbName);
+  await withAdminKnex(dbType, (knex) =>
+    knex.raw(
+      dbType === "mysql"
+        ? `CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4`
+        : `CREATE DATABASE [${dbName}]`
+    )
+  );
+}
+
+export async function dropThrowawayDatabase(dbType, dbName) {
+  if (!dbName.startsWith(CI_DB_PREFIX)) return;
+  await withAdminKnex(dbType, (knex) =>
+    knex.raw(
+      dbType === "mysql"
+        ? `DROP DATABASE IF EXISTS \`${dbName}\``
+        : `DROP DATABASE IF EXISTS [${dbName}]`
+    )
+  );
+}
+
+/** 跨库表清单（替代 sqlite_master） */
+async function listTableNames(db) {
+  if (db.dbType === "sqlite") {
+    const rows = await db.knex.raw(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    );
+    return extractRows(rows).map((row) => String(row.name)).sort();
+  }
+  if (db.dbType === "mysql") {
+    const rows = await db.knex.raw(
+      "SELECT TABLE_NAME AS name FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()"
+    );
+    return extractRows(rows).map((row) => String(row.name)).sort();
+  }
+  const rows = await db.knex.raw(
+    "SELECT TABLE_NAME AS name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
+  );
+  return extractRows(rows).map((row) => String(row.name)).sort();
+}
+
+/** 跨库索引清单（替代 sqlite_master 的 type='index'） */
+async function listIndexNames(db) {
+  if (db.dbType === "sqlite") {
+    const rows = await db.knex.raw(
+      "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+    );
+    return extractRows(rows).map((row) => String(row.name)).sort();
+  }
+  if (db.dbType === "mysql") {
+    const rows = await db.knex.raw(
+      `SELECT DISTINCT INDEX_NAME AS name FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND INDEX_NAME LIKE 'idx_%'`
+    );
+    return extractRows(rows).map((row) => String(row.name)).sort();
+  }
+  // 注意：sys.indexes 里还有 sys schema 内部表的索引（idx_groupid/idx_lcid/…），
+  // 必须 JOIN sys.tables 才只看业务表（实测不 join 会多出 4 条）。
+  const rows = await db.knex.raw(
+    `SELECT i.name AS name FROM sys.indexes i
+     JOIN sys.tables t ON t.object_id = i.object_id
+     WHERE i.name LIKE 'idx_%'`
+  );
+  return extractRows(rows).map((row) => String(row.name)).sort();
+}
+
+async function versionRow(db) {
+  const row = await db
+    .prepare("SELECT MAX(version) AS max_version, COUNT(*) AS row_count FROM schema_version")
+    .get();
+  return { maxVersion: Number(row.max_version), rowCount: Number(row.row_count) };
+}
+
+/** 单方言套件：基线建表 → 建索引 → 迁移到 SCHEMA_VERSION → 版本记账单行 → 二次幂等 */
+async function runDialectSuite(db, dbType) {
+  const check = (name, condition, detail) => {
+    if (!condition) throw new Error(`${name} 失败: ${detail}`);
+    console.log(`✅ ${name}${detail ? ` — ${detail}` : ""}`);
+  };
+
+  // --- 1. 基线建表 + 建索引 + 迁移收敛 + 版本记账单行 ---
+  await initializeSchema(db);
+  const tables = await listTableNames(db);
+  check(
+    "基线建表 16 张表齐全",
+    JSON.stringify(tables) === JSON.stringify(EXPECTED_TABLES),
+    `${tables.length} 张: ${tables.join(", ")}`
+  );
+
+  const indexes = await listIndexNames(db);
+  const missingIndexes = INDEXES.map((index) => index.name).filter(
+    (name) => !indexes.includes(name)
+  );
+  check(
+    "建索引 12 条齐全",
+    missingIndexes.length === 0,
+    missingIndexes.length ? `缺: ${missingIndexes.join(", ")}` : `${indexes.length} 条`
+  );
+
+  const audioColumns = await listTableColumns(db, "meeting_audio_recordings");
+  check(
+    "列探测（listTableColumns）跨库可用",
+    audioColumns.length === 15,
+    `meeting_audio_recordings ${audioColumns.length} 列`
+  );
+
+  let version = await versionRow(db);
+  check(
+    "迁移到 SCHEMA_VERSION + 版本记账单行",
+    version.rowCount === 1 && version.maxVersion === KNEX_SCHEMA_VERSION,
+    `MAX(version)=${version.maxVersion}, COUNT(*)=${version.rowCount}`
+  );
+
+  // --- 2. 二次幂等：不得重复迁移、表/索引集合不变 ---
+  const tablesBefore = JSON.stringify(tables);
+  const indexesBefore = JSON.stringify(indexes);
+  const logs2 = await captureLogs(() => initializeSchema(db));
+  check(
+    "二次幂等：无 Migration applied",
+    appliedLogs(logs2).length === 0,
+    appliedLogs(logs2).length ? JSON.stringify(appliedLogs(logs2)) : "0 条"
+  );
+  check(
+    "二次幂等：表/索引集合不变",
+    JSON.stringify(await listTableNames(db)) === tablesBefore &&
+      JSON.stringify(await listIndexNames(db)) === indexesBefore,
+    "结构未变"
+  );
+
+  // --- 3. 真实迁移循环：污染 [2,2] → 重跑 v3 + v4 → 单行 ---
+  await db.prepare("DELETE FROM schema_version").run();
+  for (const value of [2, 2]) {
+    await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(value);
+  }
+  const logs3 = await captureLogs(() => initializeSchema(db));
+  version = await versionRow(db);
+  const applied3 = appliedLogs(logs3);
+  check(
+    "迁移循环 v3+v4 重跑（含事务内的记账写入）",
+    applied3.some((line) => line.includes("v3")) &&
+      applied3.some((line) => line.includes(`v${KNEX_SCHEMA_VERSION}`)) &&
+      version.rowCount === 1 &&
+      version.maxVersion === KNEX_SCHEMA_VERSION,
+    `日志 ${applied3.length} 条, 单行 v${version.maxVersion}`
+  );
+
+  // --- 4. 嵌套事务语义（MSSQL 分支走 knex.transaction 后必须真测） ---
+  //    已知缺口：sqlite/mysql 的嵌套 savepoint 有独立缺陷（_txDepth 实例级 +
+  //    ROLLBACK TO SAVEPOINT sp_1），登记在 docs/design/db-dialect-portability.md，
+  //    归 #55 修，本单不碰 ⇒ 嵌套断言只在 mssql 上跑。
+  if (dbType === "mssql") {
+    await db.prepare("DELETE FROM schema_version").run();
+    await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(KNEX_SCHEMA_VERSION);
+
+    // 4a. 内层失败只回滚到内层，外层照常提交
+    await db.withTransaction(async () => {
+      await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(10);
+      try {
+        await db.withTransaction(async () => {
+          await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(11);
+          throw new Error("inner-rollback");
+        });
+      } catch {
+        // 内层异常在外层被吞掉 → 外层应提交
+      }
+      await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(12);
+    });
+    const afterInner = (
+      await db.prepare("SELECT version FROM schema_version ORDER BY version").all()
+    ).map((row) => Number(row.version));
+    check(
+      "嵌套事务：内层失败只回滚内层（外层提交）",
+      JSON.stringify(afterInner) === JSON.stringify([KNEX_SCHEMA_VERSION, 10, 12]),
+      `剩余行 ${JSON.stringify(afterInner)}（11 应被回滚掉）`
+    );
+
+    // 4b. 内层抛错穿透外层 → 整体回滚
+    await db.prepare("DELETE FROM schema_version").run();
+    await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(KNEX_SCHEMA_VERSION);
+    let outerThrew = false;
+    try {
+      await db.withTransaction(async () => {
+        await db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(20);
+        await db.withTransaction(async () => {
+          throw new Error("inner-propagate");
+        });
+      });
+    } catch {
+      outerThrew = true;
+    }
+    const afterOuter = (
+      await db.prepare("SELECT version FROM schema_version ORDER BY version").all()
+    ).map((row) => Number(row.version));
+    check(
+      "嵌套事务：内层抛错穿透后外层整体回滚",
+      outerThrew && JSON.stringify(afterOuter) === JSON.stringify([KNEX_SCHEMA_VERSION]),
+      `剩余行 ${JSON.stringify(afterOuter)}（20 应被回滚掉）`
+    );
+  }
+}
+
+/** --dialect：单方言套件（DB_TYPE 决定目标；mysql/mssql 自建自删一次性库） */
+async function mainDialect() {
+  const dbType = getDbType();
+  console.log(`[dialect] 目标方言 db_type=${dbType}`);
+  let tempDir = null;
+  let dbName = null;
+  let knex = null;
+
+  if (dbType === "sqlite") {
+    tempDir = mkdtempSync(join(tmpdir(), "db-dialect-test-"));
+    process.env.SQLITE_PATH = join(tempDir, "dialect.db");
+    console.log(`[dialect] sqlite 临时库: ${process.env.SQLITE_PATH}`);
+  } else {
+    dbName = `${CI_DB_PREFIX}schema_${Date.now().toString(36)}_${process.pid}`;
+    process.env.DB_NAME = dbName;
+    console.log(`[dialect] 一次性库: ${dbName}`);
+    try {
+      await createThrowawayDatabase(dbType, dbName);
+    } catch (error) {
+      console.log(
+        `SKIP: 目标库不可达或建库失败（db_type=${dbType}, db=${dbName}）: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      console.log("RESULT: SKIP");
+      process.exitCode = 3;
+      return;
+    }
+  }
+
+  try {
+    knex = createKnexInstance(dbType);
+    const db = new AsyncDb(knex, dbType);
+    await db.knex.raw("SELECT 1");
+    await runDialectSuite(db, dbType);
+    console.log(`🎉 方言套件全部通过（db_type=${dbType}）`);
+    console.log("RESULT: PASS");
+  } catch (error) {
+    console.error("❌", error instanceof Error ? error.message : error);
+    console.log("RESULT: FAIL");
+    process.exitCode = 1;
+  } finally {
+    if (knex) await knex.destroy().catch(() => {});
+    if (dbName) {
+      await dropThrowawayDatabase(dbType, dbName).catch((error) => {
+        console.error(`[dialect] DROP 失败: ${error.message}`);
+        process.exitCode = 1;
+      });
+      console.log(`[dialect] 已 DROP 一次性库 ${dbName}`);
+    }
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+/** 子进程执行（矩阵用）：捕获输出，按退出码归类 PASS/SKIP/FAIL */
+function runChild(args, env) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const child = spawn(process.execPath, args, {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const lines = [];
+    const collect = (chunk) => {
+      for (const line of String(chunk).split("\n")) {
+        if (line.trim()) {
+          lines.push(line);
+          console.log(`    │ ${line}`);
+        }
+      }
+    };
+    child.stdout.on("data", collect);
+    child.stderr.on("data", collect);
+    child.on("close", (code) => {
+      const verdict = code === 0 ? "PASS" : code === 3 ? "SKIP" : "FAIL";
+      const skipLine = lines.find((line) => line.startsWith("SKIP:"));
+      resolve({
+        verdict,
+        code,
+        seconds: ((Date.now() - started) / 1000).toFixed(1),
+        reason: skipLine ? skipLine.replace(/^SKIP:\s*/, "") : null,
+      });
+    });
+  });
+}
+
+/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件与语义锁 */
+async function mainMatrix() {
+  const self = fileURLToPath(import.meta.url);
+  const semanticScript = join(process.cwd(), "scripts", "db-semantic-test.mjs");
+  const mysqlPassword = process.env.CI_MYSQL_PASSWORD || "";
+  const mssqlPassword = process.env.CI_MSSQL_PASSWORD || "";
+  const mysqlEnv = {
+    DB_TYPE: "mysql",
+    DB_HOST: process.env.CI_MYSQL_HOST || "mariadb",
+    DB_PORT: process.env.CI_MYSQL_PORT || "3306",
+    DB_USER: process.env.CI_MYSQL_USER || "root",
+    DB_PASSWORD: mysqlPassword,
+  };
+  const mssqlEnv = {
+    DB_TYPE: "mssql",
+    DB_HOST: process.env.CI_MSSQL_HOST || "host.docker.internal",
+    DB_PORT: process.env.CI_MSSQL_PORT || "1433",
+    DB_USER: process.env.CI_MSSQL_USER || "sa",
+    DB_PASSWORD: mssqlPassword,
+  };
+
+  const targets = [
+    {
+      label: "sqlite（node:sqlite legacy + better-sqlite3 knex）",
+      jobs: [
+        { name: "schema/迁移全量", args: [self], env: {} },
+        { name: "语义锁", args: [semanticScript], env: {} },
+      ],
+    },
+    {
+      label: `mariadb（${mysqlEnv.DB_HOST}:${mysqlEnv.DB_PORT}）`,
+      jobs: [
+        { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mysqlEnv },
+        { name: "语义锁", args: [semanticScript], env: mysqlEnv },
+      ],
+    },
+    {
+      label: `mssql（${mssqlEnv.DB_HOST}:${mssqlEnv.DB_PORT}）`,
+      jobs: [
+        { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mssqlEnv },
+        { name: "语义锁", args: [semanticScript], env: mssqlEnv },
+      ],
+    },
+  ];
+
+  const summary = [];
+  for (const target of targets) {
+    console.log(`\n[matrix] ===== ${target.label} =====`);
+    for (const job of target.jobs) {
+      console.log(`[matrix] ▶ ${job.name}`);
+      const result = await runChild(job.args, job.env);
+      summary.push({ target: target.label, job: job.name, ...result });
+      console.log(`[matrix] ◀ ${job.name}: ${result.verdict}（${result.seconds}s）`);
+    }
+  }
+
+  console.log("\n[matrix] ===== 汇总 =====");
+  for (const item of summary) {
+    const reason = item.reason ? ` — ${item.reason}` : "";
+    console.log(
+      `${item.verdict === "PASS" ? "✅" : item.verdict === "SKIP" ? "⏭" : "❌"} ${item.target} / ${item.job}: ${item.verdict}（${item.seconds}s）${reason}`
+    );
+  }
+  const failed = summary.filter((item) => item.verdict === "FAIL");
+  const skipped = summary.filter((item) => item.verdict === "SKIP");
+  console.log(
+    `[matrix] ${summary.length} 项：PASS ${summary.length - failed.length - skipped.length} / SKIP ${skipped.length} / FAIL ${failed.length}`
+  );
+  if (failed.length > 0) {
+    process.exitCode = 1;
+  } else if (skipped.length > 0) {
+    console.log("[matrix] 注意：存在 SKIP 项（目标库不可达），见上方原因，未覆盖的方言不算通过");
+  }
+}
+
+const invokedDirectly =
+  process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (invokedDirectly) {
+  const mode = process.argv.includes("--matrix")
+    ? mainMatrix
+    : process.argv.includes("--dialect")
+      ? mainDialect
+      : main;
+  mode().catch((e) => {
+    console.error("❌", e);
+    console.log("RESULT: FAIL");
+    process.exit(1);
+  });
+}
