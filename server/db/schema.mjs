@@ -61,7 +61,7 @@ function defineMeetingLlmResultsTable(t) {
   t.string("created_at", 32).notNullable();
   t.unique(["meeting_id", "version_no"]);
   t.foreign("meeting_id").references("meetings.id").onDelete("CASCADE");
-  t.foreign("prompt_template_id").references("llm_prompt_templates.id").onDelete("RESTRICT");
+  t.foreign("prompt_template_id").references("llm_prompt_templates.id").onDelete("NO ACTION");
 }
 
 function defineMeetingSendRecordsTable(t) {
@@ -83,7 +83,7 @@ function defineMeetingSendRecordsTable(t) {
   t.string("created_at", 32).notNullable();
   t.string("sent_at", 32).nullable();
   t.foreign("meeting_llm_result_id").references("meeting_llm_results.id").onDelete("CASCADE");
-  t.foreign("sent_by_user_id").references("users.id").onDelete("RESTRICT");
+  t.foreign("sent_by_user_id").references("users.id").onDelete("NO ACTION");
 }
 
 // ---------- 初始化 ----------
@@ -183,7 +183,7 @@ export async function createTables(db) {
     t.string("created_by_user_email", 255).nullable();
     t.string("created_at", 32).notNullable();
     t.string("updated_at", 32).notNullable();
-    t.foreign("created_by_user_id").references("users.id").onDelete("RESTRICT");
+    t.foreign("created_by_user_id").references("users.id").onDelete("NO ACTION");
   });
 
   await createTableIfAbsent(db, "meeting_asr_results", (t) => {
