@@ -60,21 +60,51 @@ AUTH_COOKIE_SECURE=false
 BOOTSTRAP_ADMIN_ACCOUNT=admin
 BOOTSTRAP_ADMIN_PASSWORD=<强密码，勿用默认值>
 
-# —— 数据库（可选，默认 SQLite 零配置）——
-# 生产需要对接外部 MySQL / MSSQL 实例时：
-# DB_TYPE=mysql          # 或 mssql
-# DB_HOST=10.0.0.5       # 外部实例地址
-# DB_PORT=3306           # MySQL 默认 3306；MSSQL 默认 1433
-# DB_NAME=meeting_asr    # 实例上需先创建同名数据库/库
+# —— 数据库：当前只支持 SQLite（零配置），无需任何配置 ——
+# ⚠ 下面的 DB_TYPE=mysql|mssql 是「进行中能力」，生产**暂不可用**，见 3.3.1。
+# DB_TYPE=sqlite         # 唯一支持值（默认）；mysql / mssql 尚未接线
+# DB_HOST=10.0.0.5       # （未来）外部实例地址
+# DB_PORT=3306           # （未来）MySQL 默认 3306；MSSQL 默认 1433
+# DB_NAME=meeting_asr    # （未来）实例上需先创建同名数据库/库
 # DB_USER=meeting_app
 # DB_PASSWORD=<数据库密码>
-# DB_ENCRYPT=false       # MSSQL 启用 TLS 时设 true
+# DB_ENCRYPT=false       # （未来）MSSQL 启用 TLS 时设 true
 EOF
 ```
 
-> 应用业务配置（ASR/LLM/SMTP/模板等）不在 .env 中，通过后台管理页面保存到数据库（SQLite 或外部实例），首次部署后需在 `http://<host>:3123/admin` 完成初始化配置。
+> 应用业务配置（ASR/LLM/SMTP/模板等）不在 .env 中，通过后台管理页面保存到数据库，首次部署后需在 `http://<host>:3123/admin` 完成初始化配置。
 
-> 数据库对接验证：`DB_TYPE=mysql DB_HOST=... DB_NAME=... node scripts/db-smoke.mjs` 可提前连通性与方言兼容性冒烟测试，无需启动整套应用。
+### 3.3.1 数据库支持面（当前真实状态）
+
+**生产目前仅 SQLite 经过真机验证。** `DB_TYPE=mysql|mssql` 是进行中能力（见 issue #53/#54/#55 的阶段计划），现在**配了也不会生效**：
+
+- 运行时（`server/db-shared.mjs` 的 `getDb()`）仍写死 `node:sqlite`，**不读 `DB_TYPE`**；把 `DB_TYPE` 接到运行时是阶段②（#54）的工作。
+- knex 三方言基建（`server/db/index.mjs` / `async-db.mjs` / `schema.mjs`）已存在并已通过三库测试，但目前只被 `scripts/*` 调用，不在运行时路径上。
+- SQLite 是单文件数据库（`data/meeting-asr-app.db`），备份/迁移/换机都只需拷文件（见 §6）。
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| ① #53 | 方言事实钉死 + 三库测试脚手架（零运行时变更） | 已完成 |
+| ② #54 | 114 处裸 SQL 同步→异步、`getKnex()` 成为唯一入口、`DB_TYPE` 真正生效 | 待做 |
+| ③ #55 | 方言语法清零（`ON CONFLICT` / `INSERT OR IGNORE` / `PRAGMA`）+ 大小写语义落地 + 三库 CI | 待做 |
+
+> 方言事实与待办清单：`docs/design/db-dialect-portability.md`。
+
+### 3.3.2 外部实例连通性冒烟（当前只用于验证基建，不影响运行时）
+
+```bash
+# SQLite（默认，零配置）
+node scripts/db-smoke.mjs
+
+# 外部实例（仅冒烟 knex 基建，不会改变应用运行时的数据库）
+DB_TYPE=mysql DB_HOST=10.0.0.5 DB_PORT=3306 DB_NAME=meeting_asr DB_USER=... DB_PASSWORD=... \
+  node scripts/db-smoke.mjs
+DB_TYPE=mssql DB_HOST=10.0.0.5 DB_PORT=1433 DB_NAME=meeting_asr DB_USER=sa DB_PASSWORD=... \
+  node scripts/db-smoke.mjs
+```
+
+> ⚠ `scripts/db-smoke.mjs` 会在目标库里建/删一张 `__smoke_test__` 临时表——**只对专用测试库跑**，不要指向生产实例。
+> 三库 schema/迁移与语义锁的完整矩阵：`npm run db:test-parity`（见 `docs/design/db-dialect-portability.md` §6）。
 
 ### 3.4 启动
 
@@ -175,7 +205,7 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 ```
 
 - **音频在本地磁盘，不在数据库里**：SQLite 只存路径（相对 `data` 目录）、字节数、时长、状态。
-- **多实例 / MySQL / MSSQL 部署必须共享卷**：`data/audio` 是本地目录，`DB_TYPE=mysql|mssql` 只是把元数据外置到外部数据库，**音频文件仍在本机**。多个应用实例同时提供服务时，必须把 `data`（或至少 `data/audio`）挂成同一份共享卷（NFS/CIFS/云盘），否则 A 实例录的音在 B 实例上 404。
+- **多实例部署必须共享卷**：`data/audio` 是本地目录；即便将来（#54 之后）把元数据外置到 MySQL / MSSQL，**音频文件仍在本机**。多个应用实例同时提供服务时，必须把 `data`（或至少 `data/audio`）挂成同一份共享卷（NFS/CIFS/云盘），否则 A 实例录的音在 B 实例上 404。当前运行时仍只支持 SQLite（见 §3.3.1），单实例零配置。
 - 单实例（默认 compose 形态）零配置，无需改动。
 
 ### 容量估算

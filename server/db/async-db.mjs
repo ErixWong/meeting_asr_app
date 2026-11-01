@@ -90,6 +90,30 @@ export class AsyncDb {
     }
 
     this._txDepth = 1;
+    if (this.dbType === "mssql") {
+      // MSSQL 不能用 knex.raw("BEGIN")：knex 的 mssql 方言把语句交给 sp_executesql，
+      // 语句内开启事务会让 SQL Server 在过程返回时发现 @@TRANCOUNT 前后不一致，
+      // 直接报 `Msg 266 Transaction count after EXECUTE indicates a mismatching number
+      // of BEGIN and COMMIT statements`（2026-11 实测）。
+      // 因此 mssql 分支走驱动级事务 API（knex.transaction → tedious beginTransaction/
+      // commitTransaction/rollbackTransaction），并在事务期间把 this.knex 换成 trx，
+      // 使 AsyncDb 的 exec/prepare 与调用方的 db.knex.xxx 都落在同一条连接上
+      // （knex.transaction 绑定单连接，池里另取连接会跑在事务之外）。
+      // sqlite / mysql 分支不经过这里，下发的 SQL 文本与改动前逐字节一致。
+      const outerKnex = this.knex;
+      try {
+        return await outerKnex.transaction(async (trx) => {
+          this.knex = trx;
+          try {
+            return await callback();
+          } finally {
+            this.knex = outerKnex;
+          }
+        });
+      } finally {
+        this._txDepth = 0;
+      }
+    }
     await this.knex.raw("BEGIN");
     try {
       const result = await callback();

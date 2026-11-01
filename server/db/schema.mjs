@@ -9,7 +9,7 @@
  *
  * 迁移机制沿用原 schema_version 表 + MIGRATIONS 数组，up 改为 async。
  */
-import { listTableColumns } from "./async-db.mjs";
+import { extractRows, listTableColumns } from "./async-db.mjs";
 
 /**
  * 幂等建表：hasTable 检查后 createTable。
@@ -61,7 +61,7 @@ function defineMeetingLlmResultsTable(t) {
   t.string("created_at", 32).notNullable();
   t.unique(["meeting_id", "version_no"]);
   t.foreign("meeting_id").references("meetings.id").onDelete("CASCADE");
-  t.foreign("prompt_template_id").references("llm_prompt_templates.id").onDelete("RESTRICT");
+  t.foreign("prompt_template_id").references("llm_prompt_templates.id").onDelete("NO ACTION");
 }
 
 function defineMeetingSendRecordsTable(t) {
@@ -83,7 +83,7 @@ function defineMeetingSendRecordsTable(t) {
   t.string("created_at", 32).notNullable();
   t.string("sent_at", 32).nullable();
   t.foreign("meeting_llm_result_id").references("meeting_llm_results.id").onDelete("CASCADE");
-  t.foreign("sent_by_user_id").references("users.id").onDelete("RESTRICT");
+  t.foreign("sent_by_user_id").references("users.id").onDelete("NO ACTION");
 }
 
 // ---------- 初始化 ----------
@@ -183,7 +183,7 @@ export async function createTables(db) {
     t.string("created_by_user_email", 255).nullable();
     t.string("created_at", 32).notNullable();
     t.string("updated_at", 32).notNullable();
-    t.foreign("created_by_user_id").references("users.id").onDelete("RESTRICT");
+    t.foreign("created_by_user_id").references("users.id").onDelete("NO ACTION");
   });
 
   await createTableIfAbsent(db, "meeting_asr_results", (t) => {
@@ -246,6 +246,46 @@ export async function createTables(db) {
   });
 }
 
+/** 索引清单（表 / 列 / 名）—— 与迁移解耦，供三库按方言建索引 */
+export const INDEXES = [
+  { name: "idx_meeting_asr_results_meeting_created", table: "meeting_asr_results", columns: ["meeting_id", "created_at"] },
+  { name: "idx_meeting_send_records_llm_created", table: "meeting_send_records", columns: ["meeting_llm_result_id", "created_at"] },
+  { name: "idx_asr_capture_sessions_expires", table: "asr_capture_sessions", columns: ["expires_at"] },
+  { name: "idx_auth_sessions_expires", table: "auth_sessions", columns: ["expires_at"] },
+  { name: "idx_user_roles_role", table: "user_roles", columns: ["role_id"] },
+  { name: "idx_audit_logs_created", table: "audit_logs", columns: ["created_at"] },
+  { name: "idx_audit_logs_resource", table: "audit_logs", columns: ["resource_type", "resource_id"] },
+  { name: "idx_meetings_owner_created", table: "meetings", columns: ["created_by_user_id", "created_at"] },
+  { name: "idx_auth_sessions_user", table: "auth_sessions", columns: ["user_id"] },
+  { name: "idx_meeting_llm_results_meeting_version_created", table: "meeting_llm_results", columns: ["meeting_id", "version_no", "created_at"] },
+  { name: "idx_meeting_audio_recordings_meeting", table: "meeting_audio_recordings", columns: ["meeting_id"] },
+  { name: "idx_meeting_audio_recordings_expires", table: "meeting_audio_recordings", columns: ["expires_at"] },
+];
+
+/**
+ * 幂等建索引（单条）
+ *
+ * SQLite / MySQL(MariaDB) 支持 `CREATE INDEX IF NOT EXISTS`，MSSQL 不支持
+ * （`Msg 156 … Incorrect syntax near the keyword 'IF'`），所以 mssql 分支先查
+ * sys.indexes 再建。sqlite/mysql 的 SQL 文本与改动前逐字一致（现网行为不变）。
+ */
+async function createIndexIfAbsent(db, { name, table, columns }) {
+  if (db.dbType === "mssql") {
+    const existing = extractRows(
+      await db.knex.raw("SELECT name FROM sys.indexes WHERE name = ? AND object_id = OBJECT_ID(?)", [
+        name,
+        table,
+      ])
+    );
+    if (existing.length > 0) return;
+    await db.knex.raw(
+      `CREATE INDEX [${name}] ON [${table}] (${columns.map((column) => `[${column}]`).join(", ")})`
+    );
+    return;
+  }
+  await db.knex.raw(`CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${columns.join(", ")})`);
+}
+
 /**
  * 索引创建（迁移之后执行）
  *
@@ -253,22 +293,8 @@ export async function createTables(db) {
  * 旧表上的索引会随 RENAME+DROP 丢失；统一在迁移后重建（IF NOT EXISTS 幂等）。
  */
 export async function createIndexes(db) {
-  const indexes = [
-    "CREATE INDEX IF NOT EXISTS idx_meeting_asr_results_meeting_created ON meeting_asr_results(meeting_id, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_meeting_send_records_llm_created ON meeting_send_records(meeting_llm_result_id, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_asr_capture_sessions_expires ON asr_capture_sessions(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_user_roles_role ON user_roles(role_id)",
-    "CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_audit_logs_resource ON audit_logs(resource_type, resource_id)",
-    "CREATE INDEX IF NOT EXISTS idx_meetings_owner_created ON meetings(created_by_user_id, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_meeting_llm_results_meeting_version_created ON meeting_llm_results(meeting_id, version_no, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_meeting ON meeting_audio_recordings(meeting_id)",
-    "CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_expires ON meeting_audio_recordings(expires_at)",
-  ];
-  for (const sql of indexes) {
-    await db.knex.raw(sql);
+  for (const index of INDEXES) {
+    await createIndexIfAbsent(db, index);
   }
 }
 
