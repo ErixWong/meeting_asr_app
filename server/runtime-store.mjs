@@ -323,9 +323,9 @@ export function releaseCaptureSession(captureSessionId) {
 }
 
 // 语句包装器不再跨调用缓存：`AsyncDb.prepare()` 现在只是闭包工厂（无真实 prepared
-// statement 开销），而缓存会把 `this.knex` 钉在创建时的那条连接上——事务期间（mssql 的
-// `this.knex = trx`）会用外层连接执行，落在事务之外。每次调用重新 prepare 后，
-// 事务内的语句与事务同连接。
+// statement 开销），而缓存会把语句钉在创建时的那条连接上。issue #55 起事务连接由
+// `withTransaction(cb)` 交给回调的 `tx` 句柄承载（不再有实例级的 `this.knex = trx`），
+// 每次调用重新 `statementsFor(tx)` 即可让语句与事务同连接。
 function statementsFor(database) {
   return {
     sessionExpires: database.prepare(
@@ -395,11 +395,12 @@ async function flushQueueState(database, captureSessionId, state) {
   state.events = [];
   state.bytes = 0;
 
-  const statements = statementsFor(database);
-
   try {
-    return await database.withTransaction(async () => {
-      const session = await statements.sessionExpires.get(captureSessionId);
+    return await database.withTransaction(async (tx) => {
+      // 事务内一律走 tx（issue #55 D1/D2）：用外层 database 会落在事务连接之外，
+      // 且被 AsyncDb 的运行期防线直接抛错。
+      const txStatements = statementsFor(tx);
+      const session = await txStatements.sessionExpires.get(captureSessionId);
       if (!session || String(session.expiresAt) < nowIso()) {
         pendingQueues.delete(captureSessionId);
         captureStats.delete(captureSessionId);
@@ -409,10 +410,10 @@ async function flushQueueState(database, captureSessionId, state) {
       }
 
       let sequenceNo = Number(
-        (await statements.nextSequence.get(captureSessionId))?.nextSequence ?? 1
+        (await txStatements.nextSequence.get(captureSessionId))?.nextSequence ?? 1
       );
       for (const item of events) {
-        await statements.insertEvent.run(
+        await txStatements.insertEvent.run(
           `${captureSessionId}-${sequenceNo}`,
           captureSessionId,
           sequenceNo,
@@ -422,7 +423,7 @@ async function flushQueueState(database, captureSessionId, state) {
         sequenceNo++;
       }
 
-      await statements.updateSession.run(events[events.length - 1].receivedAt, captureSessionId);
+      await txStatements.updateSession.run(events[events.length - 1].receivedAt, captureSessionId);
       return events.length;
     });
   } catch (error) {
@@ -658,9 +659,9 @@ export async function getAudioRecordingById(id) {
   return normalizeAudioRow(row);
 }
 
-export async function listAudioRecordingsForMeeting(meetingId) {
+export async function listAudioRecordingsForMeeting(meetingId, db) {
   if (!meetingId) return [];
-  const database = await getDb();
+  const database = db ?? (await getDb());
   const rows = await database
     .prepare(`
       SELECT ${AUDIO_ROW_COLUMNS}
@@ -745,11 +746,11 @@ export async function markAudioRecordingFailed(input) {
  * 会议落定时把录音绑定到会议：meeting_id 写上、expires_at 置 NULL（永久）。
  * 同时接受单数 captureSessionId（旧前端）与复数 captureSessionIds，取并集去重。
  */
-export async function bindAudioRecordingsToMeeting(input) {
+export async function bindAudioRecordingsToMeeting(input, db) {
   const ids = collectCaptureSessionIds(input);
   if (ids.length === 0) return [];
 
-  const database = await getDb();
+  const database = db ?? (await getDb());
   const updatedAt = nowIso();
   const statement = database.prepare(`
     UPDATE meeting_audio_recordings
@@ -759,7 +760,7 @@ export async function bindAudioRecordingsToMeeting(input) {
   for (const captureSessionId of ids) {
     await statement.run(input.meetingId, updatedAt, captureSessionId);
   }
-  return listAudioRecordingsForMeeting(input.meetingId);
+  return listAudioRecordingsForMeeting(input.meetingId, db);
 }
 
 /** 单数/复数入参归一：去空、去重、保持首次出现顺序。 */
@@ -805,11 +806,11 @@ export function removeAudioFilesForRows(rows) {
 }
 
 /** 只删行，返回被删行（文件由调用方在事务提交后删，避免回滚丢文件）。 */
-export async function deleteAudioRecordingRowsForMeeting(meetingId) {
+export async function deleteAudioRecordingRowsForMeeting(meetingId, db) {
   if (!meetingId) return [];
-  const rows = await listAudioRecordingsForMeeting(meetingId);
+  const rows = await listAudioRecordingsForMeeting(meetingId, db);
   if (rows.length === 0) return [];
-  const database = await getDb();
+  const database = db ?? (await getDb());
   await database
     .prepare("DELETE FROM meeting_audio_recordings WHERE meeting_id = ?")
     .run(meetingId);
