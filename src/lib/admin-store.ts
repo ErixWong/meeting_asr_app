@@ -316,6 +316,31 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemDescription: "DashScope Workspace ID",
     validate: textSetting("ASR workspace ID", 256, false),
   },
+  "audio:record_enabled": {
+    itemTitle: "录音落盘开关",
+    itemDescription: "转写的同时在服务端旁路录制原始音频，会议结束后转成 MP3 保存（默认开）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Audio record enabled", 16, false);
+      const lower = normalized.toLowerCase();
+      return normalized === "0" || lower === "false" || lower === "no" || lower === "off" ? "0" : "1";
+    },
+  },
+  "audio:bitrate_kbps": {
+    itemTitle: "录音码率（kbps）",
+    itemDescription: "会议结束后转码 MP3 的码率，可选 32 / 48 / 64 / 96 / 128（默认 48，约 21 MB/小时）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Audio bitrate", 32, true).trim();
+      if (!["32", "48", "64", "96", "128"].includes(normalized)) {
+        throw new Error("Audio bitrate must be one of 32/48/64/96/128");
+      }
+      return normalized;
+    },
+  },
+  "audio:orphan_ttl_hours": {
+    itemTitle: "孤儿录音保留（小时）",
+    itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
+    validate: integerSetting("Audio orphan TTL hours", 1, 24 * 365),
+  },
   "llm:base_url": {
     itemTitle: "LLM URL",
     itemDescription: "OpenAI 兼容服务根地址",
@@ -642,6 +667,27 @@ function seedDefaults(database: DatabaseSync) {
         itemTitle: "ASR Workspace ID",
         itemDescription: "DashScope Workspace ID",
         itemValue: "",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "record_enabled",
+        itemTitle: "录音落盘开关",
+        itemDescription: "转写的同时在服务端旁路录制原始音频，会议结束后转成 MP3 保存（默认开）",
+        itemValue: "1",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "bitrate_kbps",
+        itemTitle: "录音码率（kbps）",
+        itemDescription: "会议结束后转码 MP3 的码率，可选 32 / 48 / 64 / 96 / 128（默认 48，约 21 MB/小时）",
+        itemValue: "48",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "orphan_ttl_hours",
+        itemTitle: "孤儿录音保留（小时）",
+        itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
+        itemValue: "72",
       },
       {
         itemSection: "llm",

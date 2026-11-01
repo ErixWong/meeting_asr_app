@@ -6,7 +6,7 @@ import { useAuthSession } from "@/lib/use-auth-session";
 import VoiceprintPanel from "@/components/admin/VoiceprintPanel";
 import TtsPanel from "@/components/admin/TtsPanel";
 
-type AdminTab = "asr" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit" | "voiceprint" | "tts";
+type AdminTab = "asr" | "audio" | "llm" | "mail" | "templates" | "hotwords" | "users" | "audit" | "voiceprint" | "tts";
 
 type SettingItem = {
   itemSection: string;
@@ -170,6 +170,7 @@ function SectionTabs({
 }) {
   const tabs: { key: AdminTab; label: string }[] = [
     { key: "asr", label: "ASR 配置" },
+    { key: "audio", label: "录音配置" },
     { key: "llm", label: "LLM 配置" },
     { key: "mail", label: "邮件配置" },
     { key: "templates", label: "模板管理" },
@@ -211,6 +212,10 @@ export default function AdminPage() {
   const [funasrWorkspaceId, setFunasrWorkspaceId] = useState("");
   const [funasrStatus, setFunasrStatus] = useState<"ok" | "fail" | "idle">("idle");
   const [funasrDiagnostics, setFunasrDiagnostics] = useState<AsrDiagnostics | null>(null);
+
+  const [audioRecordEnabled, setAudioRecordEnabled] = useState("1");
+  const [audioBitrateKbps, setAudioBitrateKbps] = useState("48");
+  const [audioOrphanTtlHours, setAudioOrphanTtlHours] = useState("72");
 
   const [llmUrl, setLlmUrl] = useState("http://qwen.local:8080/v1");
   const [llmKey, setLlmKey] = useState("");
@@ -286,6 +291,27 @@ export default function AdminPage() {
         itemTitle: "ASR Workspace ID",
         itemDescription: "DashScope Workspace ID",
         itemValue: funasrWorkspaceId,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "record_enabled",
+        itemTitle: "录音落盘开关",
+        itemDescription: "转写的同时在服务端旁路录制原始音频，会议结束后转成 MP3 保存（默认开）",
+        itemValue: audioRecordEnabled,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "bitrate_kbps",
+        itemTitle: "录音码率（kbps）",
+        itemDescription: "会议结束后转码 MP3 的码率，可选 32 / 48 / 64 / 96 / 128（默认 48，约 21 MB/小时）",
+        itemValue: audioBitrateKbps,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "orphan_ttl_hours",
+        itemTitle: "孤儿录音保留（小时）",
+        itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
+        itemValue: audioOrphanTtlHours,
       },
       {
         itemSection: "llm",
@@ -422,6 +448,9 @@ export default function AdminPage() {
       },
     ],
     [
+      audioBitrateKbps,
+      audioOrphanTtlHours,
+      audioRecordEnabled,
       defaultTemplateId,
       funasrApiKey,
       funasrProvider,
@@ -497,6 +526,10 @@ export default function AdminPage() {
         setFunasrUrl(get("asr", "endpoint", "ws://funasr.local:10095/ws"));
         setFunasrApiKey(get("asr", "api_key", ""));
         setFunasrWorkspaceId(get("asr", "workspace_id", ""));
+
+        setAudioRecordEnabled(get("audio", "record_enabled", "1"));
+        setAudioBitrateKbps(get("audio", "bitrate_kbps", "48"));
+        setAudioOrphanTtlHours(get("audio", "orphan_ttl_hours", "72"));
 
         setLlmUrl(get("llm", "base_url", "http://qwen.local:8080/v1"));
         setLlmKey(get("llm", "api_key", ""));
@@ -1144,6 +1177,59 @@ export default function AdminPage() {
               <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>
                 {savingSettings ? "保存中..." : "保存 ASR 配置"}
               </button>
+            </div>
+          </Card>
+        )}
+
+        {!loading && activeTab === "audio" && (
+          <Card title="录音配置" icon="🎙️">
+            <div className="space-y-3">
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={audioRecordEnabled === "1"}
+                  onChange={(e) => setAudioRecordEnabled(e.target.checked ? "1" : "0")}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                服务端旁路录制会议音频（关闭后新会议不再落盘，已录好的不受影响）
+              </label>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">转码码率（kbps）</label>
+                  <select
+                    value={audioBitrateKbps}
+                    onChange={(e) => setAudioBitrateKbps(e.target.value)}
+                    className={inputCls}
+                  >
+                    {["32", "48", "64", "96", "128"].map((value) => (
+                      <option key={value} value={value}>
+                        {value} kbps（约 {Math.round((Number(value) * 3600) / 8 / 1024 / 1024 * 10) / 10} MB/小时）
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">孤儿录音保留（小时）</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="8760"
+                    step="1"
+                    value={audioOrphanTtlHours}
+                    onChange={(e) => setAudioOrphanTtlHours(e.target.value)}
+                    className={inputCls}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-slate-400">
+                已绑定会议的录音永久保留（删会议才删文件）；未绑定会议的录音超过保留时长后由后台定时任务清理。
+                录音落在服务端 data/audio 目录，多实例部署需共享卷。
+              </p>
+              <div>
+                <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>
+                  {savingSettings ? "保存中..." : "保存录音配置"}
+                </button>
+              </div>
             </div>
           </Card>
         )}
