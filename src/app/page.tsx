@@ -1858,7 +1858,7 @@ export default function MeetingPage() {
                 <button
                   type="button"
                   onClick={notice.action.onClick}
-                  className="rounded border border-current/30 px-2 py-0.5 text-xs font-medium underline-offset-2 transition hover:bg-white/60 hover:underline"
+                  className="rounded border border-current px-2 py-0.5 text-xs font-medium underline-offset-2 transition hover:bg-white/60 hover:underline"
                 >
                   {notice.action.label}
                 </button>
