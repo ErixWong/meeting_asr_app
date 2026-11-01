@@ -7,13 +7,25 @@ import { getMeetingStatusMeta } from "@/lib/meeting-status";
 interface Props {
   meetings: MeetingRecord[];
   selectedId: string | null;
+  /** feat-261101-04（#44）：正在 AI 起标题的会议 id（该项按钮进入 loading） */
+  aiTitleLoadingId?: string | null;
   onSelect: (m: MeetingRecord) => void;
   onCreateNew: () => void;
   onRename: (id: string, newTitle: string) => void;
+  onAiTitle?: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
-export default function HistoryList({ meetings, selectedId, onSelect, onCreateNew, onRename, onDelete }: Props) {
+export default function HistoryList({
+  meetings,
+  selectedId,
+  aiTitleLoadingId = null,
+  onSelect,
+  onCreateNew,
+  onRename,
+  onAiTitle,
+  onDelete,
+}: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
@@ -81,6 +93,30 @@ export default function HistoryList({ meetings, selectedId, onSelect, onCreateNe
                    <div className="min-w-0 flex-1 truncate text-sm font-medium text-slate-700">
                      📄 {m.title}
                    </div>
+                  {onAiTitle && (
+                    <button
+                      type="button"
+                      data-testid={`ai-title-list-${m.id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onAiTitle(m.id);
+                      }}
+                      disabled={aiTitleLoadingId === m.id}
+                      className="shrink-0 rounded p-1 text-slate-300 transition hover:bg-slate-200 hover:text-brand disabled:cursor-not-allowed disabled:opacity-60 group-hover:text-slate-400"
+                      title={aiTitleLoadingId === m.id ? "AI 起标题中…" : "AI 起标题（直接重命名，可撤销）"}
+                    >
+                      {aiTitleLoadingId === m.id ? (
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-3.5 w-3.5 animate-spin" aria-hidden="true">
+                          <circle cx="8" cy="8" r="6" strokeOpacity="0.25" />
+                          <path d="M14 8a6 6 0 0 0-6-6" strokeLinecap="round" />
+                        </svg>
+                      ) : (
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5" aria-hidden="true">
+                          <path d="M8 1.5l1.4 3.6 3.6 1.4-3.6 1.4L8 11.5 6.6 7.9 3 6.5l3.6-1.4L8 1.5Zm4.5 8l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8Z" />
+                        </svg>
+                      )}
+                    </button>
+                  )}
                   <span className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${statusMeta.className}`}>
                     {statusMeta.label}
                   </span>

@@ -97,6 +97,8 @@ function getTranscriptPlainText(segments: TranscriptSegment[]) {
 type ActionNotice = {
   type: "success" | "error" | "info";
   message: string;
+  /** feat-261101-04（#44）：toast 里的一次性动作（AI 标题的「撤销」） */
+  action?: { label: string; onClick: () => void };
 };
 
 type TranscriptCommitListener = (segments: TranscriptSegment[]) => void;
@@ -170,6 +172,8 @@ export default function MeetingPage() {
   const [asrErrorMessage, setAsrErrorMessage] = useState<string | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
+  // feat-261101-04（#44）：AI 起标题进行中的会议 id（按钮 loading 态）
+  const [aiTitleLoadingId, setAiTitleLoadingId] = useState<string | null>(null);
   const { isSupported, isSpeaking, canRead, hasSelection, setReadableText, toggleSpeak } = useTts();
   const readableText = selected
     ? viewTab === "transcript"
@@ -1286,6 +1290,76 @@ export default function MeetingPage() {
     );
   }, [isActiveMeeting, requestJson]);
 
+  // ---------------------------------------------------------------------------
+  // 会议 AI 标题（feat-261101-04 / #44）
+  //
+  // #43 R2 的教训：列表行走 `setSelected(m)` 的投影、详情走 `loadMeetingFull()` 合并，
+  // 两处不是一个来源就会出现「详情有、列表点进去没有」。所以改名/撤销只走
+  // `applyMeetingProjection(meeting)`：服务端返回的**同一份投影**同时落到列表行与详情。
+  // ---------------------------------------------------------------------------
+  const applyMeetingProjection = useCallback((meeting: MeetingRecord) => {
+    setMeetings((prev) =>
+      prev.map((item) => (item.id === meeting.id ? { ...item, ...meeting, transcript: item.transcript } : item))
+    );
+    setSelected((prev) =>
+      prev && prev.id === meeting.id ? { ...prev, ...meeting, transcript: prev.transcript } : prev
+    );
+  }, []);
+
+  const handleUndoAiTitle = useCallback(
+    async (meetingId: string, previousTitle: string) => {
+      try {
+        const data = await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${meetingId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: previousTitle }),
+        });
+        if (data.meeting) applyMeetingProjection(data.meeting);
+        setNotice({ type: "success", message: `已撤销，标题恢复为「${previousTitle}」` });
+      } catch (error) {
+        console.error("Failed to undo ai title:", error);
+        setNotice({ type: "error", message: "撤销失败" });
+      }
+    },
+    [applyMeetingProjection, requestJson]
+  );
+
+  const handleGenerateAiTitle = useCallback(
+    async (meetingId: string) => {
+      if (aiTitleLoadingId) return;
+      setAiTitleLoadingId(meetingId);
+      try {
+        const data = await requestJson<{
+          title?: string;
+          previousTitle?: string;
+          meeting?: MeetingRecord;
+        }>(`/api/meetings/${meetingId}/ai-title`, { method: "POST" });
+        const meeting = data.meeting;
+        if (meeting) applyMeetingProjection(meeting);
+        const title = data.title ?? meeting?.title ?? "";
+        const previousTitle = data.previousTitle ?? "";
+        setNotice({
+          type: "success",
+          message: `AI 已重命名为「${title}」`,
+          // toast 里给**一次**撤销：点完这次就换成不带动作的提示
+          action:
+            previousTitle && previousTitle !== title
+              ? { label: "撤销", onClick: () => { void handleUndoAiTitle(meetingId, previousTitle); } }
+              : undefined,
+        });
+      } catch (error) {
+        console.error("Failed to generate ai title:", error);
+        setNotice({
+          type: "error",
+          message: error instanceof Error ? `AI 起标题失败：${error.message}` : "AI 起标题失败",
+        });
+      } finally {
+        setAiTitleLoadingId(null);
+      }
+    },
+    [aiTitleLoadingId, applyMeetingProjection, handleUndoAiTitle, requestJson]
+  );
+
   // R2 修 F2：「录音处理中…」自动变播放器 —— 有界轮询。
   // 只在选中会议的音频里还存在 status==='recording' 时起定时器：8 秒一次、最多 12 次（≈96 秒），
   // 全部离开 recording（变 ready/failed）或轮询次数用尽后自停；切会议 / 卸载时 cleanup 清定时器。
@@ -1777,15 +1851,26 @@ export default function MeetingPage() {
       <TtsReadableSync text={readableText} />
       <div className="flex min-h-0 flex-1 flex-col">
         {notice && (
-          <div className={`flex items-center justify-between border-b px-6 py-2 text-sm ${noticeClassName}`}>
-            <span>{notice.message}</span>
-            <button
-              type="button"
-              onClick={() => setNotice(null)}
-              className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
-            >
-              关闭
-            </button>
+          <div className={`flex items-center justify-between gap-3 border-b px-6 py-2 text-sm ${noticeClassName}`}>
+            <span className="min-w-0 truncate">{notice.message}</span>
+            <div className="flex shrink-0 items-center gap-1">
+              {notice.action && (
+                <button
+                  type="button"
+                  onClick={notice.action.onClick}
+                  className="rounded border border-current/30 px-2 py-0.5 text-xs font-medium underline-offset-2 transition hover:bg-white/60 hover:underline"
+                >
+                  {notice.action.label}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setNotice(null)}
+                className="rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+              >
+                关闭
+              </button>
+            </div>
           </div>
         )}
 
@@ -1795,6 +1880,10 @@ export default function MeetingPage() {
             <HistoryList
               meetings={meetings}
               selectedId={selected?.id ?? null}
+              aiTitleLoadingId={aiTitleLoadingId}
+              onAiTitle={(id) => {
+                void handleGenerateAiTitle(id);
+              }}
                onSelect={(m) => {
                  resetTranscriptScheduler();
                  asrRecoveryRef.current = false;
@@ -1875,6 +1964,19 @@ export default function MeetingPage() {
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+                    {/* feat-261101-04（#44）：详情页的 AI 起标题入口 */}
+                    <button
+                      type="button"
+                      data-testid="ai-title-detail"
+                      onClick={() => {
+                        void handleGenerateAiTitle(selected.id);
+                      }}
+                      disabled={aiTitleLoadingId === selected.id}
+                      title="用 AI 根据转写生成标题并重命名（可撤销）"
+                      className="rounded-md border border-slate-200 bg-white px-3 py-1 text-sm text-slate-600 transition hover:border-brand hover:text-brand disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {aiTitleLoadingId === selected.id ? "生成中…" : "✨ AI 起标题"}
+                    </button>
                     <div className="flex gap-1 rounded-lg bg-slate-100 p-1">
                       <button
                         onClick={() => {
