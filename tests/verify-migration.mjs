@@ -13,7 +13,7 @@ const tmpDir = mkdtempSync(join(tmpdir(), "asr-migration-"));
 process.chdir(tmpDir);
 mkdirSync(join(tmpDir, "data"), { recursive: true });
 
-const { initializeDatabase } = await import("../server/database-schema.mjs");
+const { initializeDatabase, SCHEMA_VERSION } = await import("../server/database-schema.mjs");
 
 let failures = 0;
 function check(cond, label) {
@@ -155,8 +155,8 @@ check(
 initializeDatabase(db);
 
 // 升级后：版本号
-const version = db.prepare("SELECT version FROM schema_version LIMIT 1").get();
-check(Number(version?.version) === 1, "升级后：schema_version = 1");
+const version = db.prepare("SELECT MAX(version) AS version FROM schema_version").get();
+check(Number(version?.version) === SCHEMA_VERSION, `升级后：schema_version = ${SCHEMA_VERSION}`);
 
 // 升级后：新结构
 const newCols = db.prepare("PRAGMA table_info(meeting_llm_results)").all();
@@ -197,8 +197,8 @@ check(legacyTables.length === 0, "升级后：无 legacy 表残留");
 
 // ============ 场景 2：幂等（二次初始化不重复迁移） ============
 initializeDatabase(db);
-const version2 = db.prepare("SELECT version FROM schema_version LIMIT 1").get();
-check(Number(version2?.version) === 1, "幂等：二次初始化后 version 仍 = 1");
+const version2 = db.prepare("SELECT MAX(version) AS version FROM schema_version").get();
+check(Number(version2?.version) === SCHEMA_VERSION, `幂等：二次初始化后 version 仍 = ${SCHEMA_VERSION}`);
 const llmRows2 = db.prepare("SELECT COUNT(*) AS c FROM meeting_llm_results").get();
 check(Number(llmRows2.c) === 3, "幂等：二次初始化后行数不变（仍 3）");
 
@@ -208,8 +208,8 @@ db.close();
 const freshDbPath = join(tmpDir, "data", "fresh.db");
 const freshDb = new DatabaseSync(freshDbPath);
 initializeDatabase(freshDb);
-const freshVersion = freshDb.prepare("SELECT version FROM schema_version LIMIT 1").get();
-check(Number(freshVersion?.version) === 1, "全新库：schema_version = 1");
+const freshVersion = freshDb.prepare("SELECT MAX(version) AS version FROM schema_version").get();
+check(Number(freshVersion?.version) === SCHEMA_VERSION, `全新库：schema_version = ${SCHEMA_VERSION}`);
 const freshCols = freshDb.prepare("PRAGMA table_info(meeting_llm_results)").all();
 check(freshCols.some((c) => c.name === "meeting_id"), "全新库：meeting_llm_results 直接新结构");
 const freshIdx = freshDb.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_meeting_llm_results_meeting_version_created'").get();

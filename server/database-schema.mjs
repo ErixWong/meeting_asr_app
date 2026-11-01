@@ -244,7 +244,19 @@ export function initializeDatabase(database) {
   `);
 }
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
+  {
+    version: 4,
+    name: "schema-version-single-row",
+    up() {
+      // fix-261101-02（issue #51）：治愈版本记账。
+      // 历史缺陷下每次启动都往 schema_version 追加一行（INSERT OR REPLACE 在无唯一键的表上
+      // 退化成普通 INSERT），因此库里的行可能形如 [2, 3, 3, 3]。
+      // 真正的收敛动作由 runMigrations 的记账收尾统一完成（DELETE 全表 + INSERT 单行，
+      // 三库通用、不依赖唯一键），本条迁移只负责把版本号推进到 SCHEMA_VERSION，
+      // 使被污染的库在升级时必然经过一次单行化写入。
+    },
+  },
   {
     version: 3,
     name: "meeting-audio-recordings",
@@ -414,6 +426,34 @@ const MIGRATIONS = [
   },
 ];
 
+/** 当前代码期望的 schema 版本（= 迁移条数；版本号从 1 连续递增） */
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
+/**
+ * 版本记账写入：DELETE 全表 + INSERT 一行。
+ * 不用 INSERT OR REPLACE / ON CONFLICT：schema_version 没有唯一键（SQLite 也无法给已有表
+ * 补主键），REPLACE 在没有约束冲突时就是普通 INSERT，正是 issue #51 的根因。
+ * DELETE 全表 + INSERT 是 SQLite / MySQL / MSSQL 通用写法。
+ */
+function writeSchemaVersion(database, version) {
+  database.prepare("DELETE FROM schema_version").run();
+  database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(version);
+}
+
+/**
+ * 读版本：MAX(version)（不依赖无 ORDER BY 的隐式行序）+ 行数。
+ * 行数 > 1 说明库被 issue #51 污染过，调用方负责收敛成单行。
+ */
+function readSchemaVersion(database) {
+  const row = database
+    .prepare("SELECT MAX(version) AS max_version, COUNT(*) AS row_count FROM schema_version")
+    .get();
+  return {
+    maxVersion: row?.max_version == null ? 0 : Number(row.max_version),
+    rowCount: Number(row?.row_count ?? 0),
+  };
+}
+
 function runMigrations(database) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -421,36 +461,52 @@ function runMigrations(database) {
     );
   `);
 
-  const row = database.prepare("SELECT version FROM schema_version LIMIT 1").get();
-  let currentVersion = row ? Number(row.version) : 0;
+  const latestVersion = SCHEMA_VERSION;
+  const { maxVersion, rowCount } = readSchemaVersion(database);
+  let currentVersion = maxVersion;
 
-  const latestVersion = MIGRATIONS.length;
-  if (currentVersion === 0) {
+  if (rowCount === 0) {
     // 无版本记录：若表结构已是最新（全新库或已迁移库），直接标记最新版本；
     // 否则视为旧库，从迁移 1 开始。
     const llmColumns = database.prepare("PRAGMA table_info(meeting_llm_results)").all();
     if (llmColumns.some((column) => column.name === "meeting_id")) {
       currentVersion = latestVersion;
-      database
-        .prepare("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
-        .run(latestVersion);
+    }
+  }
+
+  // 记账收敛：行数 > 1（历史缺陷遗留）或「无记录但结构已是最新」→ 写成唯一一行。
+  // 值取 MAX(现存) 而不是最新版本号：收敛这一步只做去重、不代替迁移推进版本，
+  // 版本推进统一由下面的迁移循环负责。
+  if (rowCount > 1 || (rowCount === 0 && currentVersion > 0)) {
+    database.exec("BEGIN");
+    try {
+      writeSchemaVersion(database, currentVersion);
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    if (rowCount > 1) {
+      console.log(
+        `[DB] schema_version 收敛为单行: ${rowCount} 行 → v${currentVersion}`
+      );
     }
   }
 
   if (currentVersion >= latestVersion) return;
 
-  for (const migration of MIGRATIONS) {
+  // 按版本升序执行（MIGRATIONS 声明顺序是新的在前，不能直接依赖）
+  const sortedMigrations = [...MIGRATIONS].sort((a, b) => a.version - b.version);
+  for (const migration of sortedMigrations) {
     if (migration.version <= currentVersion) continue;
 
     database.exec("PRAGMA foreign_keys = OFF");
     database.exec("BEGIN");
     try {
       migration.up(database);
-      database
-        .prepare("INSERT OR REPLACE INTO schema_version (version) VALUES (?)")
-        .run(migration.version);
+      writeSchemaVersion(database, migration.version);
       database.exec("COMMIT");
-      console.log(`[DB] Migration applied: v${migration.version} (${migration.name})`);
+      console.log(`[DB] Migration applied: v${migration.version} (${migration.name}) [legacy]`);
     } catch (error) {
       database.exec("ROLLBACK");
       throw new Error(
