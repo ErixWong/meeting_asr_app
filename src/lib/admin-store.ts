@@ -2665,11 +2665,12 @@ export function getMeetingAudioFile(input: { meetingId: string; recordingId?: st
   const stats = statSync(absolutePath);
   if (!stats.isFile()) return null;
 
+  const meetingTitle = queryMeetingRowById(meetingId)?.title ?? "录音";
   return {
     filePath: absolutePath,
     size: stats.size,
     mimeType: "audio/mpeg",
-    recording: toClientAudioRow(target, "", 0, 1),
+    recording: toClientAudioRow(target, meetingTitle, 0, readyRows.length),
   };
 }
 
