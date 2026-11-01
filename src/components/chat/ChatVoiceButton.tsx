@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FunASRClient } from "@/lib/funasr";
+import { friendlyError } from "@/lib/chat-voice-errors";
 
 interface Props {
   /** 语音识别结束后回调解码文本（可能为空）。 */
@@ -13,17 +14,6 @@ const MAX_HOLD_MS = 60_000;
 const START_TIMEOUT_MS = 8000;
 
 type Phase = "idle" | "starting" | "holding";
-
-/** 把底层错误翻译成用户能看懂的话 */
-function friendlyError(err: Error): string {
-  const m = err.message || String(err);
-  if (/permission|NotAllowedError|denied|not allowed|\u6743\u9650/i.test(m))
-    return "麦克风权限被拒绝：请在浏览器地址栏允许麦克风后重试";
-  if (/NotReadable|\u88ab\u5360/i.test(m)) return "麦克风不可用或被占用，请检查设备";
-  if (/timeout|\u8d85\u65f6/i.test(m)) return "语音服务启动超时，请检查网络或稍后再试";
-  if (/connect|websocket|ECONN|socket/i.test(m)) return "语音识别服务连接失败，请稍后再试";
-  return m;
-}
 
 function formatElapsed(seconds: number) {
   const m = Math.floor(seconds / 60);
@@ -46,8 +36,10 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const releasingRef = useRef(false);
-  // 启动竞态：startRecording 完成前用户已松手时标记，等连接就绪后立即结束
-  const pendingReleaseRef = useRef(false);
+  // 启动竞态靠 clientRef 判定：beginHold 在第一个 await 之前就同步写好 clientRef.current，
+  // 而 finishHold 会把 clientRef.current 置空并接管收尾 —— 所以「await 期间松手」用
+  // `clientRef.current !== client` 就能识别。原先的 pendingReleaseRef 守卫的是 pointerup 里
+  // `!clientRef.current` 这条分支，而该分支因上述同步赋值**永不可达**，已删除。
   // finishHold 存 ref：beginHold 里要用它收尾，但直接引变量会进依赖数组（与 cleanup/startTick 互指成环），
   // 存 ref 后 beginHold 只依赖稳定引用，stale closure 也拿到最新实现
   const finishHoldRef = useRef<(() => Promise<void>) | null>(null);
@@ -89,15 +81,15 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   const beginHold = useCallback(async () => {
     if (disabled || releasingRef.current || clientRef.current) return;
     releasingRef.current = true;
-    pendingReleaseRef.current = false;
     finalsRef.current = [];
     partialRef.current = "";
     setPartial("");
     setError("");
     setPhase("starting");
 
+    let client: FunASRClient | null = null;
     try {
-      const client = new FunASRClient();
+      client = new FunASRClient();
       clientRef.current = client;
       await Promise.race([
         client.startRecording({
@@ -113,6 +105,7 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
             }
           },
           onError: (err) => {
+            // friendlyError 返回空串表示安静处理（如 AbortError），setError("") 不渲染徽标
             setError(friendlyError(err));
             cleanup();
           },
@@ -123,19 +116,19 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
           setTimeout(() => reject(new Error("timeout")), START_TIMEOUT_MS)
         ),
       ]);
+      // 启动期间用户已松手（finishHold 已置空 clientRef、清 phase、停 tick、调过 stopRecording）：
+      // 这里绝不能再把 phase 复活成 holding，也不能重复 stopRecording（否则会二次 session.finish）
+      if (clientRef.current !== client) return;
       setPhase("holding");
       startTick();
       // 超时保护：长按住自动结束
       holdTimerRef.current = setTimeout(() => {
         void finishHoldRef.current?.();
       }, MAX_HOLD_MS);
-      // 若启动期间用户已松开，立即结束（避免录音永不停止）
-      if (pendingReleaseRef.current) {
-        void finishHoldRef.current?.();
-      }
     } catch (err) {
+      // 已被 finishHold 收尾（启动期间松手 / 60s 兜底）：那次启动由它负责停掉，这里安静退出
+      if (clientRef.current !== client) return;
       // 启动失败：显式停止并给出醒目错误（按钮不闪回无反馈状态）
-      const client = clientRef.current;
       clientRef.current = null;
       if (client) client.stopRecording().catch(() => {});
       setError(friendlyError(err instanceof Error ? err : new Error(String(err))));
@@ -147,16 +140,18 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
   }, [cleanup, disabled, startTick]);
 
   const finishHold = useCallback(async () => {
+    // 幂等清态：即使 client 已被清过（启动期间松手 / 60s 兜底晚到），也必须回到 idle 并停表。
+    // 否则界面会永久停在「正在听…」而实际什么都没录（真机回归 261101-01 F1）。
     stopTick();
-    const client = clientRef.current;
-    clientRef.current = null;
     if (holdTimerRef.current) {
       clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
     }
-    if (!client) return;
+    const client = clientRef.current;
+    clientRef.current = null;
     setPhase("idle");
     setElapsed(0);
+    if (!client) return;
     try {
       await client.stopRecording();
     } catch (err) {
@@ -204,11 +199,9 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
           void beginHold();
         }}
         onPointerUp={() => {
-          if (!clientRef.current) {
-            // 录音还在启动中：标记待释放，由 beginHold 收尾
-            pendingReleaseRef.current = true;
-            return;
-          }
+          // beginHold 在第一个 await 之前就同步写了 clientRef.current，所以启动中松手这里也看得到它：
+          // 直接由 finishHold 接管（清 clientRef → beginHold 在 await 之后自检退出，不再复活 holding）
+          if (!clientRef.current) return;
           void finishHold();
         }}
         onLostPointerCapture={() => {
