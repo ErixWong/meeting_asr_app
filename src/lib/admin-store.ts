@@ -1,9 +1,11 @@
 ﻿import { DatabaseSync } from "node:sqlite";
+import { existsSync, statSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
 import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
+import { resolveStoredPath } from "../../server/audio-paths.mjs";
 import {
   bindAudioRecordingsToMeeting,
   collectCaptureSessionIds,
@@ -2527,6 +2529,119 @@ function mapMeetingRow(row: MeetingRow & { transcript: TranscriptSegment[] }) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 会议录音（feat-261101-01 L5）：详情/列表输出 + 播放下载
+// ---------------------------------------------------------------------------
+
+type MeetingAudioRow = {
+  id: string;
+  captureSessionId: string;
+  meetingId: string | null;
+  filePath: string | null;
+  rawFilePath: string | null;
+  format: string;
+  status: string;
+  bytes: number;
+  durationSeconds: number;
+  sampleRate: number;
+  bitrateKbps: number | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string | null;
+};
+
+export type MeetingAudioClientRow = {
+  id: string;
+  captureSessionId: string;
+  status: string;
+  format: string;
+  bytes: number;
+  durationSeconds: number;
+  bitrateKbps: number | null;
+  errorMessage: string | null;
+  createdAt: string;
+  downloadFileName: string;
+};
+
+function toClientAudioRow(
+  row: MeetingAudioRow,
+  meetingTitle: string,
+  index: number,
+  total: number
+): MeetingAudioClientRow {
+  const baseName = String(meetingTitle || "录音").trim() || "录音";
+  return {
+    id: row.id,
+    captureSessionId: row.captureSessionId,
+    status: row.status,
+    format: row.format,
+    bytes: row.bytes,
+    durationSeconds: row.durationSeconds,
+    bitrateKbps: row.bitrateKbps,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt,
+    // 双通道时带序号，避免两个下载文件同名
+    downloadFileName: total > 1 ? `${baseName}-${index + 1}.mp3` : `${baseName}.mp3`,
+  };
+}
+
+export function getMeetingAudioRecordings(meetingId: string): MeetingAudioClientRow[] {
+  if (!meetingId || !ensureMeetingOwned(meetingId)) return [];
+  const row = queryMeetingRowById(meetingId);
+  const title = row?.title ?? "录音";
+  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  return rows.map((item, index) => toClientAudioRow(item, title, index, rows.length));
+}
+
+/** 播放/下载用：属主校验后返回磁盘绝对路径 + 元信息。 */
+export function getMeetingAudioFile(input: { meetingId: string; recordingId?: string | null }) {
+  const { meetingId } = input;
+  if (!meetingId || !ensureMeetingOwned(meetingId)) return null;
+
+  const rows = listAudioRecordingsForMeeting(meetingId) as MeetingAudioRow[];
+  const readyRows = rows.filter((row) => row.status === "ready" && row.filePath);
+  const recordingId = String(input.recordingId || "").trim();
+  const target = recordingId
+    ? readyRows.find((row) => row.id === recordingId || row.captureSessionId === recordingId)
+    : readyRows[0];
+  if (!target?.filePath) return null;
+
+  let absolutePath: string;
+  try {
+    absolutePath = resolveStoredPath(target.filePath) as string;
+  } catch (error) {
+    console.error("Invalid meeting audio path:", target.filePath, error);
+    return null;
+  }
+  if (!existsSync(absolutePath)) return null;
+
+  const stats = statSync(absolutePath);
+  if (!stats.isFile()) return null;
+
+  return {
+    filePath: absolutePath,
+    size: stats.size,
+    mimeType: "audio/mpeg",
+    recording: toClientAudioRow(target, "", 0, 1),
+  };
+}
+
+/** 列表页用：一次性拿全部会议的录音就绪数（避免 N+1）。 */
+function listMeetingAudioSummaries(): Map<string, number> {
+  const actor = getCurrentActor();
+  const rows = getDb()
+    .prepare(`
+      SELECT r.meeting_id as meetingId, COUNT(*) as readyCount
+      FROM meeting_audio_recordings r
+      INNER JOIN meetings m ON m.id = r.meeting_id
+      WHERE m.created_by_user_id = ? AND r.status = 'ready'
+      GROUP BY r.meeting_id
+    `)
+    .all(actor.id) as Array<{ meetingId: string; readyCount: number }>;
+  return new Map(rows.map((row) => [String(row.meetingId), Number(row.readyCount)]));
+}
+
 export function listMeetings() {
   const database = getDb();
   const actor = getCurrentActor();
@@ -2553,7 +2668,13 @@ export function listMeetings() {
     `)
     .all<MeetingRow>(actor.id);
 
-  return rows.map((row) => mapMeetingRow({ ...row, transcript: [] }));
+  const audioSummaries = listMeetingAudioSummaries();
+
+  return rows.map((row) => ({
+    ...mapMeetingRow({ ...row, transcript: [] }),
+    hasAudio: (audioSummaries.get(String(row.id)) ?? 0) > 0,
+    audioRecordings: [],
+  }));
 }
 
 function queryMeetingRowById(id: string) {
@@ -2592,14 +2713,24 @@ export function getMeetingLightById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  return mapMeetingRow({ ...row, transcript: [] });
+  const audioRecordings = getMeetingAudioRecordings(id);
+  return {
+    ...mapMeetingRow({ ...row, transcript: [] }),
+    hasAudio: audioRecordings.some((item) => item.status === "ready"),
+    audioRecordings,
+  };
 }
 
 export function getMeetingById(id: string) {
   if (!ensureMeetingOwned(id)) return null;
   const row = queryMeetingRowById(id);
   if (!row) return null;
-  return mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) });
+  const audioRecordings = getMeetingAudioRecordings(id);
+  return {
+    ...mapMeetingRow({ ...row, transcript: getMergedMeetingTranscriptSegments(id) }),
+    hasAudio: audioRecordings.some((item) => item.status === "ready"),
+    audioRecordings,
+  };
 }
 
 function getMeetingAsrRows(meetingId: string) {

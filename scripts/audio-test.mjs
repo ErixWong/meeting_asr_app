@@ -32,6 +32,7 @@ const { getDb: getSharedDb } = await load("../server/db-shared.mjs");
 
 after(() => {
   rmSync(sandbox, { recursive: true, force: true });
+  rmSync(rangeCompileDir, { recursive: true, force: true });
 });
 
 /** 合成 s16le 单声道正弦波 PCM。 */
@@ -506,4 +507,57 @@ test("delete: 删会议时音频行与文件一并清掉（含残留 pcm）", ()
   assert.equal(existsSync(rawAudioPath(captureSessionId)), false);
   assert.equal(runtimeStore.listAudioRecordingsForMeeting(meetingId).length, 0);
   console.log("[L4] 删会议连带删文件 OK（mp3 + 残留 pcm）");
+});
+
+// ---------------------------------------------------------------------------
+// L5 Range 语义（`<audio>` 拖进度条的前提）
+// ---------------------------------------------------------------------------
+
+const rangeCompileDir = mkdtempSync(join(tmpdir(), "audio-test-range-"));
+
+// 注意：本文件已经 chdir 到沙箱，所以 tsc 必须用绝对路径调本地依赖（不能用 npx，
+// 否则会在沙箱里现下 tsc）。仓库根从 import.meta.url 反推。
+const repoRoot = new URL("..", import.meta.url).pathname;
+
+async function loadRangeModule() {
+  const { spawnSync } = await import("node:child_process");
+  const tsc = spawnSync(
+    process.execPath,
+    [
+      join(repoRoot, "node_modules", "typescript", "bin", "tsc"),
+      join(repoRoot, "src", "lib", "http-range.ts"),
+      "--outDir",
+      rangeCompileDir,
+      "--module",
+      "esnext",
+      "--target",
+      "es2022",
+      "--skipLibCheck",
+    ],
+    { encoding: "utf-8" }
+  );
+  if (tsc.status !== 0) {
+    throw new Error(`tsc 编译 http-range.ts 失败: ${tsc.stdout ?? ""}${tsc.stderr ?? ""}`);
+  }
+  return import(new URL(`file://${join(rangeCompileDir, "http-range.js")}`).href);
+}
+
+test("range: bytes=a-b / a- / -N 与越界 416 语义", async () => {
+  const { parseRange } = await loadRangeModule();
+  const size = 1000;
+
+  assert.deepEqual(parseRange("bytes=0-99", size), { start: 0, end: 99 });
+  assert.deepEqual(parseRange("bytes=100-", size), { start: 100, end: 999 });
+  assert.deepEqual(parseRange("bytes=-100", size), { start: 900, end: 999 });
+  assert.deepEqual(parseRange("bytes=0-99999", size), { start: 0, end: 999 });
+  assert.deepEqual(parseRange("bytes=999-999", size), { start: 999, end: 999 });
+
+  assert.equal(parseRange(null, size), null, "无 Range 头应回 200 全量");
+  assert.equal(parseRange("", size), null);
+  assert.equal(parseRange("bytes=2000-", size), "invalid", "起点越界应 416");
+  assert.equal(parseRange("bytes=100-50", size), "invalid", "start>end 应 416");
+  assert.equal(parseRange("bytes=abc", size), "invalid");
+  assert.equal(parseRange("bytes=-", size), "invalid");
+  assert.equal(parseRange("bytes=-0", size), "invalid");
+  console.log("[L5] Range 语义 OK（200/206/416 三条分支）");
 });

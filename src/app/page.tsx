@@ -51,6 +51,20 @@ const HISTORY_TRANSLATE_LANGS = [
   { value: "ko", label: "韩语" },
 ];
 
+/** 录音时长 mm:ss（feat-261101-01）。 */
+function formatAudioDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+/** 录音体积 MB（1 位小数）。 */
+function formatAudioSize(bytes: number): string {
+  const mb = (Number(bytes) || 0) / 1024 / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
+}
+
 function getTranslationLangLabel(result: MeetingLlmResultSummary): string | null {
   if (result.resultType !== "translation" || !result.generationConfigSnapshot) return null;
   try {
@@ -1863,6 +1877,47 @@ export default function MeetingPage() {
                     </div>
                   </div>
                 </div>
+                {selected.audioRecordings && selected.audioRecordings.length > 0 && (
+                  <div className="mb-3 flex flex-col gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2">
+                    {selected.audioRecordings.map((recording, index) => (
+                      <div key={recording.id} className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="shrink-0 text-xs font-medium text-slate-500">
+                          录音{selected.audioRecordings && selected.audioRecordings.length > 1 ? ` ${index + 1}` : ""}
+                        </span>
+                        {recording.status === "ready" ? (
+                          <>
+                            <audio
+                              controls
+                              preload="none"
+                              className="h-9 min-w-0 flex-1"
+                              src={`/api/meetings/${selected.id}/audio?recording=${encodeURIComponent(recording.id)}`}
+                            />
+                            <span className="shrink-0 text-xs text-slate-400">
+                              {formatAudioDuration(recording.durationSeconds)} · {formatAudioSize(recording.bytes)}
+                              {recording.bitrateKbps ? ` · ${recording.bitrateKbps} kbps` : ""}
+                            </span>
+                            <a
+                              href={`/api/meetings/${selected.id}/audio?recording=${encodeURIComponent(recording.id)}&download=1`}
+                              download={recording.downloadFileName}
+                              className="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+                            >
+                              下载
+                            </a>
+                          </>
+                        ) : recording.status === "failed" ? (
+                          <details className="min-w-0 text-xs text-red-500">
+                            <summary className="cursor-pointer">录音不可用（转码失败）</summary>
+                            <p className="mt-1 break-all text-red-400">{recording.errorMessage ?? "未知原因"}</p>
+                          </details>
+                        ) : (
+                          <span className="text-xs text-slate-400">
+                            录音处理中…（{formatAudioDuration(recording.durationSeconds)} · {formatAudioSize(recording.bytes)}）
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4">
                   {viewTab === "transcript" ? (
                     <div className="flex min-h-0 flex-1 flex-col gap-3">

@@ -18,6 +18,20 @@ export interface TranscriptSegment {
   isFinal: boolean;
 }
 
+export interface MeetingAudioRecording {
+  id: string;
+  captureSessionId: string;
+  /** recording = 已录到 PCM、转码未完成；ready = mp3 可播放；failed = 转码失败 */
+  status: "recording" | "ready" | "failed" | string;
+  format: string;
+  bytes: number;
+  durationSeconds: number;
+  bitrateKbps?: number | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  downloadFileName: string;
+}
+
 export interface MeetingRecord {
   id: string;
   title: string;
@@ -27,6 +41,9 @@ export interface MeetingRecord {
   lastErrorMessage?: string | null;
   transcript: TranscriptSegment[];
   summary: string;
+  /** feat-261101-01：是否有可播放的会议录音 */
+  hasAudio?: boolean;
+  audioRecordings?: MeetingAudioRecording[];
 }
 
 export interface MeetingLlmResultSummary {
