@@ -674,3 +674,40 @@ test("T9 UI 接线：列表/详情两个入口 + 撤销 + 共用投影函数", (
   assert.match(routeSource, /error instanceof AiTitleError \? error\.status : 500/, "错误码按 AiTitleError.status 映射");
   console.log("[T9] UI 接线（两个入口 / 共用投影 / 撤销）OK");
 });
+
+// ---------------------------------------------------------------------------
+// T10 运行期第二道保险：标题模板被删掉时，生成链路自己补回来
+//
+// `meeting_llm_results.prompt_template_id` 是 NOT NULL + 外键（指向 llm_prompt_templates.id），
+// 所以「模板没了」不能只靠代码里的常量兜底 —— 记账行必须落在真实模板 id 上。
+// 断言：删掉 tpl-title 后仍能生成成功，且模板被 ensureTitleTemplate 幂等补回。
+// ---------------------------------------------------------------------------
+
+test("T10 标题模板被删 → 生成链路运行期补回，不因外键挂掉", async () => {
+  const meeting = createMeetingWithSegments(buildLongTranscriptSegments(), "模板缺失用例原标题");
+
+  // 注意：`meeting_llm_results.prompt_template_id` 是 ON DELETE RESTRICT 外键，
+  // 所以「模板被删」只可能出现在「还没有任何记账行引用它」的库上 —— 先清掉前面用例
+  // 产生的记账行（沙箱库，T10 是最后一个用例，不影响其它断言），再删模板。
+  withDb((handle) => {
+    handle.prepare("DELETE FROM meeting_llm_results").run();
+    handle.prepare("DELETE FROM llm_prompt_templates WHERE template_key = ?").run("system_title");
+  });
+  assert.equal(rows("SELECT id FROM llm_prompt_templates WHERE template_key = 'system_title'").length, 0);
+
+  installTransport(() => ({ text: chatCompletionBody("模板缺失时的标题") }));
+  const result = await store.runWithActor(ADMIN, () => store.generateMeetingTitle(meeting.id));
+
+  assert.equal(result.title, "模板缺失时的标题");
+  const restored = one("SELECT id, template_type FROM llm_prompt_templates WHERE template_key = 'system_title'");
+  assert.ok(restored, "生成链路必须把标题模板补回来（否则记账行外键挂掉）");
+  assert.equal(restored.id, "tpl-title");
+  assert.equal(restored.template_type, "title");
+
+  const llmRow = one("SELECT prompt_template_id, status FROM meeting_llm_results WHERE id = ?", result.llmResultId);
+  assert.equal(llmRow.status, "succeeded");
+  assert.equal(llmRow.prompt_template_id, "tpl-title");
+
+  store.setLlmTransport(null);
+  console.log("[T10] 模板缺失自愈 OK");
+});

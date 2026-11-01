@@ -3675,10 +3675,19 @@ async function generateMeetingTitleInner(meetingId: string): Promise<MeetingTitl
     throw new AiTitleError("LLM config incomplete", 500);
   }
 
-  // 模板可能被用户改过 → 优先用库里的；老库连种子都没跑过（模板被删）也能兜底
-  const template = listPromptTemplates().find(
-    (item) => item.templateKey === TITLE_TEMPLATE_KEY || item.id === TITLE_TEMPLATE_ID
-  );
+  // 模板可能被用户改过 → 优先用库里的。
+  // 若库里根本没有标题模板（老库种子没跑到 / 被删），运行期再补一次：
+  // `ensureTitleTemplate` 幂等（已有就不覆盖），而 `meeting_llm_results.prompt_template_id`
+  // 是 NOT NULL + 外键，记账行必须有真实模板 id 才能落库。
+  const findTitleTemplate = () =>
+    listPromptTemplates().find(
+      (item) => item.templateKey === TITLE_TEMPLATE_KEY || item.id === TITLE_TEMPLATE_ID
+    );
+  let template = findTitleTemplate();
+  if (!template) {
+    ensureTitleTemplate(getDb(), nowIso());
+    template = findTitleTemplate();
+  }
   const built = buildTitlePrompt(template?.content || TITLE_TEMPLATE_CONTENT, transcript);
   const maxTokens = Number(String(get("llm", "max_tokens") || "").trim()) || 0;
   const timeoutMs = Number(String(get("llm", "timeout_ms") || "").trim()) || 120_000;
