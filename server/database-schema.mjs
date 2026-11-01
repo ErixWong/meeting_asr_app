@@ -108,6 +108,25 @@ export function initializeDatabase(database) {
       FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS meeting_audio_recordings (
+      id TEXT PRIMARY KEY,
+      capture_session_id TEXT NOT NULL UNIQUE,
+      meeting_id TEXT,
+      file_path TEXT,
+      raw_file_path TEXT,
+      format TEXT NOT NULL,
+      status TEXT NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,
+      duration_seconds REAL NOT NULL DEFAULT 0,
+      sample_rate INTEGER NOT NULL DEFAULT 16000,
+      bitrate_kbps INTEGER,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      expires_at TEXT,
+      FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS meeting_llm_results (
       id TEXT PRIMARY KEY,
       meeting_id TEXT NOT NULL,
@@ -209,6 +228,10 @@ export function initializeDatabase(database) {
       ON audit_logs(resource_type, resource_id);
     CREATE INDEX IF NOT EXISTS idx_meetings_owner_created
       ON meetings(created_by_user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_meeting
+      ON meeting_audio_recordings(meeting_id);
+    CREATE INDEX IF NOT EXISTS idx_meeting_audio_recordings_expires
+      ON meeting_audio_recordings(expires_at);
     CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
       ON auth_sessions(user_id);
   `);

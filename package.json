@@ -12,7 +12,8 @@
     "db:smoke": "node scripts/db-smoke.mjs",
     "db:test-schema": "node scripts/db-schema-test.mjs",
     "test:tts": "node --test scripts/tts-test.mjs",
-    "test:chat": "node --test scripts/chat-voice-test.mjs"
+    "test:chat": "node --test scripts/chat-voice-test.mjs",
+    "test:audio": "node --test scripts/audio-test.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",

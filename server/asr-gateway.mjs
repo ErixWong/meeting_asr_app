@@ -4,9 +4,13 @@ import {
   appendCaptureEvent,
   authorizeAsrGatewaySession,
   createCaptureSession,
+  finishAudioRecording,
   finishCaptureSession,
   getAsrRuntimeConfig,
+  getAudioRuntimeConfig,
+  registerAudioRecording,
 } from "./runtime-store.mjs";
+import { createRecorder } from "./audio-recorder.mjs";
 
 const APP_PORT = Number(process.env.PORT || 3123);
 const DEFAULT_ALLOWED_ORIGINS = `http://localhost:${APP_PORT},http://127.0.0.1:${APP_PORT}`;
@@ -296,6 +300,9 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
   let providerAdapter = null;
   let upstreamConnectTimer = null;
   let partialAccumText = "";
+  let audioRecorder = null;
+  let audioFinalizeStarted = false;
+  let sessionSampleRate = 16000;
   const pendingAudio = [];
   const MAX_PENDING_AUDIO_CHUNKS = 120;
   const UPSTREAM_CONNECT_TIMEOUT_MS = 10000;
@@ -309,8 +316,72 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     if (captureSessionId) {
       finishCaptureSession(captureSessionId, "failed");
     }
+    finalizeAudioRecording();
     sendAppMessage(clientWs, "session.failed", { sessionId, error: errorMessage });
     clientWs.close();
+  }
+
+  /**
+   * 旁路录制（feat-261101-01 L1）：受 audio:record_enabled 开关控制，开关关闭时
+   * 不建文件也不登记 DB 行。录制失败一律只记日志，绝不影响 ASR 转发。
+   */
+  function startAudioRecording() {
+    try {
+      const audioConfig = getAudioRuntimeConfig();
+      if (!audioConfig.recordEnabled) return;
+
+      audioRecorder = createRecorder({
+        captureSessionId,
+        sampleRate: sessionSampleRate,
+      });
+      registerAudioRecording({
+        captureSessionId,
+        sampleRate: sessionSampleRate,
+        rawFilePath: audioRecorder.storedPath,
+        orphanTtlHours: audioConfig.orphanTtlHours,
+      });
+    } catch (error) {
+      audioRecorder = null;
+      console.error("[ASR Gateway] audio recording init failed:", error);
+    }
+  }
+
+  /** 幂等：finish / fail / close 三处都会调，只有第一次真正落盘收尾。 */
+  function finalizeAudioRecording() {
+    if (audioFinalizeStarted || !audioRecorder) return;
+    audioFinalizeStarted = true;
+    const activeRecorder = audioRecorder;
+    const targetCaptureSessionId = captureSessionId;
+
+    void activeRecorder
+      .finalize()
+      .then((result) => {
+        try {
+          finishAudioRecording({
+            captureSessionId: targetCaptureSessionId,
+            rawFilePath: result.storedPath,
+            bytes: result.bytes,
+            durationSeconds: result.durationSeconds,
+            ok: result.ok,
+            errorMessage: result.error,
+          });
+        } catch (error) {
+          console.error("[ASR Gateway] audio recording persist failed:", error);
+        }
+      })
+      .catch((error) => {
+        console.error("[ASR Gateway] audio recording finalize failed:", error);
+      });
+  }
+
+  /** PCM 帧旁路：写盘异常只打日志，不影响上游转发。 */
+  function recordAudioChunk(data) {
+    if (!audioRecorder) return;
+    try {
+      audioRecorder.append(data);
+    } catch (error) {
+      console.error("[ASR Gateway] audio recording append failed:", error);
+    }
   }
 
   function ensureCaptureSession() {
@@ -329,6 +400,8 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
       },
       hotwords: runtimeConfig.hotwords,
     });
+
+    startAudioRecording();
 
     return captureSessionId;
   }
@@ -357,6 +430,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
     if (captureSessionId) {
       finishCaptureSession(captureSessionId);
     }
+    finalizeAudioRecording();
     sendAppMessage(clientWs, "session.finished", { sessionId });
     clientWs.close();
   }
@@ -374,6 +448,9 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
 
     sessionStarted = true;
     sessionId = String(message.sessionId || `asr-${randomUUID()}`);
+    sessionSampleRate = Number(message?.audio?.sampleRate) > 0
+      ? Number(message.audio.sampleRate)
+      : 16000;
 
     try {
       ensureCaptureSession();
@@ -500,6 +577,8 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
         return;
       }
 
+      recordAudioChunk(data);
+
       if (targetReady && providerStarted && targetWs) {
         if (!safeSend(targetWs, data)) {
           failSession("ASR upstream send buffer overflow");
@@ -535,6 +614,7 @@ export function attachAsrGateway(server, { path = "/asr", onUnhandledUpgrade, de
 
   clientWs.on("close", () => {
     clearTimeout(upstreamConnectTimer);
+    finalizeAudioRecording();
     if (targetWs?.readyState === WebSocket.OPEN || targetWs?.readyState === WebSocket.CONNECTING) {
       targetWs.close();
     }
