@@ -611,18 +611,32 @@ async function withTransaction<T>(callback: () => Promise<T>): Promise<T> {
  *
  * 首次调用做一次幂等初始化（auth 列自愈 → 种子数据 → 卡住的 LLM 任务收敛）；
  * 异步化后用 single-flight promise 代替 legacy 的 `dbSeeded` 布尔值，避免并发首调重复跑。
+ *
+ * ⚠ 播种期间必须**重入放行**：seedDefaults / seedIdentityDefaults 内部会调用
+ * `upsertPromptTemplate` / `upsertHotword` / `writeAuditLog` 等仍然走 `getDb()` 的函数。
+ * 若这些调用也去 `await seedPromise`，就会等待「自己所在的那个 promise」—— 永久挂住
+ * （同步时代 `dbSeeded` 是布尔值，重入只会看到 true 直接返回句柄，所以没有这个问题）。
+ * 用 AsyncLocalStorage 标记播种上下文：**同一个异步上下文**内重入直接拿句柄，
+ * 其他并发调用仍然排队等播种完成。
  */
+const seedingContext = new AsyncLocalStorage<AsyncDatabase>();
+
 async function getDb(): Promise<AsyncDatabase> {
+  const seedingDb = seedingContext.getStore();
+  if (seedingDb) return seedingDb;
+
   const database = (await getSharedDb()) as unknown as AsyncDatabase;
   if (!seedPromise) {
-    seedPromise = (async () => {
-      await migrateAuthSchema(database);
-      await seedDefaults(database);
-      await reconcileStuckLlmProcessing(database);
-    })().catch((error) => {
-      seedPromise = null;
-      throw error;
-    });
+    seedPromise = seedingContext
+      .run(database, async () => {
+        await migrateAuthSchema(database);
+        await seedDefaults(database);
+        await reconcileStuckLlmProcessing(database);
+      })
+      .catch((error) => {
+        seedPromise = null;
+        throw error;
+      });
   }
   await seedPromise;
   return database;

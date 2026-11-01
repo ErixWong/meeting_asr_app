@@ -16,7 +16,7 @@
  *   T7 并发点击：两个并发都成功，后者覆盖前者，不留半更新状态
  *   T8 越权：别人的会议 → 404（AiTitleError），不动任何数据
  *
- * 运行：npm run test:title（= node --test scripts/ai-title-test.mjs，需 Node 24：node:sqlite）
+ * 运行：npm run test:title（= node --test scripts/ai-title-test.mjs）
  * 说明：
  *   * 临时库落在 os.tmpdir() 沙箱里（测试开始 chdir 进去），收尾整目录删除，不污染仓库；
  *   * **测试里不出现任何真实模型名 / API key**：模型名从库里的 `llm.model` 设置读出来再断言，
@@ -59,7 +59,9 @@ registerHooks({
   },
 });
 
-const { DatabaseSync } = await import("node:sqlite");
+// 直接用 better-sqlite3（与生产驱动同一个库）：**不能**混用 node:sqlite 的 DatabaseSync，
+// 两个 SQLite 库在同一个文件上交替写会让 WAL 对彼此不可读（实测 SQLITE_IOERR_SHORT_READ）。
+const Database = (await import("better-sqlite3")).default;
 
 // 「老库」现场：库文件已存在且 `llm_prompt_templates` 里已经有一条（非内置的）模板。
 // 这样 admin-store 的 seedDefaults 里 `if (templateCount === 0) { …tpl-1/tpl-2… }` 整块不会跑，
@@ -79,7 +81,7 @@ process.env.SQLITE_PATH = dbPath;
   await initializeSchema(new AsyncDb(bootstrapKnex, "sqlite"));
   await bootstrapKnex.destroy();
 
-  const bootstrap = new DatabaseSync(dbPath);
+  const bootstrap = new Database(dbPath);
   bootstrap
     .prepare(`
       INSERT INTO llm_prompt_templates (
@@ -109,7 +111,7 @@ const { llmQueue } = await import(pathToFileURL(join(repoRoot, "src", "lib", "ll
 // 工具
 // ---------------------------------------------------------------------------
 
-const db = () => new DatabaseSync(dbPath);
+const db = () => new Database(dbPath);
 
 async function withDb(fn) {
   const handle = db();
