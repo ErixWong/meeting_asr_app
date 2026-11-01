@@ -7,6 +7,9 @@
  *   1. ChatVoiceButton 的按住/松开状态机（真机回归 fix-261101-01 F1）：
  *      「启动期间松手」「60s 兜底」「正常长按释放」三条场景，断言最终 phase 回到 idle、
  *      计时器被清、且 stopRecording（= 一次 session.finish）只发一次。
+ *   2. src/lib/chat-voice-errors.ts 的 friendlyError（真机回归 fix-261101-01 F2）：
+ *      NotFoundError / NotAllowedError / NotReadableError / timeout / connect / AbortError /
+ *      未知错误原样透传 7 类 + 优先级（权限类最先命中）。
  *
  * 做法（本机无浏览器 / 无 react-dom 测试渲染器）：
  *   - 用 tsc 把 ChatVoiceButton.tsx 编译到临时目录（临时 tsconfig 提供 @/* 路径别名）；
@@ -220,9 +223,32 @@ function prepare(reuseDir) {
   writeFileSync(join(stubsDir, "stub-funasr.mjs"), STUB_FUNASR);
 
   const componentPath = join(outDir, "components/chat/ChatVoiceButton.js");
+  const errorsModulePath = join(outDir, "errors/chat-voice-errors.js");
   if (reuseDir) {
     if (!existsSync(componentPath)) throw new Error(`复用的编译产物不存在: ${componentPath}`);
-    return { workDir, outDir, stubsDir, componentPath, funasrStubPath: join(stubsDir, "stub-funasr.mjs") };
+    return {
+      workDir,
+      outDir,
+      stubsDir,
+      componentPath,
+      errorsModulePath: existsSync(errorsModulePath) ? errorsModulePath : null,
+      funasrStubPath: join(stubsDir, "stub-funasr.mjs"),
+    };
+  }
+
+  // 错误文案模块（无外部 import，可单文件编译；tts-test.mjs 里同一个套路）
+  const errorsSrc = join(SRC_ROOT, "src/lib/chat-voice-errors.ts");
+  let compiledErrors = null;
+  if (existsSync(errorsSrc)) {
+    const tscErrors = spawnSync(
+      "npx",
+      ["tsc", errorsSrc, "--outDir", join(outDir, "errors"), "--module", "esnext", "--target", "es2022", "--skipLibCheck"],
+      { encoding: "utf-8" }
+    );
+    if (tscErrors.status !== 0) {
+      throw new Error(`tsc 编译 chat-voice-errors.ts 失败:\n${tscErrors.stdout || ""}${tscErrors.stderr || ""}`);
+    }
+    compiledErrors = errorsModulePath;
   }
 
   const tsconfigPath = join(workDir, "tsconfig.probe.json");
@@ -260,9 +286,17 @@ function prepare(reuseDir) {
     react: join(stubsDir, "stub-react.mjs"),
     "react/jsx-runtime": join(stubsDir, "stub-jsx.mjs"),
     "@/lib/funasr": join(stubsDir, "stub-funasr.mjs"),
+    ...(compiledErrors ? { "@/lib/chat-voice-errors": compiledErrors } : {}),
   });
 
-  return { workDir, outDir, stubsDir, componentPath, funasrStubPath: join(stubsDir, "stub-funasr.mjs") };
+  return {
+    workDir,
+    outDir,
+    stubsDir,
+    componentPath,
+    errorsModulePath: compiledErrors,
+    funasrStubPath: join(stubsDir, "stub-funasr.mjs"),
+  };
 }
 
 // ---------------------------------------------------------------- 探针（子进程）
@@ -297,8 +331,8 @@ function createClock() {
     uninstall() {
       Object.assign(globalThis, real);
     },
+    /** 还在跑的 interval 数（= tick 是否被清） */
     pendingIntervals: () => [...timers.values()].filter((t) => t.interval !== null).length,
-    pendingTimers: () => timers.size,
     /** 推进假时钟：到点就执行回调，每次回调后清空微任务（让 state 更新/重渲染落地） */
     async advance(ms) {
       const target = now + ms;
@@ -551,5 +585,69 @@ if (IS_PROBE_CHILD) {
   test("状态机 C：正常长按释放回 idle，且只发一次 session.finish", () => {
     const r = runProbeChild("C");
     assert.equal(r.status, 0, `探针失败（exit ${r.status}）:\n${r.stdout || ""}${r.stderr || ""}`);
+  });
+
+  // ---------------- friendlyError（fix-261101-01 F2） ----------------
+
+  let friendlyError = null;
+  async function errors() {
+    if (!friendlyError) {
+      const dir = probeDir();
+      const file = join(dir, "out/errors/chat-voice-errors.js");
+      assert.ok(
+        existsSync(file),
+        `chat-voice-errors.ts 未编译出来（${file}）——若这是 CHAT_VOICE_SRC_ROOT 指向的旧代码树，` +
+          `说明那份树还没有该模块，本组用例必然失败，属反向验证的预期结果`
+      );
+      ({ friendlyError } = await import(pathToFileURL(file).href));
+    }
+    return friendlyError;
+  }
+
+  test("friendlyError：NotFoundError / device not found 给出「未找到可用麦克风设备」", async () => {
+    const f = await errors();
+    const expected = "未找到可用麦克风设备，请检查系统音频输入后重试";
+    // 真机现场原文：无麦克风设备时浏览器抛 DOMException NotFoundError
+    assert.equal(f(new DOMException("Requested device not found", "NotFoundError")), expected);
+    assert.equal(f(new Error("NotFoundError")), expected);
+    assert.equal(f(new Error("Requested device not found")), expected);
+    assert.equal(f(new Error("no audio devices found")), expected);
+    assert.equal(f(new Error("未找到可用的录音设备")), expected);
+  });
+
+  test("friendlyError：NotAllowedError 仍映射权限文案（优先级最高）", async () => {
+    const f = await errors();
+    const expected = "麦克风权限被拒绝：请在浏览器地址栏允许麦克风后重试";
+    assert.equal(f(new DOMException("Permission denied", "NotAllowedError")), expected);
+    assert.equal(f(new Error("NotAllowedError: Permission denied by system")), expected);
+    // 优先级：同时含「被占用」字样也先命权限
+    assert.equal(f(new Error("NotReadableError: permission denied")), expected);
+  });
+
+  test("friendlyError：NotReadableError 映射「不可用或被占用」", async () => {
+    const f = await errors();
+    assert.equal(f(new DOMException("Could not start audio source", "NotReadableError")), "麦克风不可用或被占用，请检查设备");
+    assert.equal(f(new Error("设备被占用")), "麦克风不可用或被占用，请检查设备");
+  });
+
+  test("friendlyError：timeout / connect 映射对应文案", async () => {
+    const f = await errors();
+    assert.equal(f(new Error("timeout")), "语音服务启动超时，请检查网络或稍后再试");
+    assert.equal(f(new Error("连接超时")), "语音服务启动超时，请检查网络或稍后再试");
+    assert.equal(f(new Error("WebSocket connect failed")), "语音识别服务连接失败，请稍后再试");
+    assert.equal(f(new Error("ECONNREFUSED")), "语音识别服务连接失败，请稍后再试");
+  });
+
+  test("friendlyError：AbortError（用户中断）安静处理，返回空串", async () => {
+    const f = await errors();
+    assert.equal(f(new DOMException("The user aborted a request.", "AbortError")), "");
+    assert.equal(f(new Error("AbortError: aborted while connecting")), "");
+  });
+
+  test("friendlyError：未知错误原样透传 message", async () => {
+    const f = await errors();
+    assert.equal(f(new Error("something odd happened")), "something odd happened");
+    // 不凭空造出 "Error: xxx"
+    assert.equal(f(new Error("plain")), "plain");
   });
 }

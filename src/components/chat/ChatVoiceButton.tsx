@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FunASRClient } from "@/lib/funasr";
+import { friendlyError } from "@/lib/chat-voice-errors";
 
 interface Props {
   /** 语音识别结束后回调解码文本（可能为空）。 */
@@ -13,17 +14,6 @@ const MAX_HOLD_MS = 60_000;
 const START_TIMEOUT_MS = 8000;
 
 type Phase = "idle" | "starting" | "holding";
-
-/** 把底层错误翻译成用户能看懂的话 */
-function friendlyError(err: Error): string {
-  const m = err.message || String(err);
-  if (/permission|NotAllowedError|denied|not allowed|\u6743\u9650/i.test(m))
-    return "麦克风权限被拒绝：请在浏览器地址栏允许麦克风后重试";
-  if (/NotReadable|\u88ab\u5360/i.test(m)) return "麦克风不可用或被占用，请检查设备";
-  if (/timeout|\u8d85\u65f6/i.test(m)) return "语音服务启动超时，请检查网络或稍后再试";
-  if (/connect|websocket|ECONN|socket/i.test(m)) return "语音识别服务连接失败，请稍后再试";
-  return m;
-}
 
 function formatElapsed(seconds: number) {
   const m = Math.floor(seconds / 60);
@@ -115,6 +105,7 @@ export default function ChatVoiceButton({ onUtterance, disabled = false }: Props
             }
           },
           onError: (err) => {
+            // friendlyError 返回空串表示安静处理（如 AbortError），setError("") 不渲染徽标
             setError(friendlyError(err));
             cleanup();
           },
