@@ -4,6 +4,8 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createHash, randomBytes, scrypt as scryptCallback, scryptSync, timingSafeEqual } from "crypto";
 import { getDb as getSharedDb, cleanupExpiredAuditLogs as cleanupSharedAuditLogs } from "../../server/db-shared.mjs";
+import { insertIgnore, upsert } from "../../server/db/insert-ignore.mjs";
+import { limitFragment, singleRowFragment, addColumnIfAbsent } from "../../server/db/async-db.mjs";
 import { resolveStoredPath } from "../../server/audio-paths.mjs";
 import {
   bindAudioRecordingsToMeeting,
@@ -587,6 +589,8 @@ type AsyncStatement<T = SqliteRow> = {
 };
 
 type AsyncDatabase = {
+  /** 方言（sqlite / mysql / mssql）——方言敏感 SQL 的分支依据（#55b） */
+  dbType: string;
   exec: (sql: string) => Promise<void>;
   prepare: <T = SqliteRow>(sql: string) => AsyncStatement<T>;
   /**
@@ -681,10 +685,17 @@ async function migrateAuthSchema(database: AsyncDatabase) {
   await ensureColumn(database, "users", "last_login_at", "TEXT");
 }
 
+/**
+ * 幂等补列。
+ *
+ * #55b：列探测从 `PRAGMA table_info(...)`（SQLite 专属）改成跨库的 `addColumnIfAbsent()`
+ * （sqlite → PRAGMA / mysql → information_schema.COLUMNS / mssql → INFORMATION_SCHEMA.COLUMNS，
+ * `ADD COLUMN` 关键字与列类型按方言翻译）。
+ * 这条在**每次启动**都会跑（migrateAuthSchema），PRAGMA 在 mssql 上是硬失败，属真机链路的必经点。
+ * 具体方言分支在 server/db/async-db.mjs（`npm run db:test-dialect` 直接测的就是那个函数）。
+ */
 async function ensureColumn(database: AsyncDatabase, tableName: string, columnName: string, definition: string) {
-  const columns = (await database.prepare(`PRAGMA table_info(${tableName})`).all()) as Array<{ name: string }>;
-  if (columns.some((column) => column.name === columnName)) return;
-  await database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  await addColumnIfAbsent(database, tableName, columnName, definition);
 }
 
 async function seedDefaults(database: AsyncDatabase) {
@@ -1004,41 +1015,42 @@ async function seedDefaults(database: AsyncDatabase) {
 }
 
 async function insertMissingSetting(database: AsyncDatabase, setting: SettingRow) {
-  await database
-    .prepare(`
-      INSERT OR IGNORE INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      setting.itemSection,
-      setting.itemMark,
-      setting.itemTitle,
-      setting.itemDescription,
-      setting.itemValue,
-      nowIso()
-    );
+  // #55b：原 `INSERT OR IGNORE`（SQLite 方言）→ 跨库 insertIgnore()
+  // （sqlite/mysql 走 knex onConflict().ignore()，mssql 走 INSERT ... SELECT ... WHERE NOT EXISTS）
+  await insertIgnore(
+    database,
+    "app_settings",
+    {
+      item_section: setting.itemSection,
+      item_mark: setting.itemMark,
+      item_title: setting.itemTitle,
+      item_description: setting.itemDescription,
+      item_value: setting.itemValue,
+      updated_at: nowIso(),
+    },
+    ["item_section", "item_mark"]
+  );
 }
 
 async function upsertSetting(setting: SettingRow, db?: AsyncDatabase) {
   const database = db ?? (await getDb());
-  await database
-    .prepare(`
-      INSERT INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(item_section, item_mark) DO UPDATE SET
-        item_title = excluded.item_title,
-        item_description = excluded.item_description,
-        item_value = excluded.item_value,
-        updated_at = excluded.updated_at
-    `)
-    .run(
-      setting.itemSection,
-      setting.itemMark,
-      setting.itemTitle,
-      setting.itemDescription,
-      setting.itemValue,
-      nowIso()
-    );
+  // #55b：原 `INSERT ... ON CONFLICT(item_section, item_mark) DO UPDATE SET ... excluded.*`
+  // → 跨库 upsert()（sqlite: ON CONFLICT DO UPDATE / mysql: ON DUPLICATE KEY UPDATE /
+  //   mssql: UPDATE ... IF @@ROWCOUNT = 0 INSERT ...）
+  await upsert(
+    database,
+    "app_settings",
+    {
+      item_section: setting.itemSection,
+      item_mark: setting.itemMark,
+      item_title: setting.itemTitle,
+      item_description: setting.itemDescription,
+      item_value: setting.itemValue,
+      updated_at: nowIso(),
+    },
+    ["item_section", "item_mark"],
+    ["item_title", "item_description", "item_value", "updated_at"]
+  );
 }
 
 async function upsertPromptTemplate(template: PromptTemplateRow, db?: AsyncDatabase) {
@@ -1047,32 +1059,35 @@ async function upsertPromptTemplate(template: PromptTemplateRow, db?: AsyncDatab
     .prepare("SELECT created_at as createdAt FROM llm_prompt_templates WHERE id = ?")
     .get(template.id) as { createdAt?: string } | undefined;
 
-  await database
-    .prepare(`
-      INSERT INTO llm_prompt_templates (id, template_key, template_name, template_type, content, description, status, is_system, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        template_key = excluded.template_key,
-        template_name = excluded.template_name,
-        template_type = excluded.template_type,
-        content = excluded.content,
-        description = excluded.description,
-        status = excluded.status,
-        is_system = excluded.is_system,
-        updated_at = excluded.updated_at
-    `)
-    .run(
-      template.id,
-      template.templateKey,
-      template.templateName,
-      template.templateType,
-      template.content,
-      template.description,
-      template.status,
-      template.isSystem ? 1 : 0,
-      existing?.createdAt ?? nowIso(),
-      nowIso()
-    );
+  // #55b：原 `ON CONFLICT(id) DO UPDATE SET ... excluded.*` → 跨库 upsert()。
+  // created_at 不在覆盖列里（首次插入值保留，与改动前一致）。
+  await upsert(
+    database,
+    "llm_prompt_templates",
+    {
+      id: template.id,
+      template_key: template.templateKey,
+      template_name: template.templateName,
+      template_type: template.templateType,
+      content: template.content,
+      description: template.description,
+      status: template.status,
+      is_system: template.isSystem ? 1 : 0,
+      created_at: existing?.createdAt ?? nowIso(),
+      updated_at: nowIso(),
+    },
+    ["id"],
+    [
+      "template_key",
+      "template_name",
+      "template_type",
+      "content",
+      "description",
+      "status",
+      "is_system",
+      "updated_at",
+    ]
+  );
 }
 
 async function upsertHotword(hotword: HotwordRow, db?: AsyncDatabase) {
@@ -1081,26 +1096,22 @@ async function upsertHotword(hotword: HotwordRow, db?: AsyncDatabase) {
     .prepare("SELECT created_at as createdAt FROM asr_hotwords WHERE id = ?")
     .get(hotword.id) as { createdAt?: string } | undefined;
 
-  await database
-    .prepare(`
-      INSERT INTO asr_hotwords (id, term, weight, status, note, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        term = excluded.term,
-        weight = excluded.weight,
-        status = excluded.status,
-        note = excluded.note,
-        updated_at = excluded.updated_at
-    `)
-    .run(
-      hotword.id,
-      hotword.term,
-      hotword.weight,
-      hotword.status,
-      hotword.note,
-      existing?.createdAt ?? nowIso(),
-      nowIso()
-    );
+  // #55b：原 `ON CONFLICT(id) DO UPDATE SET ... excluded.*` → 跨库 upsert()
+  await upsert(
+    database,
+    "asr_hotwords",
+    {
+      id: hotword.id,
+      term: hotword.term,
+      weight: hotword.weight,
+      status: hotword.status,
+      note: hotword.note,
+      created_at: existing?.createdAt ?? nowIso(),
+      updated_at: nowIso(),
+    },
+    ["id"],
+    ["term", "weight", "status", "note", "updated_at"]
+  );
 }
 
 function isSecretSetting(setting: Pick<SettingRow, "itemSection" | "itemMark">) {
@@ -1706,12 +1717,13 @@ export async function setUserRoleKeys(userId: string, roleKeys: string[], db?: A
 
     await database.prepare("DELETE FROM user_roles WHERE user_id = ?").run(userId);
     for (const role of selectedRoles) {
-      await database
-        .prepare(`
-        INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
-          VALUES (?, ?, ?, ?)
-        `)
-        .run(newId("user-role"), userId, role.id, nowIso());
+      // #55b：原 `INSERT OR IGNORE INTO user_roles ...` → 跨库 insertIgnore()
+      await insertIgnore(
+        database,
+        "user_roles",
+        { id: newId("user-role"), user_id: userId, role_id: role.id, created_at: nowIso() },
+        ["user_id", "role_id"]
+      );
     }
 
     return (await listUsers(tx)).find((item) => item.id === userId) ?? null;
@@ -1740,8 +1752,12 @@ function ensureUserRoleChangeAllowed(userId: string, roleKeys: string[]) {
 }
 
 export async function listAuditLogs(limit = 100) {
-  return await (await getDb())
-          .prepare<AuditLogRow>(`
+  const database = await getDb();
+  // #55b：原 `LIMIT ?`（MSSQL 不支持 LIMIT）→ 方言分页后缀
+  // （sqlite/mysql: `LIMIT n`；mssql: `ORDER BY ... OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`）。
+  // 行数经 limitFragment() 白名单化成正整数后再拼入 SQL 文本，不再走绑定参数。
+  return await database
+    .prepare<AuditLogRow>(`
       SELECT
         id,
         actor_user_id as actorUserId,
@@ -1756,9 +1772,9 @@ export async function listAuditLogs(limit = 100) {
         created_at as createdAt
       FROM audit_logs
       ORDER BY created_at DESC
-      LIMIT ?
+      ${limitFragment(database.dbType, limit)}
     `)
-    .all(limit);
+    .all();
 }
 
 export async function cleanupExpiredAuditLogs(retentionDays = 30) {
@@ -1951,13 +1967,14 @@ async function seedIdentityDefaults(database: AsyncDatabase) {
   ];
 
   for (const role of roles) {
-    await database
-      .prepare(`
-        INSERT INTO roles (id, role_key, role_name, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name
-      `)
-      .run(role.id, role.roleKey, role.roleName, nowIso());
+    // #55b：原 `ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name` → 跨库 upsert()
+    await upsert(
+      database,
+      "roles",
+      { id: role.id, role_key: role.roleKey, role_name: role.roleName, created_at: nowIso() },
+      ["role_key"],
+      ["role_name"]
+    );
   }
 
   const systemAdminRole = await database
@@ -1968,13 +1985,29 @@ async function seedIdentityDefaults(database: AsyncDatabase) {
     .get() as { id: string } | undefined;
 
   if (systemAdminRole && legacyMinutesAdminRole) {
-    await database
-      .prepare(`
-        UPDATE OR IGNORE user_roles
-        SET role_id = ?
-        WHERE role_id = ?
-      `)
-      .run(systemAdminRole.id, legacyMinutesAdminRole.id);
+    // #55b：原 `UPDATE OR IGNORE user_roles SET role_id = ? WHERE role_id = ?`（SQLite 方言）。
+    // 语义：把旧角色行改到新角色上，若该用户已有新角色（撞 unique(user_id, role_id)）则跳过。
+    // 跨库等价写法：逐行「按新角色插入（冲突则跳过）+ 最后删旧行」，只用已验证的
+    // insertIgnore() 与一条普通 DELETE，不依赖 `UPDATE OR IGNORE` / MySQL 的 1093 子查询限制。
+    // 与 legacy 的差异：legacy 在冲突时会把旧行留在表里，随后 `DELETE FROM roles` 撞外键报错；
+    // 新写法把重复的旧行一并删掉（结果上等价：用户最终一定持有新角色）。
+    const legacyRoleRows = (await database
+      .prepare("SELECT id, user_id, created_at FROM user_roles WHERE role_id = ?")
+      .all(legacyMinutesAdminRole.id)) as Array<{ id: string; user_id: string; created_at?: string }>;
+    for (const legacyRow of legacyRoleRows) {
+      await insertIgnore(
+        database,
+        "user_roles",
+        {
+          id: newId("user-role"),
+          user_id: legacyRow.user_id,
+          role_id: systemAdminRole.id,
+          created_at: legacyRow.created_at ?? nowIso(),
+        },
+        ["user_id", "role_id"]
+      );
+    }
+    await database.prepare("DELETE FROM user_roles WHERE role_id = ?").run(legacyMinutesAdminRole.id);
     await database.prepare("DELETE FROM roles WHERE id = ?").run(legacyMinutesAdminRole.id);
   }
 
@@ -2039,12 +2072,18 @@ async function seedIdentityDefaults(database: AsyncDatabase) {
         );
     }
 
-    await database
-      .prepare(`
-        INSERT OR IGNORE INTO user_roles (id, user_id, role_id, created_at)
-        VALUES (?, ?, ?, ?)
-      `)
-      .run("user-role-admin-system", adminUser.id, adminRole.id, nowIso());
+    // #55b：原 `INSERT OR IGNORE INTO user_roles ...` → 跨库 insertIgnore()
+    await insertIgnore(
+      database,
+      "user_roles",
+      {
+        id: "user-role-admin-system",
+        user_id: adminUser.id,
+        role_id: adminRole.id,
+        created_at: nowIso(),
+      },
+      ["user_id", "role_id"]
+    );
   }
 }
 
@@ -2811,6 +2850,8 @@ async function listMeetingAudioRowsByMeeting(): Promise<Map<string, MeetingAudio
 export async function listMeetings() {
   const database = await getDb();
   const actor = getCurrentActor();
+  // #55b：子查询里的 `LIMIT 1`（MSSQL 不支持）→ 方言片段（mssql: `SELECT TOP 1 ...`）
+  const { top, limit } = singleRowFragment(database.dbType, 1);
   const rows = await database
     .prepare(`
       SELECT
@@ -2822,11 +2863,11 @@ export async function listMeetings() {
         m.duration_seconds as durationSeconds,
         m.created_at as createdAt,
         (
-          SELECT result_markdown
+          SELECT ${top}result_markdown
           FROM meeting_llm_results lr
           WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type NOT IN ('translation', 'title')
           ORDER BY lr.version_no DESC, lr.created_at DESC
-          LIMIT 1
+          ${limit}
         ) as summary
       FROM meetings m
       WHERE m.created_by_user_id = ?
@@ -2847,7 +2888,10 @@ export async function listMeetings() {
 }
 
 async function queryMeetingRowById(id: string, db?: AsyncDatabase) {
-  return await (db ?? (await getDb()))
+  const database = db ?? (await getDb());
+  // #55b：子查询里的 `LIMIT 1` → 方言片段（mssql: `SELECT TOP 1 ...`）
+  const { top, limit } = singleRowFragment(database.dbType, 1);
+  return await database
     .prepare(`
       SELECT
         m.id,
@@ -2858,11 +2902,11 @@ async function queryMeetingRowById(id: string, db?: AsyncDatabase) {
         m.duration_seconds as durationSeconds,
         m.created_at as createdAt,
         (
-          SELECT result_markdown
+          SELECT ${top}result_markdown
           FROM meeting_llm_results lr
           WHERE lr.meeting_id = m.id AND lr.status = 'succeeded' AND lr.result_type NOT IN ('translation', 'title')
           ORDER BY lr.version_no DESC, lr.created_at DESC
-          LIMIT 1
+          ${limit}
         ) as summary
       FROM meetings m
       WHERE m.id = ?
