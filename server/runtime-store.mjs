@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "crypto";
 import { existsSync, unlinkSync } from "fs";
 import { getDb as getSharedDb } from "./db-shared.mjs";
+import { insertIgnore, upsert } from "./db/insert-ignore.mjs";
 import { resolveStoredPath } from "./audio-paths.mjs";
 
 const MAX_CAPTURE_EVENTS = 10000;
@@ -40,13 +41,22 @@ async function getDb() {
 }
 
 async function insertMissingSetting(database, section, mark, title, description, value) {
-  await database
-    .prepare(`
-      INSERT INTO app_settings (item_section, item_mark, item_title, item_description, item_value, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(item_section, item_mark) DO NOTHING
-    `)
-    .run(section, mark, title, description, value, nowIso());
+  // #55b：原 `INSERT ... ON CONFLICT(item_section, item_mark) DO NOTHING`（SQLite 方言）
+  // → 跨库 insertIgnore()（sqlite/mysql 走 knex onConflict().ignore()，
+  //   mssql 走 INSERT ... SELECT ... WHERE NOT EXISTS）
+  await insertIgnore(
+    database,
+    "app_settings",
+    {
+      item_section: section,
+      item_mark: mark,
+      item_title: title,
+      item_description: description,
+      item_value: value,
+      updated_at: nowIso(),
+    },
+    ["item_section", "item_mark"]
+  );
 }
 
 async function seedAsrDefaults(database) {
@@ -223,32 +233,32 @@ export async function createCaptureSession(input) {
   const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
 
   const database = await getDb();
-  await database
-    .prepare(`
-      INSERT INTO asr_capture_sessions (
-        capture_session_id, task_id, asr_provider, asr_config_snapshot,
-        hotwords_json, status, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(capture_session_id) DO UPDATE SET
-        task_id = excluded.task_id,
-        asr_provider = excluded.asr_provider,
-        asr_config_snapshot = excluded.asr_config_snapshot,
-        hotwords_json = excluded.hotwords_json,
-        status = excluded.status,
-        updated_at = excluded.updated_at,
-        expires_at = excluded.expires_at
-    `)
-    .run(
-      input.captureSessionId,
-      input.taskId,
-      input.asrProvider,
-      JSON.stringify(input.asrConfigSnapshot),
-      JSON.stringify(input.hotwords),
-      "capturing",
-      createdAt,
-      createdAt,
-      expiresAt
-    );
+  // #55b：原 `ON CONFLICT(capture_session_id) DO UPDATE SET ... excluded.*` → 跨库 upsert()
+  await upsert(
+    database,
+    "asr_capture_sessions",
+    {
+      capture_session_id: input.captureSessionId,
+      task_id: input.taskId,
+      asr_provider: input.asrProvider,
+      asr_config_snapshot: JSON.stringify(input.asrConfigSnapshot),
+      hotwords_json: JSON.stringify(input.hotwords),
+      status: "capturing",
+      created_at: createdAt,
+      updated_at: createdAt,
+      expires_at: expiresAt,
+    },
+    ["capture_session_id"],
+    [
+      "task_id",
+      "asr_provider",
+      "asr_config_snapshot",
+      "hotwords_json",
+      "status",
+      "updated_at",
+      "expires_at",
+    ]
+  );
 
   captureStats.set(input.captureSessionId, {
     totalEvents: 0,
@@ -613,30 +623,39 @@ export async function registerAudioRecording(input) {
   const sampleRate = Number(input?.sampleRate) > 0 ? Number(input.sampleRate) : AUDIO_DEFAULT_SAMPLE_RATE;
 
   const database = await getDb();
-  await database
-    .prepare(`
-      INSERT INTO meeting_audio_recordings (
-        id, capture_session_id, meeting_id, file_path, raw_file_path, format, status,
-        bytes, duration_seconds, sample_rate, bitrate_kbps, error_message,
-        created_at, updated_at, expires_at
-      ) VALUES (?, ?, NULL, NULL, ?, 'mp3', 'recording', 0, 0, ?, NULL, NULL, ?, ?, ?)
-      ON CONFLICT(capture_session_id) DO UPDATE SET
-        raw_file_path = excluded.raw_file_path,
-        sample_rate = excluded.sample_rate,
-        status = 'recording',
-        error_message = NULL,
-        updated_at = excluded.updated_at,
-        expires_at = excluded.expires_at
-    `)
-    .run(
-      `aud-${randomUUID()}`,
-      input.captureSessionId,
-      input.rawFilePath ?? null,
-      sampleRate,
-      createdAt,
-      createdAt,
-      expiresAt
-    );
+  // #55b：原 `ON CONFLICT(capture_session_id) DO UPDATE SET ... excluded.*` → 跨库 upsert()。
+  // 覆盖列里的 `status = 'recording'` / `error_message = NULL` 是 SQL 字面量（不是绑定值），
+  // 用 `{ column, literal }` 形式表达；其余列取新行值。
+  await upsert(
+    database,
+    "meeting_audio_recordings",
+    {
+      id: `aud-${randomUUID()}`,
+      capture_session_id: input.captureSessionId,
+      meeting_id: null,
+      file_path: null,
+      raw_file_path: input.rawFilePath ?? null,
+      format: "mp3",
+      status: "recording",
+      bytes: 0,
+      duration_seconds: 0,
+      sample_rate: sampleRate,
+      bitrate_kbps: null,
+      error_message: null,
+      created_at: createdAt,
+      updated_at: createdAt,
+      expires_at: expiresAt,
+    },
+    ["capture_session_id"],
+    [
+      "raw_file_path",
+      "sample_rate",
+      { column: "status", literal: "'recording'" },
+      { column: "error_message", literal: "NULL" },
+      "updated_at",
+      "expires_at",
+    ]
+  );
 
   return getAudioRecording(input.captureSessionId);
 }

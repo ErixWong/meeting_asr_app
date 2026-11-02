@@ -1,6 +1,9 @@
 # 数据库方言可移植性（SQLite / MariaDB / SQL Server）
 
-> 状态：PR-B 阶段①（issue #53）产出，阶段②（issue #54）与阶段③前半（issue #55 / #55a）更新。**本文件记录的是实测事实与待办边界，不是「已支持多库」的声明。**
+> 状态：PR-B 阶段①（issue #53）产出，阶段②（issue #54）、阶段③（issue #55 / #55a / #55b）更新。
+> **#55b 之后，业务 SQL 里的 SQLite 方言语法已清零**（逐条改前/改后见 §5），三库矩阵 12 项全绿，
+> `DB_TYPE=mssql` 的真机链路（登录→建会议→转写落库→录音绑定→AI 标题→删除级联）已跑通。
+> 但生产仍只用 SQLite：`DB_TYPE=mysql|mssql` 的验证级别是「一次性库 + 真机 e2e」，不是「已在生产跑过」。
 > 生产目前仅 SQLite 经过真机验证；`DB_TYPE=mysql|mssql` 已能「初始化 + 冒烟」（三库 CI 绿），
 > 但业务 SQL 的方言语法清零归 #55（见文末「待办边界」）。
 
@@ -168,6 +171,35 @@
 - 实现：`server/db/async-db.mjs` 的 `appendRowCountSelect(sql)`，只作用于 `prepare(sql).run()` 的 mssql 分支（`.all/.get` 与 `exec` 的 SQL 文本不变）。
 - 断言：`scripts/db-tx-test.mjs` 的 G1–G10（三库都跑）：INSERT=1、UPDATE 命中=1 / 不命中=0、DELETE 命中=1 / 不命中=0，事务内同样成立。
 
+### 4.9 `LIMIT` —— MSSQL 不支持（#55b 新登记）
+
+| 项 | 内容 |
+| --- | --- |
+| 现象原文 | `LIMIT 1` → `Incorrect syntax near 'LIMIT'`（`Msg 102`） |
+| 触发条件 | 业务 SQL 里的 `LIMIT ?`（列表分页）与子查询 `ORDER BY ... LIMIT 1`（取最新一条） |
+| 正确写法 | 子查询取单行 → `SELECT TOP 1 ...`；列表分页 → `ORDER BY ... OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`（要求带 `ORDER BY`） |
+| 本单是否已修 | ✅ 已修：`server/db/async-db.mjs` 的 `singleRowFragment()` / `limitFragment()`，调用点 3 处（`listAuditLogs` / `listMeetings` / `queryMeetingRowById`） |
+| 附带约束 | 行数一律经 `normalizeRowLimit()` 白名单化成正整数后再拼进 SQL 文本（原来是 `?` 绑定参数，改后不再绑定，避免注入面） |
+
+### 4.10 `ALTER TABLE ... ADD COLUMN` 与列类型 —— MSSQL 两处不兼容（#55b 新登记）
+
+| 项 | 内容 |
+| --- | --- |
+| 现象原文 | `ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0` → MSSQL 报 `Incorrect syntax near the keyword 'COLUMN'`；去掉 `COLUMN` 后 `INTEGER` 又报类型不存在 |
+| 触发条件 | `src/lib/admin-store.ts` 的 `ensureColumn()`（`migrateAuthSchema` 每次启动都跑），列探测原本是 SQLite 专属的 `PRAGMA table_info` |
+| 正确写法 | 列探测走 `listTableColumns()`（三库）；`ADD` 后不带 `COLUMN`；类型 `INTEGER→INT` / `TEXT→NVARCHAR(MAX)` / `REAL→FLOAT` / `BLOB→VARBINARY(MAX)` |
+| 本单是否已修 | ✅ 已修：`server/db/async-db.mjs` 的 `addColumnIfAbsent()` + `dialectColumnDefinition()`（sqlite/mysql 的 DDL 文本逐字不变） |
+
+### 4.11 `UPDATE OR IGNORE` —— MSSQL / MySQL 都没有（#55b 新登记，工单未列）
+
+| 项 | 内容 |
+| --- | --- |
+| 触发条件 | `src/lib/admin-store.ts` 的 legacy 角色迁移：`UPDATE OR IGNORE user_roles SET role_id = 新 WHERE role_id = 旧` |
+| 语义 | 更新时若撞 `unique(user_id, role_id)` 就跳过该行（SQLite 的 `OR IGNORE` 冲突消解子句） |
+| 跨库等价写法 | 逐行 `insertIgnore()` 插入新角色行 + 普通 `DELETE FROM user_roles WHERE role_id = 旧` + `DELETE FROM roles WHERE id = 旧` |
+| 行为差异 | legacy 在「用户已有新角色」时把旧行留在表里，随后 `DELETE FROM roles` 会撞外键报错；新写法把重复旧行一并删掉（用户最终一定持有新角色，且旧角色删得掉） |
+| 备注 | 该路径只在**老库同时存在 `minutes_admin` 与 `system_admin` 两个角色**时触发，全新库不可达；等价写法由 `db:test-dialect` 的 E1 用例在三库上验证 |
+
 ## 5. 裸 SQL 分布与方言点逐条
 
 统计口径（可复现）：`grep -c '\.prepare(' <file>`（`.prepare(...)` 即一条裸 SQL 语句）。
@@ -183,47 +215,50 @@
 | `server/app-server.mjs` | 1 | 1 | 误计（Next `app.prepare()`） |
 | **合计（含误计）** | **114** | **114** | 运行时 SQL 语句**一条没改语义**，只是换成 `await`；legacy 的 6 条 DDL 随文件退役 |
 
-### 5.1 `ON CONFLICT`（业务 SQL 实际 7 处；工单快照记 8，差额是 `server/db/schema.mjs:452` 的注释）
+### 5.1 方言敏感语法清零台账（#55b，逐条）
 
-| 文件:行号 | 语句 |
-| --- | --- |
-| `src/lib/admin-store.ts:963` | `ON CONFLICT(item_section, item_mark) DO UPDATE SET` |
-| `src/lib/admin-store.ts:989` | `ON CONFLICT(id) DO UPDATE SET` |
-| `src/lib/admin-store.ts:1023` | `ON CONFLICT(id) DO UPDATE SET` |
-| `src/lib/admin-store.ts:1891` | `ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name` |
-| `server/runtime-store.mjs:37` | `ON CONFLICT(item_section, item_mark) DO NOTHING` |
-| `server/runtime-store.mjs:220` | `ON CONFLICT(capture_session_id) DO UPDATE SET` |
-| `server/runtime-store.mjs:612` | `ON CONFLICT(capture_session_id) DO UPDATE SET` |
+改造后**业务 SQL 里已没有** `ON CONFLICT` / `INSERT OR IGNORE` / `INSERT OR REPLACE` /
+`UPDATE OR IGNORE` / `PRAGMA table_info` / `LIMIT`（`grep` 实测为空，注释除外）。
+实现集中在两个工具模块，调用点只传「表 + 行 + 冲突键 + 覆盖列」：
 
-（另有测试夹具 `scripts/audio-test.mjs:385,394` 两处，不计入业务 SQL。）
+| 工具 | 位置 | 三方方言 |
+| --- | --- | --- |
+| `insertIgnore()` | `server/db/insert-ignore.mjs` | sqlite `INSERT OR IGNORE` / mysql `INSERT IGNORE` / mssql `INSERT ... SELECT ... WHERE NOT EXISTS`（受影响行数三库一致，mssql 走 `@@ROWCOUNT`） |
+| `upsert()` | `server/db/insert-ignore.mjs` | sqlite `ON CONFLICT(keys) DO UPDATE` / mysql `ON DUPLICATE KEY UPDATE`（**不用**已弃用的 `VALUES()`）/ mssql `UPDATE ...; IF @@ROWCOUNT = 0 INSERT ...` |
+| `addColumnIfAbsent()` | `server/db/async-db.mjs` | 列探测三库；`ADD COLUMN` 关键字与列类型（`INTEGER→INT` / `TEXT→NVARCHAR(MAX)`）按方言翻译 |
+| `singleRowFragment()` / `limitFragment()` | `server/db/async-db.mjs` | sqlite/mysql `LIMIT n`；mssql 子查询 `TOP n`、列表 `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` |
 
-### 5.2 `INSERT OR IGNORE`（3 处，全在 `src/lib/admin-store.ts`）
+逐条（文件:行号是**改造前**的位置）：
 
-`src/lib/admin-store.ts:944`（app_settings）、`:1644`、`:1975`（user_roles）。
+| # | 文件:行号 | 改前 SQL | 改后 | 三库实测 |
+| --- | --- | --- | --- | --- |
+| 1 | `src/lib/admin-store.ts:963` | `INSERT ... ON CONFLICT(item_section, item_mark) DO UPDATE SET item_title = excluded.item_title, ...` | `upsert(db,"app_settings",row,["item_section","item_mark"],[...])` | ✅ |
+| 2 | `src/lib/admin-store.ts:989` | `ON CONFLICT(id) DO UPDATE SET template_* = excluded.*` | `upsert(db,"llm_prompt_templates",row,["id"],[...])`（`created_at` 不进覆盖列） | ✅ |
+| 3 | `src/lib/admin-store.ts:1023` | `ON CONFLICT(id) DO UPDATE SET term/weight/status/note = excluded.*` | `upsert(db,"asr_hotwords",row,["id"],[...])` | ✅ |
+| 4 | `src/lib/admin-store.ts:1891` | `ON CONFLICT(role_key) DO UPDATE SET role_name = excluded.role_name` | `upsert(db,"roles",row,["role_key"],["role_name"])` | ✅ |
+| 5 | `server/runtime-store.mjs:37` | `ON CONFLICT(item_section, item_mark) DO NOTHING` | `insertIgnore(db,"app_settings",row,[...])` | ✅ |
+| 6 | `server/runtime-store.mjs:220` | `ON CONFLICT(capture_session_id) DO UPDATE SET task_id/asr_provider/... = excluded.*` | `upsert(db,"asr_capture_sessions",row,["capture_session_id"],[...])` | ✅ |
+| 7 | `server/runtime-store.mjs:612` | `ON CONFLICT(capture_session_id) DO UPDATE SET raw_file_path/sample_rate, status='recording', error_message=NULL, ...` | `upsert(...,[...,{column:"status",literal:"'recording'"},{column:"error_message",literal:"NULL"},...])` | ✅ |
+| 8 | `src/lib/admin-store.ts:944` | `INSERT OR IGNORE INTO app_settings (...)` | `insertIgnore(db,"app_settings",row,["item_section","item_mark"])` | ✅ |
+| 9 | `src/lib/admin-store.ts:1644` | `INSERT OR IGNORE INTO user_roles (...)`（`setUserRoleKeys`） | `insertIgnore(db,"user_roles",row,["user_id","role_id"])` | ✅ |
+| 10 | `src/lib/admin-store.ts:1975` | `INSERT OR IGNORE INTO user_roles (...)`（`seedIdentityDefaults`） | 同上 | ✅ |
+| 11 | `src/lib/admin-store.ts:1969` | `UPDATE OR IGNORE user_roles SET role_id = ? WHERE role_id = ?`（legacy `minutes_admin` 迁移；**工单未列**） | 逐行 `insertIgnore` 到新角色 + 普通 `DELETE` 旧行 | ✅ |
+| 12 | `src/lib/admin-store.ts:627` | `PRAGMA table_info(<table>)`（`ensureColumn`，**每次启动**都跑） | `addColumnIfAbsent(db, table, column, definition)` | ✅ |
+| 13 | `src/lib/admin-store.ts:1759` | `ORDER BY created_at DESC LIMIT ?`（`listAuditLogs`） | `... ${limitFragment(db.dbType, limit)}` | ✅ |
+| 14 | `src/lib/admin-store.ts:2829` / `:2865` | 子查询 `ORDER BY ... LIMIT 1`（`listMeetings` / `queryMeetingRowById`；**工单未列**） | `(SELECT ${top}... ORDER BY ... ${limit})` | ✅ |
 
-### 5.3 `INSERT OR REPLACE`（**业务代码 0 处**）
+`INSERT OR REPLACE`：**业务代码 0 处**（工单快照记 1 处；实测只有 3 处注释提到它，真正的 REPLACE
+已在 #52 的记账改造中删除）。**结论：无待改代码点。**
 
-工单快照记 1 处；实测全仓仅 3 处**注释**提到它（`server/db/schema.mjs:452`、`server/database-schema.mjs:253`、`:434`），真正的 REPLACE 用法已在 #52 的记账改造中删除。**结论：无待改代码点。**
+保留的 `PRAGMA`（都是 SQLite 专属分支，不构成方言泄漏）：`server/db-shared.mjs` 的 3 条连接级
+PRAGMA（`dbType !== "sqlite"` 直接 return）、`server/db/index.mjs` 的 3 条连接优化 PRAGMA
+（只建 sqlite 实例时下发）、`server/db/schema.mjs` 迁移期 `PRAGMA foreign_keys = OFF/ON`
+（`dbType === "sqlite"` 分支）。测试夹具 `scripts/audio-test.mjs` 的 `PRAGMA` 只在 sqlite 上跑。
 
-### 5.4 `PRAGMA`（业务/运行时 8 处）
-
-| 文件:行号 | 用途 |
-| --- | --- |
-| `src/lib/admin-store.ts:627` | `PRAGMA table_info(...)` 列探测 |
-| `server/db-shared.mjs:21` | `PRAGMA journal_mode = WAL` |
-| `server/database-schema.mjs:301` | `PRAGMA table_info(asr_capture_sessions)` |
-| `server/database-schema.mjs:310` | `PRAGMA table_info(meeting_llm_results)` |
-| `server/database-schema.mjs:471` | `PRAGMA table_info(meeting_llm_results)` |
-| `server/database-schema.mjs:503` | `PRAGMA foreign_keys = OFF`（迁移期） |
-| `server/database-schema.mjs:516` | `PRAGMA foreign_keys = ON` |
-| `server/db/schema.mjs:507` / `:522` | `PRAGMA foreign_keys = OFF/ON`（knex 迁移期，仅 `dbType==="sqlite"` 分支） |
-
-> 上表按「运行时业务 + 迁移路径」口径计 8 处（不含 `server/db/index.mjs:109-116` 的 3 条 SQLite 连接级优化 PRAGMA——那 3 条本来就只在 `dbType === "sqlite"` 分支里下发，天然安全）。knex 侧已有跨库替代：`server/db/async-db.mjs` 的 `listTableColumns()`（sqlite `PRAGMA table_info` / mysql `information_schema.COLUMNS` / mssql `INFORMATION_SCHEMA.COLUMNS`）。
-
-## 6. 三库测试脚手架（#53 新增，#54 扩展，#55 加事务套件）
+## 6. 三库测试脚手架（#53 新增，#54 扩展，#55 加事务套件，#55b 加方言语法套件）
 
 ```bash
-# 全矩阵：sqlite（better-sqlite3 生产入口）+ mariadb + mssql，每个目标跑 3 个 job
+# 全矩阵：sqlite（better-sqlite3 生产入口）+ mariadb + mssql，每个目标跑 4 个 job（共 12 项）
 npm run db:test-parity
 
 # 单方言
@@ -241,17 +276,28 @@ npm run db:test-parity -- --allow-skip
 - **容器到宿主的可达性**：mssql 发布在 `0.0.0.0:1433`，容器用 `--add-host=host.docker.internal:host-gateway` + `host.docker.internal:1433`；**mariadb 只发布在 `127.0.0.1:3306`（loopback-only），`host.docker.internal` 打不通**，容器必须挂到 `prod` 网络并用容器名 `mariadb:3306`。
 - 覆盖矩阵（#54 之后只剩一条实现路径，所有目标都打**生产入口**）：
 
-| 目标 | schema/迁移套件 | 语义锁 | 事务句柄/affected-rows |
-| --- | --- | --- | --- |
-| sqlite（生产入口 `getDb()` → `better-sqlite3`） | 场景 1/2/4/4b/5（幂等、污染库收敛、并发）+ **5b 事务并发回归** + 3（v0 旧库迁移）+ **3b 去重/孤儿丢弃** + 6/7/8（生产入口：单例、WAL/busy_timeout/外键、污染库收敛、两模块图并发） | A/B/C 共 11 项 | A–H 共 20 项 |
-| mariadb 11.7 | 基线建表 → 建索引 → 迁移 → 记账单行 → 二次幂等 → v3/v4 迁移循环 + 事务并发回归 + **生产入口 getDb() 初始化** | A/B/C 共 11 项 | A–H 共 20 项 |
-| SQL Server 2025 | 同上 + 嵌套事务提交/回滚 | A/B/C 共 11 项 | A–H 共 20 项 |
+| 目标 | schema/迁移套件 | 语义锁 | 事务句柄/affected-rows | 方言语法（#55b） |
+| --- | --- | --- | --- | --- |
+| sqlite（生产入口 `getDb()` → `better-sqlite3`） | 场景 1/2/4/4b/5（幂等、污染库收敛、并发）+ **5b 事务并发回归** + 3（v0 旧库迁移）+ **3b 去重/孤儿丢弃** + 6/7/8（生产入口：单例、WAL/busy_timeout/外键、污染库收敛、两模块图并发） | A/B/C 共 11 项 | A–H 共 20 项 | A–E 共 14 项 |
+| mariadb 11.7 | 基线建表 → 建索引 → 迁移 → 记账单行 → 二次幂等 → v3/v4 迁移循环 + 事务并发回归 + **生产入口 getDb() 初始化** | A/B/C 共 11 项 | A–H 共 20 项 | A–E 共 14 项 |
+| SQL Server 2025 | 同上 + 嵌套事务提交/回滚 | A/B/C 共 11 项 | A–H 共 20 项 | A–E 共 14 项 |
 
-> #55 起矩阵从 6 项变 **9 项**（每个目标多一个「事务句柄/affected-rows」job）。
+> #55a 起矩阵从 6 项变 **9 项**（每个目标多一个「事务句柄/affected-rows」job）；
+> #55b 起再变 **12 项**（每个目标多一个「方言语法」job，`scripts/db-dialect-test.mjs`）。
 
 - **#54 的关键变化：`db:test-schema` 打的就是运行时那条**。`getDb()`（`server/db-shared.mjs`）是唯一入口，脚本不再直连 `node:sqlite`；`--dialect`/`--matrix` 额外跑一步「生产入口 `getDb()` 在本方言上初始化」，这就是 #54 对 mysql/mssql 的「初始化 + 冒烟可跑通」。
 - **事务并发回归**（#54 新增，三库都跑）：见 §4.6.1 的四条断言（#55 起嵌套断言也从「只在 mssql」放开到三库）。
 - **事务句柄/affected-rows 套件**（#55 新增，`scripts/db-tx-test.mjs`，三库都跑）：顶层提交/回滚、嵌套 savepoint、**D2 防线**、并发不丢写、串行化不交错、affected-rows（含事务内）、回调签名兼容。
+- **方言语法套件**（#55b 新增，`scripts/db-dialect-test.mjs`，`npm run db:test-dialect`，三库都跑）：
+  直接 import 生产用的 `insertIgnore()` / `upsert()` / `addColumnIfAbsent()`（**不复制 SQL 文本**），
+  A 插入忽略（首次生效 / 重复忽略 / 批量部分重复）、B upsert（不存在则插入 / 只覆盖指定列 /
+  `{column, literal}` 字面量覆盖）、C 列探测 + 幂等补列（含 `INTEGER NOT NULL DEFAULT 0` 的方言翻译）、
+  D 分页与单行片段（`LIMIT n` vs `TOP n`）、E 角色迁移等价写法，共 14 条断言。
+- **CI workflow**（#55b 新增，`.github/workflows/db-parity.yml`）：`services: mariadb:11.7 + mssql 2025`，
+  先跑 `scripts/probe-db-targets.mjs` 探活（带重试，把「service 没起来」和「代码坏了」分开），
+  再跑 `npm run db:test-parity`，最后 `scripts/check-db-leftovers.mjs` 复核共享实例无残留。
+  ⚠ **本机没有 GitHub runner，这份 workflow 未被执行过**；本机主门禁仍是本地矩阵。
+  两个辅助脚本本身在本机可跑，且已用真实例验证（探活 2/2、残留 0）。
 - **场景 3b**（#54 新增）：从已删除的 `tests/verify-migration.mjs` 折叠进来的「重复版本去重保留最新 / 孤儿 `llm_result` 丢弃 / 孤儿 `send_record` 丢弃 / 无空 `meeting_id` / 二次幂等 / 全新库直接新结构 + 索引」。
 - **脚本入口必须自己关池**（#54 交付项）：`db-smoke` / `db-schema-test` / `db-semantic-test` / `audio-test` / `ai-title-test` 都必须在收尾释放 knex 连接池（`db.destroy()` / `closeDb()`），否则进程挂着句柄不退出（cron/CI 里就是「永远跑不完」）。断言方式：`timeout 60 node scripts/db-smoke.mjs` 自行退出且退出码 0。
 
@@ -275,12 +321,39 @@ npm run db:test-parity -- --allow-skip
 
 **#55a（本单，已完成）**：第 5 项（事务句柄显式传递 + 运行期防线 + 嵌套 savepoint）与第 7 项（mssql 受影响行数）、第 9 项（非事务语句落进别人事务）。
 
-1. `ON CONFLICT` 7 处 → `insertIgnore()` / upsert 分支（`server/db/insert-ignore.mjs` 已有 mssql 分支）。— 归 #55b
-2. `INSERT OR IGNORE` 3 处 → 同上。— 归 #55b
-3. `PRAGMA table_info` 5 处 → `listTableColumns()`。— 归 #55b
-4. 大小写语义落地：按 §4.4 给 `account_name` 等敏感列声明二进制排序规则（或在应用侧规范化账号名），并把 `LIKE` 检索改 `LOWER()` 方案（§4.5）。— 归 #55b
+1. ✅ `ON CONFLICT` 7 处 → `insertIgnore()` / `upsert()`（#55b 完成，逐条见 §5.1）。
+2. ✅ `INSERT OR IGNORE` 3 处 → `insertIgnore()`（#55b 完成）。顺带清掉工单未列的 `UPDATE OR IGNORE` 1 处（§4.11）。
+3. ✅ `PRAGMA table_info` → `addColumnIfAbsent()`（#55b 完成；legacy 文件删除后业务侧只剩 `ensureColumn` 1 处）。
+4. ⏳ 大小写语义落地：按 §4.4 给 `account_name` 等敏感列声明二进制排序规则（或在应用侧规范化账号名），并把 `LIKE` 检索改 `LOWER()` 方案（§4.5）。**#55b 未做**（仍只有语义锁断言钉住差异，没有落地到 DDL）。
 5. ✅ **实例级事务状态**（§4.6）：① sqlite/mysql 的嵌套 savepoint 缺陷；② mssql 的 `this.knex = trx` 在并发事务下互踩。已改为「事务句柄显式传递 + D2 运行期防线」，实例字段清零。
-6. 三库 CI：把 `npm run db:test-parity` 接进流水线（需要能起 mariadb/mssql 的 runner）。— 归 #55b
+6. ✅ 三库 CI：`.github/workflows/db-parity.yml`（#55b 写好，**未在 runner 上跑过**；本机主门禁仍是本地矩阵）。
 7. ✅ **mssql 的受影响行数**（§4.8）：同 batch 追加 `SELECT @@ROWCOUNT AS changes`，三库断言在 `db:test-tx` 的 G1–G10。
-8. **`?` 的字面量约束 + 类型严格性**（§4.7）：SQL 文本里不能出现字面量 `?`；mssql 不做隐式类型转换。— 归 #55b
+8. ⏳ **`?` 的字面量约束 + 类型严格性**（§4.7）：SQL 文本里不能出现字面量 `?`；mssql 不做隐式类型转换。
+   **#55b 未做**（仍无方言级断言；`?` 字面量当前全仓 0 处，属潜在约束）。
 9. ✅ **mysql/mssql 的非事务语句可能落进别人的事务**：`this.knex = trx` 已删除，非事务语句不再被带进事务。
+
+## 8. #55b 的两个结论（留给后续，别重犯）
+
+### 8.1 `AsyncDb.transactionDepth` 是**双承重**：既是 D2 防线判据，又是语句级串行锁的重入放行条件
+
+| 承重 | 位置 | 拿掉会怎样 |
+| --- | --- | --- |
+| D2 运行期防线 | `server/db/async-db.mjs` 的 `_assertTransactionHandle()`：`transactionDepth > 0 && !isTransactionHandle` ⇒ 抛错 | 事务内误用普通 `db` 不再抛错，语句静默落在事务连接之外（#55a 的硬闸失效） |
+| 语句级串行锁放行 | 同文件的 `_serializeStatement()`：`dbType === "sqlite" && transactionDepth > 0` ⇒ **跳过加锁**直接执行 | sqlite 是单连接：事务内的语句若再抢同一把实例锁，会**自锁**（#55b 前的实测：把深度恒置 0 → `db:test-tx` 挂死、`timeout` 打出 exit 124） |
+
+**结论（#55b 未动串行化策略，原样保留）**：想改「事务内语句跳过串行锁」这条，必须同时保住
+D2 防线（否则漏改一处就静默写错库），或者给锁换成可重入实现；只把 `transactionDepth` 当鉴权位
+去「顺手清零」会直接自锁。改动时的最小验证集：`npm run db:test-tx`（D2 四入口 + 串行化不交错 +
+affected-rows）必须三库全绿。
+
+### 8.2 `DB_TYPE=mssql` 真机链路已验证到哪一步
+
+一次性库 `meeting_asr_ci_e2e_*` + 真 HTTP 服务（`node server/app-server.mjs`，端口 `:3197`）跑通：
+登录 → 建会议（`withTransaction`）→ 转写落库 → 录音行绑定（`meeting_id` 写入、`expires_at` 置 NULL）
+→ AI 标题（LLM 用本地 OpenAI 兼容 stub 顶替，见下）→ 删除级联（子表 0 行、磁盘文件删除）。
+`meeting_asr_ci_*` 库与文件收尾已清空。
+
+⚠ **AI 标题这一步的 LLM 是 stub**：本机可用的真实端点全部不可达（生产 `app_settings` 指向的
+`http://host.docker.internal:8008/v1` 已停；`api.ai.erix.vip` 与 `api.deepseek.com` 用现有 key 均 401）。
+所以真机链路证明的是「HTTP → admin-store → LLM 客户端 → `meeting_llm_results` 落库 → 会议改名」这条
+路径在三库方言上成立，**不是**「真实模型的输出质量」。

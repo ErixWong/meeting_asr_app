@@ -89,6 +89,37 @@ export function appendRowCountSelect(sql) {
   return `${sql}\n; SELECT @@ROWCOUNT AS changes`;
 }
 
+/**
+ * 子查询取单行的方言片段（issue #55b）。SQL Server 不支持 `LIMIT`，只能把 `TOP n` 放到
+ * SELECT 列表前面；SQLite / MariaDB 则把 `LIMIT n` 放到语句尾部。
+ *
+ *   `(SELECT ${top}col FROM ... ORDER BY ... ${limit})`
+ *   → sqlite/mysql: top=""      limit="LIMIT 1"
+ *   → mssql:        top="TOP 1 " limit=""
+ */
+export function singleRowFragment(dbType, count) {
+  const n = normalizeRowLimit(count);
+  if (dbType === "mssql") return { top: `TOP ${n} `, limit: "" };
+  return { top: "", limit: `LIMIT ${n}` };
+}
+
+/**
+ * 列表分页的方言后缀（issue #55b）：SQLite / MariaDB 用 `LIMIT n`；SQL Server 用
+ * `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY`（要求语句本身带 `ORDER BY`）。
+ */
+export function limitFragment(dbType, count) {
+  const n = normalizeRowLimit(count);
+  if (dbType === "mssql") return `OFFSET 0 ROWS FETCH NEXT ${n} ROWS ONLY`;
+  return `LIMIT ${n}`;
+}
+
+/** 行数一律走白名单化的正整数，避免把外部输入直接拼进 SQL 文本 */
+function normalizeRowLimit(count) {
+  const n = Math.trunc(Number(count));
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.min(n, 100000);
+}
+
 const TRANSACTION_GUARD_HINT =
   "事务内请使用回调传入的 tx，否则语句会落在事务连接之外（事务回滚后不会生效，或被并发事务污染）";
 
@@ -254,4 +285,40 @@ export async function listTableColumns(db, tableName) {
     [tableName]
   );
   return extractRows(rows).map((row) => String(row.name));
+}
+
+/**
+ * 方言列定义（issue #55b）：业务侧沿用 SQLite 的类型写法，这里按方言翻译。
+ *
+ * MSSQL 不认 `INTEGER`（`Incorrect syntax near 'INTEGER'`），`TEXT` 也是已弃用的 legacy
+ * 类型（用 `NVARCHAR(MAX)`）。其余方言**原样返回**，保证 sqlite/mysql 的 DDL 文本与
+ * 改动前逐字一致。
+ */
+export function dialectColumnDefinition(dbType, definition) {
+  if (dbType !== "mssql") return definition;
+  return definition
+    .replace(/\bINTEGER\b/gi, "INT")
+    .replace(/\bTEXT\b/gi, "NVARCHAR(MAX)")
+    .replace(/\bREAL\b/gi, "FLOAT")
+    .replace(/\bBLOB\b/gi, "VARBINARY(MAX)");
+}
+
+/**
+ * 跨库「幂等补列」（issue #55b）：列已存在则什么都不做，缺失才 `ALTER TABLE ... ADD`。
+ *
+ * 三处方言差异：
+ *   1. 列探测：`PRAGMA table_info` 只有 SQLite 有 → 统一走 `listTableColumns()`；
+ *   2. `ADD COLUMN` 的 `COLUMN` 关键字：MSSQL 不认（`ALTER TABLE t ADD c ...`）；
+ *   3. 列类型：`INTEGER` / `TEXT` 在 MSSQL 上非法 → `dialectColumnDefinition()`。
+ *
+ * `db` 可以是普通 AsyncDb，也可以是事务句柄 `tx`（事务内必须传 tx，否则被 D2 防线抛错）。
+ */
+export async function addColumnIfAbsent(db, tableName, columnName, definition) {
+  const columns = await listTableColumns(db, tableName);
+  if (columns.includes(columnName)) return false;
+  const columnKeyword = db.dbType === "mssql" ? "" : " COLUMN";
+  await db.exec(
+    `ALTER TABLE ${tableName} ADD${columnKeyword} ${columnName} ${dialectColumnDefinition(db.dbType, definition)}`
+  );
+  return true;
 }

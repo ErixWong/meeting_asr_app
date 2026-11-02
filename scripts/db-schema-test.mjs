@@ -9,7 +9,7 @@
  * 参数（未知参数一律报错退出，不静默忽略）：
  *   --matrix / --dialect / --allow-skip
  *   --allow-skip：存在 SKIP 项时仍以退出码 0 结束。**默认严格**——存在 SKIP ⇒ 退出码非 0
- *   （矩阵模式下 6 项里只跑通 sqlite、外部靶子不可达时，CI 不许绿着过关）。
+ *   （矩阵模式下 12 项里只跑通 sqlite、外部靶子不可达时，CI 不许绿着过关）。
  *
  * 默认模式覆盖**同一条**实现路径的两个层次（issue #54 之后只剩一条）：
  *   - 引擎层：server/db/schema.mjs 的 initializeSchema()（better-sqlite3 驱动）
@@ -1097,13 +1097,16 @@ function runChild(args, env) {
   });
 }
 
-/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件、语义锁与事务套件 */
+/** --matrix：sqlite(两驱动) + mariadb + mssql 各跑一遍 schema 套件、语义锁、事务套件与方言语法套件 */
 async function mainMatrix({ allowSkip = false } = {}) {
   const self = fileURLToPath(import.meta.url);
   const semanticScript = join(process.cwd(), "scripts", "db-semantic-test.mjs");
   // issue #55 D7：事务句柄/affected-rows 套件（scripts/db-tx-test.mjs）作为一个 job 挂进每个目标，
   // 矩阵语义不变：任何 SKIP 即失败（外部靶子不可达时不许绿着过关）。
   const txScript = join(process.cwd(), "scripts", "db-tx-test.mjs");
+  // issue #55b：方言语法套件（scripts/db-dialect-test.mjs）也作为一个 job 挂进每个目标。
+  // 矩阵项数 9 → 12（每个目标多一个 job，与 #55a 从 6 → 9 同一做法）。
+  const dialectScript = join(process.cwd(), "scripts", "db-dialect-test.mjs");
   const mysqlPassword = process.env.CI_MYSQL_PASSWORD || "";
   const mssqlPassword = process.env.CI_MSSQL_PASSWORD || "";
   const mysqlEnv = {
@@ -1128,6 +1131,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
         { name: "schema/迁移全量", args: [self], env: {} },
         { name: "语义锁", args: [semanticScript], env: {} },
         { name: "事务句柄/affected-rows", args: [txScript], env: {} },
+        { name: "方言语法（upsert/insertIgnore/补列/分页）", args: [dialectScript], env: {} },
       ],
     },
     {
@@ -1136,6 +1140,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mysqlEnv },
         { name: "语义锁", args: [semanticScript], env: mysqlEnv },
         { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mysqlEnv },
+        { name: "方言语法（upsert/insertIgnore/补列/分页）", args: [dialectScript, "--dialect"], env: mysqlEnv },
       ],
     },
     {
@@ -1144,6 +1149,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
         { name: "schema/迁移方言套件", args: [self, "--dialect"], env: mssqlEnv },
         { name: "语义锁", args: [semanticScript], env: mssqlEnv },
         { name: "事务句柄/affected-rows", args: [txScript, "--dialect"], env: mssqlEnv },
+        { name: "方言语法（upsert/insertIgnore/补列/分页）", args: [dialectScript, "--dialect"], env: mssqlEnv },
       ],
     },
   ];
@@ -1179,7 +1185,7 @@ async function mainMatrix({ allowSkip = false } = {}) {
     if (allowSkip) {
       console.log(`[matrix] ⏭ 存在 SKIP 项，已由 --allow-skip 显式放行（退出码 0）：${skipList}`);
     } else {
-      // 默认严格：SKIP 不许伪装成全绿（6 项里只跑通 sqlite、外部靶子不可达时 CI 必须红）
+      // 默认严格：SKIP 不许伪装成全绿（12 项里只跑通 sqlite、外部靶子不可达时 CI 必须红）
       process.exitCode = 1;
       console.log(
         `[matrix] ❌ 存在 SKIP 项，未覆盖的方言不算通过（默认严格，退出码非 0）：${skipList}`

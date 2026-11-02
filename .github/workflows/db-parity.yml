@@ -1,0 +1,103 @@
+# 三库方言矩阵（issue #55b / PR-B③b）
+#
+# 跑的是 `npm run db:test-parity`（scripts/db-schema-test.mjs --matrix）：
+#   sqlite（better-sqlite3 生产入口）+ MariaDB + SQL Server 各跑 4 个 job
+#   （schema/迁移、语义锁、事务句柄/affected-rows、方言语法），共 12 项。
+#
+# ⚠ 语义：**SKIP 即失败**（矩阵默认严格，不向子进程透传 --allow-skip）。
+#   某个 service 没起来 ⇒ 那一项 SKIP ⇒ 整个 job 红，不会「只跑了 sqlite 就绿着过关」。
+#
+# ⚠ 本仓库的开发机没有 GitHub runner，这份 workflow **在本机不可执行、未被验证过**。
+#   本机的主门禁始终是本地矩阵（命令见 docs/tasks/HANDOVER-261101.md）：
+#     docker run --rm -e MSSQLPW -e MARIAPW --network prod \
+#       --add-host=host.docker.internal:host-gateway node:24-slim \
+#       -c 'CI_MYSQL_PASSWORD="$MARIAPW" CI_MSSQL_PASSWORD="$MSSQLPW" npm run db:test-parity'
+#   本文件只把「接进流水线要做什么」写死，不代表 CI 已被跑通。
+name: db-parity（三库方言矩阵）
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: db-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: sqlite + mariadb + mssql
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      mariadb:
+        image: mariadb:11.7
+        env:
+          MARIADB_ROOT_PASSWORD: ${{ secrets.CI_MYSQL_PASSWORD || 'ci-root-password' }}
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+      # SQL Server 的 healthcheck 需要把 sa 密码塞进命令行（嵌套引号在 GHA 的 services.options
+      # 里很容易被吃掉），所以这里不配 healthcheck，改由下面的「探活」步骤带重试等待。
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: ${{ secrets.CI_MSSQL_PASSWORD || 'Ci-Pa55word!' }}
+        ports:
+          - 1433:1433
+
+    env:
+      # 非容器 job 的 service 端口发布在 localhost；脚本默认值给的是本机 docker 网络里的别名
+      # （mariadb / host.docker.internal），这里必须覆盖。
+      CI_MYSQL_HOST: 127.0.0.1
+      CI_MYSQL_PORT: "3306"
+      CI_MYSQL_USER: root
+      CI_MYSQL_PASSWORD: ${{ secrets.CI_MYSQL_PASSWORD || 'ci-root-password' }}
+      CI_MSSQL_HOST: 127.0.0.1
+      CI_MSSQL_PORT: "1433"
+      CI_MSSQL_USER: sa
+      CI_MSSQL_PASSWORD: ${{ secrets.CI_MSSQL_PASSWORD || 'Ci-Pa55word!' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # node 24 是硬要求（与生产运行时同版本：better-sqlite3 预编译二进制、node 24 的 fetch 行为）
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      # 先单独打靶：把「service 没起来」和「代码坏了」区分开（失败信息更好读）。
+      # 这一步失败 → 直接红，不进入矩阵。
+      - name: 探活（mariadb / mssql 必须都可达）
+        run: |
+          for attempt in $(seq 1 18); do
+            if node scripts/probe-db-targets.mjs; then
+              echo "[probe] 两个靶子都就绪（第 ${attempt} 次尝试）"
+              exit 0
+            fi
+            echo "[probe] 第 ${attempt} 次未就绪，10s 后重试"
+            sleep 10
+          done
+          echo "[probe] ❌ mariadb / mssql 在 180s 内没有都就绪"
+          exit 1
+
+      # 主门禁：12 项必须全 PASS（SKIP 即失败）
+      - name: npm run db:test-parity
+        run: npm run db:test-parity
+
+      - name: 收尾复核（共享实例上不许留 meeting_asr_ci_* 一次性库）
+        if: always()
+        run: node scripts/check-db-leftovers.mjs
