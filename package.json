@@ -13,6 +13,7 @@
     "db:test-schema": "node scripts/db-schema-test.mjs",
     "db:test-semantic": "node scripts/db-semantic-test.mjs",
     "db:test-tx": "node scripts/db-tx-test.mjs",
+    "db:test-dialect": "node scripts/db-dialect-test.mjs",
     "db:test-parity": "node scripts/db-schema-test.mjs --matrix",
     "test:tts": "node --test scripts/tts-test.mjs",
     "test:chat": "node --test scripts/chat-voice-test.mjs",
