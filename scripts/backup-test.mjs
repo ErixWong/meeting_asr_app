@@ -17,7 +17,18 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  chmodSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -336,4 +347,65 @@ test("7. 同一秒内重复运行不覆盖已有备份（加序号）", () => {
 
   // 命名仍可被保留策略识别（前缀 + 时间戳 + 可选序号）
   assert.equal(parseBackupName(secondFile.split("/").pop(), "meeting-asr-app") !== null, true);
+});
+
+// ---------------------------------------------------------------------------
+// 8. cron 安装脚本：默认只打印，--install 幂等
+// ---------------------------------------------------------------------------
+
+test("8. install-backup-cron.sh：默认只打印不写；--install 幂等（同一行不重复追加）", () => {
+  const dir = sandboxDir("cron");
+  const binDir = join(dir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const store = join(dir, "crontab.txt");
+  // 假 crontab：`-l` 读 store，`-` 从 stdin 写 store —— 单测绝不碰宿主真实 crontab
+  writeFileSync(
+    join(binDir, "crontab"),
+    [
+      "#!/usr/bin/env bash",
+      'STORE="$CRONTAB_SHIM_STORE"',
+      'case "$1" in',
+      "  -l) if [ -f \"$STORE\" ]; then cat \"$STORE\"; else exit 1; fi ;;",
+      '  -) cat > "$STORE" ;;',
+      "  *) exit 2 ;;",
+      "esac",
+      "",
+    ].join("\n")
+  );
+  chmodSync(join(binDir, "crontab"), 0o755);
+  const script = new URL("./install-backup-cron.sh", import.meta.url).pathname;
+  const runInstall = (args) =>
+    spawnSync("bash", [script, ...args], {
+      cwd: sandbox,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CRONTAB_SHIM_STORE: store },
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+
+  // 默认模式：只打印，不写
+  const printed = runInstall([]);
+  assert.equal(printed.status, 0, printed.stderr);
+  assert.match(printed.stdout, /docker exec meeting_asr_app-app-1 node \/app\/scripts\/db-backup\.mjs/);
+  assert.equal(existsSync(store), false, "默认模式不许写 crontab");
+
+  // --check：未装 ⇒ 退出码 1
+  assert.equal(runInstall(["--check"]).status, 1);
+
+  // 首次 --install：写入 1 行
+  const first = runInstall(["--install"]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(existsSync(store), true, "--install 必须真的写入 crontab");
+  assert.equal(readFileSync(store, "utf8").split("\n").filter((line) => line.includes("db-backup.mjs")).length, 1);
+
+  // 第二次 --install：幂等，仍是 1 行
+  const second = runInstall(["--install"]);
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /已存在同一行，跳过/);
+
+  const installed = readFileSync(store, "utf8");
+  const lineCount = installed.split("\n").filter((line) => line.includes("db-backup.mjs")).length;
+  assert.equal(lineCount, 1, `同一行只能出现一次，实际 ${lineCount} 次:\n${installed}`);
+
+  // --check：已装 ⇒ 退出码 0
+  assert.equal(runInstall(["--check"]).status, 0);
 });
