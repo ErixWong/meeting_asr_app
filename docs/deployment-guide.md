@@ -335,7 +335,7 @@ $ docker ps | grep -c restore56                      → 0
 ```
 
 结论：**今日真备份 → `integrity_check=ok` → 临时实例能登录、能读、能写 → 已清理干净**。
-一处偏差（如实记录）：生产 `admin` 密码早已不是 `admin123`，为了验证登录，只在**恢复副本**上把 admin 的 `password_hash` 重置成 `admin123`（`scrypt-v1` 格式，与 `src/lib/admin-store.ts` 一致）；**生产库未改动**（`.docker/data` 下各文件 mtime 与本单开始时一致）。
+一处偏差（**主 agent 复核后已修正原判断**）：演练时临时实例首次登录失败，当时写成「生产 `admin` 密码早已不是 `admin123`」。2026-11-04 主 agent 现验：生产 `POST /api/auth/login`（`admin` / `admin123`）返回 **200**，且**带与不带 `Content-Type: application/json` 都是 200** ⇒ 原判断**不成立**，演练登录失败的真正原因**至今未查明**。副作用仍在：演练副本上把 admin 的 `password_hash` 重置过（生产库未改，`.docker/data` 各文件 mtime 与本单开始时一致），所以「副本能登录」这条证据的强度弱于原始描述；「副本 `integrity_check=ok`、能读到与生产一致的数据、能写入并读回」三条不受影响。
 
 ### 5.7 从备份恢复（正式流程）
 
