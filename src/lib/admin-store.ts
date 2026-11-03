@@ -13,6 +13,7 @@ import {
   deleteAudioRecordingRowsForMeeting,
   drainCaptureEvents,
   getCaptureSessionStats,
+  getAudioDiskStatus,
   invalidateAsrRuntimeConfig,
   invalidateAudioRuntimeConfig,
   listAudioRecordingsForMeeting,
@@ -352,6 +353,26 @@ const SETTING_DEFINITIONS: Record<string, SettingDefinition> = {
     itemTitle: "孤儿录音保留（小时）",
     itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
     validate: integerSetting("Audio orphan TTL hours", 1, 24 * 365),
+  },
+  // feat-261103-01（issue #57）：绑定录音保留策略 / 磁盘水位 / 演练开关
+  "audio:bound_retention_days": {
+    itemTitle: "已绑定录音保留（天）",
+    itemDescription: "绑定到会议的录音保留天数，到期只删 MP3、保留转写；0 = 永久保留（默认 365）",
+    validate: integerSetting("Audio bound retention days", 0, 36500),
+  },
+  "audio:disk_warn_gb": {
+    itemTitle: "磁盘可用空间告警阈值（GB）",
+    itemDescription: "data/audio 所在磁盘可用空间低于该值时在日志与页面顶部告警（默认 5）",
+    validate: integerSetting("Audio disk warn GB", 0, 1_048_576),
+  },
+  "audio:retention_dry_run": {
+    itemTitle: "保留策略演练模式",
+    itemDescription: "置 1 时只记「将清理多少行 / 释放多少字节」的日志，不删文件、不改状态（默认 0）",
+    validate: (value) => {
+      const normalized = validateSettingValue(value, "Audio retention dry run", 16, false);
+      const lower = normalized.toLowerCase();
+      return normalized === "0" || lower === "false" || lower === "no" || lower === "off" ? "0" : "1";
+    },
   },
   "llm:base_url": {
     itemTitle: "LLM URL",
@@ -757,6 +778,27 @@ async function seedDefaults(database: AsyncDatabase) {
         itemTitle: "孤儿录音保留（小时）",
         itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
         itemValue: "72",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "bound_retention_days",
+        itemTitle: "已绑定录音保留（天）",
+        itemDescription: "绑定到会议的录音保留天数，到期只删 MP3、保留转写；0 = 永久保留（默认 365）",
+        itemValue: "365",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "disk_warn_gb",
+        itemTitle: "磁盘可用空间告警阈值（GB）",
+        itemDescription: "data/audio 所在磁盘可用空间低于该值时在日志与页面顶部告警（默认 5）",
+        itemValue: "5",
+      },
+      {
+        itemSection: "audio",
+        itemMark: "retention_dry_run",
+        itemTitle: "保留策略演练模式",
+        itemDescription: "置 1 时只记「将清理多少行 / 释放多少字节」的日志，不删文件、不改状态（默认 0）",
+        itemValue: "0",
       },
       {
         itemSection: "llm",
@@ -1818,6 +1860,11 @@ export async function getRuntimeConfig() {
           name: defaultTemplate.templateName,
         }
       : null,
+    // feat-261103-01（issue #57）：磁盘水位给 UI 用（顶部常驻告警条）。
+    // 读的是 data/audio 所在文件系统（fs.statfs），不接任何外部通知渠道。
+    audio: {
+      disk: await getAudioDiskStatus(),
+    },
   };
 }
 

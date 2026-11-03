@@ -174,6 +174,13 @@ export default function MeetingPage() {
   // 不用 toast（3.5s 就消失，用户以为还在录），而是常驻页面顶部，
   // 直到连接恢复 / 重新开始录音 / 用户手动关闭。
   const [asrLinkError, setAsrLinkError] = useState<string | null>(null);
+  // feat-261103-01（issue #57）：服务端磁盘可用空间低于阈值时的**常驻**告警（同一模式：#61）。
+  // 数据来自 GET /api/config 的 audio.disk（fs.statfs 读 data/audio 所在文件系统）。
+  const [audioDiskAlert, setAudioDiskAlert] = useState<{
+    freeGb: number | null;
+    thresholdGb: number;
+    path: string;
+  } | null>(null);
   const [savingMeeting, setSavingMeeting] = useState(false);
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   // feat-261101-04（#44）：AI 起标题进行中的会议 id（按钮 loading 态）
@@ -723,7 +730,11 @@ export default function MeetingPage() {
   }, [translationEnabled, status, requestJson]);
 
   const loadRuntimeConfig = useCallback(async () => {
-    const data = await requestJson<{ asr?: { isConfigured?: boolean }; llm?: { translateTriggerSentences?: number } }>("/api/config");
+    const data = await requestJson<{
+      asr?: { isConfigured?: boolean };
+      llm?: { translateTriggerSentences?: number };
+      audio?: { disk?: { active?: boolean; freeGb?: number | null; thresholdGb?: number; path?: string } };
+    }>("/api/config");
     const nextAsrReady = Boolean(data.asr?.isConfigured);
     const nextTriggerSentences = Number(data.llm?.translateTriggerSentences);
     if (Number.isFinite(nextTriggerSentences) && nextTriggerSentences > 0) {
@@ -731,6 +742,18 @@ export default function MeetingPage() {
     }
 
     setAsrReady(nextAsrReady);
+
+    // 磁盘水位：低于阈值 → 常驻告警条（不做自动消失）
+    const disk = data.audio?.disk;
+    if (disk?.active) {
+      setAudioDiskAlert({
+        freeGb: typeof disk.freeGb === "number" ? disk.freeGb : null,
+        thresholdGb: Number(disk.thresholdGb ?? 0),
+        path: String(disk.path ?? "data/audio"),
+      });
+    } else {
+      setAudioDiskAlert(null);
+    }
 
     return {
       asrReady: nextAsrReady,
@@ -1936,6 +1959,34 @@ export default function MeetingPage() {
           </div>
         )}
 
+        {/*
+          feat-261103-01（issue #57）：磁盘可用空间低于 audio.disk_warn_gb 时的**常驻**告警。
+          - 与 #61 同一模式：不用 toast，不做自动消失，允许手动关闭
+          - 文案给实际剩余 + 阈值，可行动（清理磁盘 / 调 audio.disk_warn_gb）
+        */}
+        {audioDiskAlert && (
+          <div
+            role="alert"
+            className="flex items-start justify-between gap-3 border-b border-amber-300 bg-amber-50 px-6 py-2 text-sm text-amber-800"
+          >
+            <div className="min-w-0 space-y-0.5">
+              <p className="font-semibold">服务端磁盘可用空间不足，录音可能无法保存。</p>
+              <p className="text-xs text-amber-700">
+                剩余 {audioDiskAlert.freeGb === null ? "未知" : `${audioDiskAlert.freeGb.toFixed(2)} GB`}
+                ，告警阈值 {audioDiskAlert.thresholdGb} GB（{audioDiskAlert.path}）。
+                请联系管理员清理磁盘，或在后台「录音配置」调整阈值；已到期录音会由后台定时任务自动清理。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAudioDiskAlert(null)}
+              className="shrink-0 rounded px-2 py-0.5 text-xs opacity-80 transition hover:bg-white/60 hover:opacity-100"
+            >
+              关闭
+            </button>
+          </div>
+        )}
+
         <div className="flex min-w-0 flex-1 overflow-hidden">
         <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-white">
           <div className="flex-1 overflow-y-auto">
@@ -2115,6 +2166,15 @@ export default function MeetingPage() {
                               下载
                             </a>
                           </>
+                        ) : recording.status === "purged" ? (
+                          // feat-261103-01（issue #57）：到期清理后**不**给播放器（文件已删，
+                          // <audio> 会报错），也不说「处理中」—— 明确告知「录音已到期清理（转写仍保留）」。
+                          <span className="text-xs text-amber-600">
+                            录音已到期清理（转写仍保留）
+                            {recording.durationSeconds
+                              ? ` · 原时长 ${formatAudioDuration(recording.durationSeconds)}`
+                              : ""}
+                          </span>
                         ) : recording.status === "failed" ? (
                           <details className="min-w-0 text-xs text-red-500">
                             <summary className="cursor-pointer">录音不可用（转码失败）</summary>

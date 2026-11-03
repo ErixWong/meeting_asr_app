@@ -9,7 +9,7 @@
  *
  * 迁移机制沿用原 schema_version 表 + MIGRATIONS 数组，up 改为 async。
  */
-import { extractRows, listTableColumns } from "./async-db.mjs";
+import { addColumnIfAbsent, extractRows, listTableColumns } from "./async-db.mjs";
 
 /**
  * 幂等建表：hasTable 检查后 createTable。
@@ -50,6 +50,8 @@ function defineMeetingAudioRecordingsTable(t) {
   t.string("created_at", 32).notNullable();
   t.string("updated_at", 32).notNullable();
   t.string("expires_at", 32).nullable();
+  // feat-261103-01（issue #57）：到期清理留痕。可空 —— NULL = 从未清理过。
+  t.string("purged_at", 32).nullable();
   t.foreign("meeting_id").references("meetings.id").onDelete("CASCADE");
 }
 
@@ -312,6 +314,17 @@ export async function createIndexes(db) {
 // ---------- 迁移 ----------
 
 export const MIGRATIONS = [
+  {
+    version: 5,
+    name: "meeting-audio-recordings-purged-at",
+    async up(db) {
+      // feat-261103-01（issue #57）：绑定录音到期清理的留痕列。
+      // 新库由 defineMeetingAudioRecordingsTable 直接带上；老库（v4 及以前）在此补列。
+      // 补列走跨库 addColumnIfAbsent()（sqlite PRAGMA / mysql information_schema /
+      // mssql INFORMATION_SCHEMA 三方言探测），不裸写 PRAGMA / ADD COLUMN 方言语法。
+      await addColumnIfAbsent(db, "meeting_audio_recordings", "purged_at", "TEXT");
+    },
+  },
   {
     version: 4,
     name: "schema-version-single-row",

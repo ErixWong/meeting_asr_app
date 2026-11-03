@@ -21,8 +21,11 @@ export interface TranscriptSegment {
 export interface MeetingAudioRecording {
   id: string;
   captureSessionId: string;
-  /** recording = 已录到 PCM、转码未完成；ready = mp3 可播放；failed = 转码失败 */
-  status: "recording" | "ready" | "failed" | string;
+  /**
+   * recording = 已录到 PCM、转码未完成；ready = mp3 可播放；failed = 转码失败；
+   * purged = 已到期清理（MP3 已删、转写仍保留，feat-261103-01 / issue #57）
+   */
+  status: "recording" | "ready" | "failed" | "purged" | string;
   format: string;
   bytes: number;
   durationSeconds: number;

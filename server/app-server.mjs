@@ -5,10 +5,10 @@ import { createTtsGateway } from "./tts-gateway.mjs";
 import { cleanupExpiredAuditLogs } from "./db-shared.mjs";
 import {
   cleanupExpiredCaptureSessions,
-  cleanupExpiredAudioRecordings,
   closeCaptureStore,
   getAsrRuntimeConfig,
   getAudioRuntimeConfig,
+  runAudioMaintenance,
   startCaptureFlushTimer,
 } from "./runtime-store.mjs";
 
@@ -64,18 +64,32 @@ const captureCleanupTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 captureCleanupTimer.unref();
 
-// 孤儿录音清理（feat-261101-01）：未绑定会议且过期 → 删行 + 删文件。
-// 已绑定会议的录音 expires_at 为 NULL，永不被清。
-void cleanupExpiredAudioRecordings().catch((error) => {
-  console.error("[App Server] audio cleanup failed:", error);
-});
+// 录音维护（feat-261101-01 孤儿清理 + feat-261103-01 到期清理与磁盘水位）：
+// 启动跑一次，之后每小时一次（复用同一个定时器，不新起进程、不用系统 cron）。
+//   - 磁盘水位：data/audio 所在 fs 可用空间 < audio.disk_warn_gb → console.warn
+//   - 孤儿：meeting_id IS NULL 且 expires_at 过期 → 删行 + 删文件（语义未变）
+//   - 到期：meeting_id 非空 + status='ready' + updated_at < now - bound_retention_days
+//           → 只删 MP3，置 status='purged' / purged_at（转写与会议不动）
+function reportAudioMaintenance(result) {
+  if (result.orphan.rows > 0) {
+    console.log(`[App Server] audio cleanup: removed ${result.orphan.rows} row(s), ${result.orphan.files} file(s)`);
+  }
+  if (result.retention.purged > 0 || result.retention.failed > 0) {
+    console.log(
+      `[App Server] audio retention: purged ${result.retention.purged} file(s), ` +
+        `failed ${result.retention.failed}, freed ${result.retention.bytes} bytes`
+    );
+  }
+}
+
+void runAudioMaintenance()
+  .then(reportAudioMaintenance)
+  .catch((error) => {
+    console.error("[App Server] audio cleanup failed:", error);
+  });
 const audioCleanupTimer = setInterval(() => {
-  void cleanupExpiredAudioRecordings()
-    .then((result) => {
-      if (result.rows > 0) {
-        console.log(`[App Server] audio cleanup: removed ${result.rows} row(s), ${result.files} file(s)`);
-      }
-    })
+  void runAudioMaintenance()
+    .then(reportAudioMaintenance)
     .catch((error) => {
       console.error("[App Server] audio cleanup failed:", error);
     });

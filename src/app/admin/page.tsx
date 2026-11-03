@@ -216,6 +216,10 @@ export default function AdminPage() {
   const [audioRecordEnabled, setAudioRecordEnabled] = useState("1");
   const [audioBitrateKbps, setAudioBitrateKbps] = useState("48");
   const [audioOrphanTtlHours, setAudioOrphanTtlHours] = useState("72");
+  // feat-261103-01（issue #57）：绑定录音保留 / 磁盘水位 / 演练
+  const [audioBoundRetentionDays, setAudioBoundRetentionDays] = useState("365");
+  const [audioDiskWarnGb, setAudioDiskWarnGb] = useState("5");
+  const [audioRetentionDryRun, setAudioRetentionDryRun] = useState("0");
 
   const [llmUrl, setLlmUrl] = useState("http://qwen.local:8080/v1");
   const [llmKey, setLlmKey] = useState("");
@@ -312,6 +316,27 @@ export default function AdminPage() {
         itemTitle: "孤儿录音保留（小时）",
         itemDescription: "未绑定到任何会议的录音保留时长，超时后连同文件一起清理（默认 72）",
         itemValue: audioOrphanTtlHours,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "bound_retention_days",
+        itemTitle: "已绑定录音保留（天）",
+        itemDescription: "绑定到会议的录音保留天数，到期只删 MP3、保留转写；0 = 永久保留（默认 365）",
+        itemValue: audioBoundRetentionDays,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "disk_warn_gb",
+        itemTitle: "磁盘可用空间告警阈值（GB）",
+        itemDescription: "data/audio 所在磁盘可用空间低于该值时在日志与页面顶部告警（默认 5）",
+        itemValue: audioDiskWarnGb,
+      },
+      {
+        itemSection: "audio",
+        itemMark: "retention_dry_run",
+        itemTitle: "保留策略演练模式",
+        itemDescription: "置 1 时只记「将清理多少行 / 释放多少字节」的日志，不删文件、不改状态（默认 0）",
+        itemValue: audioRetentionDryRun,
       },
       {
         itemSection: "llm",
@@ -449,8 +474,11 @@ export default function AdminPage() {
     ],
     [
       audioBitrateKbps,
+      audioBoundRetentionDays,
+      audioDiskWarnGb,
       audioOrphanTtlHours,
       audioRecordEnabled,
+      audioRetentionDryRun,
       defaultTemplateId,
       funasrApiKey,
       funasrProvider,
@@ -530,6 +558,9 @@ export default function AdminPage() {
         setAudioRecordEnabled(get("audio", "record_enabled", "1"));
         setAudioBitrateKbps(get("audio", "bitrate_kbps", "48"));
         setAudioOrphanTtlHours(get("audio", "orphan_ttl_hours", "72"));
+        setAudioBoundRetentionDays(get("audio", "bound_retention_days", "365"));
+        setAudioDiskWarnGb(get("audio", "disk_warn_gb", "5"));
+        setAudioRetentionDryRun(get("audio", "retention_dry_run", "0"));
 
         setLlmUrl(get("llm", "base_url", "http://qwen.local:8080/v1"));
         setLlmKey(get("llm", "api_key", ""));
@@ -1220,10 +1251,44 @@ export default function AdminPage() {
                     className={inputCls}
                   />
                 </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">已绑定录音保留（天，0 = 永久）</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="36500"
+                    step="1"
+                    value={audioBoundRetentionDays}
+                    onChange={(e) => setAudioBoundRetentionDays(e.target.value)}
+                    className={inputCls}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">磁盘可用空间告警阈值（GB）</label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="1048576"
+                    step="1"
+                    value={audioDiskWarnGb}
+                    onChange={(e) => setAudioDiskWarnGb(e.target.value)}
+                    className={inputCls}
+                  />
+                </div>
               </div>
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={audioRetentionDryRun === "1"}
+                  onChange={(e) => setAudioRetentionDryRun(e.target.checked ? "1" : "0")}
+                  className="h-4 w-4 rounded border-slate-300"
+                />
+                演练模式（只记「将清理多少行 / 释放多少字节」的日志，不删文件、不改状态）
+              </label>
               <p className="text-xs text-slate-400">
-                已绑定会议的录音永久保留（删会议才删文件）；未绑定会议的录音超过保留时长后由后台定时任务清理。
-                录音落在服务端 data/audio 目录，多实例部署需共享卷。
+                已绑定会议的录音按「已绑定录音保留」到期清理：到期只删 MP3、保留转写与会议本身，
+                录音行状态置 purged；填 0 表示永久保留。未绑定会议的录音超过孤儿保留时长后由同一节
+                后台任务清理。录音落在服务端 data/audio 目录，多实例部署需共享卷。
               </p>
               <div>
                 <button onClick={saveSettings} className={btnCls} disabled={savingSettings}>

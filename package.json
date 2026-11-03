@@ -18,6 +18,7 @@
     "test:tts": "node --test scripts/tts-test.mjs",
     "test:chat": "node --test scripts/chat-voice-test.mjs",
     "test:audio": "node --test scripts/audio-test.mjs",
+    "test:retention": "node --test scripts/audio-retention-test.mjs",
     "test:title": "node --test scripts/ai-title-test.mjs",
     "test:asr-origin": "node --test scripts/asr-origin-test.mjs"
   },
