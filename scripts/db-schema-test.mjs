@@ -905,10 +905,11 @@ async function runDialectSuite(db, dbType) {
   );
 
   const audioColumns = await listTableColumns(db, "meeting_audio_recordings");
+  // feat-261103-01（issue #57）：v5 补 purged_at → 16 列
   check(
     "列探测（listTableColumns）跨库可用",
-    audioColumns.length === 15,
-    `meeting_audio_recordings ${audioColumns.length} 列`
+    audioColumns.length === 16 && audioColumns.includes("purged_at"),
+    `meeting_audio_recordings ${audioColumns.length} 列（含 purged_at=${audioColumns.includes("purged_at")}）`
   );
 
   let version = await versionRow(db);
