@@ -377,7 +377,8 @@ test("8. install-backup-cron.sh：默认只打印不写；--install 幂等（同
   const runInstall = (args) =>
     spawnSync("bash", [script, ...args], {
       cwd: sandbox,
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CRONTAB_SHIM_STORE: store },
+      // CRONTAB_BIN 直指假 shim：不依赖 PATH 解析，绝不落到真实 crontab
+      env: { ...process.env, CRONTAB_BIN: join(binDir, "crontab"), CRONTAB_SHIM_STORE: store },
       encoding: "utf8",
       timeout: 60_000,
     });

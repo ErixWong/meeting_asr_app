@@ -7,6 +7,7 @@
 #   bash scripts/install-backup-cron.sh --check    # 只检查是否已安装（已装退出码 0，未装 1）
 #
 # 幂等实现：整行 `grep -Fqx` 精确匹配；同一行已存在 ⇒ 直接跳过，不重复追加。
+# 环境变量：BACKUP_CRON_LINE 覆盖整行；BACKUP_LOG_PATH 覆盖日志路径；CRONTAB_BIN 指定 crontab 可执行文件（单测用假 shim）。
 # ⚠ 脚本不碰 crontab 以外的东西：不重启容器、不改 compose、不建目录（日志目录只提示）。
 # ⚠ 本机 crontab 是**本地时区（UTC+8）**，所以 20 3 = 每天 03:20（UTC+8）。
 set -uo pipefail
@@ -14,6 +15,8 @@ set -uo pipefail
 CRON_LINE="${BACKUP_CRON_LINE:-20 3 * * * docker exec meeting_asr_app-app-1 node /app/scripts/db-backup.mjs >> /home/eric/logs/meeting-asr-backup.log 2>&1}"
 LOG_PATH="${BACKUP_LOG_PATH:-/home/eric/logs/meeting-asr-backup.log}"
 LOG_DIR="$(dirname "$LOG_PATH")"
+# 用哪个 crontab 可执行文件（**单测专用**：指向假 shim，保证测试永不落到真实 crontab）
+CRONTAB_BIN="${CRONTAB_BIN:-crontab}"
 MODE="print"
 
 usage() {
@@ -33,11 +36,11 @@ for arg in "$@"; do
 done
 
 crontab_available() {
-  command -v crontab >/dev/null 2>&1
+  command -v "$CRONTAB_BIN" >/dev/null 2>&1
 }
 
 current_crontab() {
-  crontab -l 2>/dev/null || true
+  "$CRONTAB_BIN" -l 2>/dev/null || true
 }
 
 already_installed() {
@@ -83,7 +86,7 @@ EOF
     if [ ! -d "$LOG_DIR" ]; then
       echo "[install-backup-cron] ⚠ 日志目录不存在：$LOG_DIR（cron 会静默失败，请先 mkdir -p）" >&2
     fi
-    { current_crontab; printf '%s\n' "$CRON_LINE"; } | crontab -
+    { current_crontab; printf '%s\n' "$CRON_LINE"; } | "$CRONTAB_BIN" -
     if already_installed; then
       echo "[install-backup-cron] 已安装：$CRON_LINE"
       exit 0
