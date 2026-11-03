@@ -1,19 +1,27 @@
 import { createHash, randomUUID } from "crypto";
-import { existsSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, unlinkSync } from "fs";
+import { statfs } from "fs/promises";
 import { getDb as getSharedDb } from "./db-shared.mjs";
 import { insertIgnore, upsert } from "./db/insert-ignore.mjs";
-import { resolveStoredPath } from "./audio-paths.mjs";
+import { getAudioRootDir, resolveStoredPath } from "./audio-paths.mjs";
 
 const MAX_CAPTURE_EVENTS = 10000;
 const MAX_CAPTURE_EVENT_CHARS = 512 * 1024;
 const MAX_CAPTURE_EVENT_CHARS_TOTAL = 8 * 1024 * 1024;
 const ASR_GATEWAY_ROLE_KEYS = new Set(["user", "system_admin"]);
 
-// 录音默认值（后台 app_settings 的 audio:* 三项，缺行时按这些兜底）
+// 录音默认值（后台 app_settings 的 audio:* 六项，缺行时按这些兜底）
 const AUDIO_DEFAULT_BITRATE_KBPS = 48;
 const AUDIO_DEFAULT_ORPHAN_TTL_HOURS = 72;
 const AUDIO_ALLOWED_BITRATES = [32, 48, 64, 96, 128];
 const AUDIO_DEFAULT_SAMPLE_RATE = 16000;
+// feat-261103-01（issue #57）：绑定录音保留天数（0 = 永久）与磁盘水位阈值（GB）
+const AUDIO_DEFAULT_BOUND_RETENTION_DAYS = 365;
+const AUDIO_DEFAULT_DISK_WARN_GB = 5;
+const AUDIO_MAX_BOUND_RETENTION_DAYS = 36500;
+const AUDIO_MAX_DISK_WARN_GB = 1024 * 1024;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const BYTES_PER_GB = 1024 * 1024 * 1024;
 
 let dbSeeded = false;
 let seedPromise = null;
@@ -67,6 +75,10 @@ async function seedAsrDefaults(database) {
   await insertMissingSetting(database, "audio", "record_enabled", "录音落盘开关", "是否在转写的同时旁路录制原始音频", "1");
   await insertMissingSetting(database, "audio", "bitrate_kbps", "录音码率（kbps）", "会议结束后转码 MP3 的码率，默认 48", String(AUDIO_DEFAULT_BITRATE_KBPS));
   await insertMissingSetting(database, "audio", "orphan_ttl_hours", "孤儿录音保留（小时）", "未绑定会议的录音保留时长，默认 72", String(AUDIO_DEFAULT_ORPHAN_TTL_HOURS));
+  // feat-261103-01（issue #57）：绑定录音保留策略 / 磁盘水位 / dry-run
+  await insertMissingSetting(database, "audio", "bound_retention_days", "已绑定录音保留（天）", "绑定到会议的录音保留天数，到期只删 MP3、保留转写；0 = 永久保留（默认 365）", String(AUDIO_DEFAULT_BOUND_RETENTION_DAYS));
+  await insertMissingSetting(database, "audio", "disk_warn_gb", "磁盘可用空间告警阈值（GB）", "data/audio 所在磁盘可用空间低于该值时在日志与页面顶部告警（默认 5）", String(AUDIO_DEFAULT_DISK_WARN_GB));
+  await insertMissingSetting(database, "audio", "retention_dry_run", "保留策略演练模式", "置 1 时只记「将清理多少行 / 释放多少字节」的日志，不删文件、不改状态（默认 0）", "0");
 }
 
 function settingValue(settings, section, mark) {
@@ -535,7 +547,8 @@ const AUDIO_ROW_COLUMNS = `
   error_message as errorMessage,
   created_at as createdAt,
   updated_at as updatedAt,
-  expires_at as expiresAt
+  expires_at as expiresAt,
+  purged_at as purgedAt
 `;
 
 function normalizeAudioRow(row) {
@@ -553,6 +566,7 @@ function normalizeAudioRow(row) {
     rawFilePath: row.rawFilePath ?? null,
     errorMessage: row.errorMessage ?? null,
     expiresAt: row.expiresAt ?? null,
+    purgedAt: row.purgedAt ?? null,
   };
 }
 
@@ -566,6 +580,21 @@ function normalizeOrphanTtlHours(value) {
   const parsed = Number(String(value ?? "").trim());
   if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 24 * 365) return Math.round(parsed);
   return AUDIO_DEFAULT_ORPHAN_TTL_HOURS;
+}
+
+/** `0` = 永久保留（**不是**立即到期）；非法值回落 365。 */
+function normalizeBoundRetentionDays(value) {
+  const parsed = Number(String(value ?? "").trim());
+  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= AUDIO_MAX_BOUND_RETENTION_DAYS) {
+    return Math.round(parsed);
+  }
+  return AUDIO_DEFAULT_BOUND_RETENTION_DAYS;
+}
+
+function normalizeDiskWarnGb(value) {
+  const parsed = Number(String(value ?? "").trim());
+  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= AUDIO_MAX_DISK_WARN_GB) return parsed;
+  return AUDIO_DEFAULT_DISK_WARN_GB;
 }
 
 function parseBooleanSetting(value, fallback) {
@@ -594,6 +623,10 @@ async function loadAudioRuntimeConfig() {
     recordEnabled: parseBooleanSetting(settingValue(settings, "audio", "record_enabled"), true),
     bitrateKbps: normalizeBitrateKbps(settingValue(settings, "audio", "bitrate_kbps")),
     orphanTtlHours: normalizeOrphanTtlHours(settingValue(settings, "audio", "orphan_ttl_hours")),
+    // feat-261103-01（issue #57）
+    boundRetentionDays: normalizeBoundRetentionDays(settingValue(settings, "audio", "bound_retention_days")),
+    diskWarnGb: normalizeDiskWarnGb(settingValue(settings, "audio", "disk_warn_gb")),
+    retentionDryRun: parseBooleanSetting(settingValue(settings, "audio", "retention_dry_run"), false),
     sampleRate: AUDIO_DEFAULT_SAMPLE_RATE,
   };
 }
@@ -839,6 +872,9 @@ export async function deleteAudioRecordingRowsForMeeting(meetingId, db) {
 /**
  * 孤儿录音清理：meeting_id IS NULL 且 expires_at 已过期 → 删行 + 删文件
  * （raw 与 mp3 都删）。已绑定会议的 expires_at 为 NULL，永远不在此集合里。
+ *
+ * feat-261103-01 起：**孤儿语义不变**（72h TTL 仍由这里管），绑定录音的到期清理
+ * 在 purgeExpiredBoundAudioRecordings() 里，两者由 runAudioMaintenance() 按同一节拍串起来。
  */
 export async function cleanupExpiredAudioRecordings() {
   const database = await getDb();
@@ -861,4 +897,207 @@ export async function cleanupExpiredAudioRecordings() {
 
   const { files } = removeAudioFilesForRows(rows);
   return { rows: rows.length, files };
+}
+
+// ---------------------------------------------------------------------------
+// 绑定录音保留策略（feat-261103-01 / issue #57）
+//
+// 语义：meeting_id 非空（已绑定）+ status='ready' + updated_at 早于 now - bound_retention_days
+//   → 删 MP3 文件；成功则 status='purged' + purged_at=now（**file_path 保留**，审计用），
+//     转写与会议本身不动；
+//   → 删除失败：**不改 status / updated_at**，只把原因写进 error_message，下一轮重试；
+//   → bound_retention_days = 0：一行都不清（永久保留，**不是**立即到期）。
+//
+// 幂等：候选集只含 status='ready' 的行，已置 purged 的行不会再次进入；文件已不存在视为成功。
+// ---------------------------------------------------------------------------
+
+/**
+ * 删一个存储路径对应的 MP3。
+ *
+ * 返回 `{ ok, removed, reason }`：
+ *   - 文件已不存在 → `ok: true`（目标状态已达成，幂等）；
+ *   - 路径非法 / unlink 报错（EACCES/EPERM/EBUSY…）→ `ok: false` + reason，调用方保行重试。
+ */
+function removeBoundAudioFile(storedPath) {
+  if (!storedPath) return { ok: true, removed: false, reason: null };
+  let absolutePath;
+  try {
+    absolutePath = resolveStoredPath(storedPath);
+  } catch (error) {
+    return { ok: false, removed: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    if (!existsSync(absolutePath)) return { ok: true, removed: false, reason: null };
+    unlinkSync(absolutePath);
+    return { ok: true, removed: true, reason: null };
+  } catch (error) {
+    return { ok: false, removed: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * 到期清理已绑定会议的录音（只删 MP3，保留行 + 转写）。
+ *
+ * @param {{ config?: object, dryRun?: boolean }} [options]
+ *        config 缺省时**当场读库**（运维改设置后下一轮立即生效，不吃缓存）；
+ *        dryRun 缺省取 `audio.retention_dry_run`。
+ * @returns {Promise<{scanned:number, purged:number, failed:number, bytes:number, dryRun:boolean, retentionDays:number, cutoff:string|null}>}
+ */
+export async function purgeExpiredBoundAudioRecordings(options = {}) {
+  const config = options.config ?? (await loadAudioRuntimeConfig());
+  const retentionDays = normalizeBoundRetentionDays(config.boundRetentionDays);
+  const dryRun = options.dryRun === undefined
+    ? Boolean(config.retentionDryRun)
+    : Boolean(options.dryRun);
+
+  // 0 = 永久保留：一行都不清（连查询都不发）
+  if (retentionDays === 0) {
+    return { scanned: 0, purged: 0, failed: 0, bytes: 0, dryRun, retentionDays, cutoff: null };
+  }
+
+  const database = await getDb();
+  const cutoff = new Date(Date.now() - retentionDays * MS_PER_DAY).toISOString();
+  const rows = (
+    await database
+      .prepare(`
+        SELECT ${AUDIO_ROW_COLUMNS}
+        FROM meeting_audio_recordings
+        WHERE meeting_id IS NOT NULL
+          AND status = 'ready'
+          AND updated_at < ?
+        ORDER BY updated_at ASC, id ASC
+      `)
+      .all(cutoff)
+  ).map(normalizeAudioRow);
+
+  if (rows.length === 0) {
+    return { scanned: 0, purged: 0, failed: 0, bytes: 0, dryRun, retentionDays, cutoff };
+  }
+
+  const totalBytes = rows.reduce((sum, row) => sum + Number(row.bytes ?? 0), 0);
+
+  if (dryRun) {
+    // 演练：只记日志，不删文件、不改状态
+    console.log(
+      `[Audio Retention] dry-run: 将清理 ${rows.length} 行 / 释放 ${totalBytes} 字节 ` +
+        `（retention=${retentionDays} 天，cutoff=${cutoff}）`
+    );
+    return { scanned: rows.length, purged: 0, failed: 0, bytes: totalBytes, dryRun: true, retentionDays, cutoff };
+  }
+
+  const markPurged = database.prepare(`
+    UPDATE meeting_audio_recordings
+    SET status = 'purged', purged_at = ?, error_message = NULL
+    WHERE id = ? AND status = 'ready'
+  `);
+  // 失败分支**只**写 error_message：不动 status（仍是 ready）、不动 updated_at
+  //（否则会把下次重试推后整整一个保留期）
+  const markFailure = database.prepare(`
+    UPDATE meeting_audio_recordings
+    SET error_message = ?
+    WHERE id = ?
+  `);
+
+  let purged = 0;
+  let failed = 0;
+  let bytes = 0;
+  for (const row of rows) {
+    const removal = removeBoundAudioFile(row.filePath);
+    if (!removal.ok) {
+      failed += 1;
+      await markFailure.run(String(removal.reason ?? "unlink failed").slice(0, 2000), row.id);
+      console.error(`[Audio Retention] 删除失败，保留行等待重试 (${row.id}): ${removal.reason}`);
+      continue;
+    }
+    await markPurged.run(nowIso(), row.id);
+    purged += 1;
+    bytes += Number(row.bytes ?? 0);
+  }
+
+  if (purged > 0 || failed > 0) {
+    console.log(
+      `[Audio Retention] 到期清理: purged=${purged} failed=${failed} 释放=${bytes} 字节 ` +
+        `（retention=${retentionDays} 天）`
+    );
+  }
+
+  return { scanned: rows.length, purged, failed, bytes, dryRun: false, retentionDays, cutoff };
+}
+
+// ---------------------------------------------------------------------------
+// 磁盘水位告警（feat-261103-01 / issue #57）
+//
+// 只读 data/audio 所在文件系统的可用空间（fs.statfs），低于 audio.disk_warn_gb 时
+// console.warn 一条含「实际剩余 + 阈值」的日志，并给 UI 一个可查询的状态对象。
+// **不接外部通知渠道**（工单明确排除）。
+// ---------------------------------------------------------------------------
+
+/**
+ * data/audio 所在文件系统的空间状态（启动/每轮清理/前端轮询都读这个）。
+ *
+ * @returns {Promise<{path:string, freeBytes:number|null, totalBytes:number|null,
+ *   freeGb:number|null, thresholdGb:number, thresholdBytes:number, active:boolean, error:string|null}>}
+ */
+export async function getAudioDiskStatus(options = {}) {
+  const config = options.config ?? (await loadAudioRuntimeConfig());
+  const thresholdGb = normalizeDiskWarnGb(config.diskWarnGb);
+  const thresholdBytes = thresholdGb * BYTES_PER_GB;
+  const rootDir = getAudioRootDir();
+
+  let freeBytes = null;
+  let totalBytes = null;
+  let error = null;
+  try {
+    if (!existsSync(rootDir)) mkdirSync(rootDir, { recursive: true });
+    const stats = await statfs(rootDir);
+    // bavail = 非特权用户可用块数（比 bfree 更贴近实际可写空间）
+    freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    totalBytes = Number(stats.blocks) * Number(stats.bsize);
+  } catch (statError) {
+    error = statError instanceof Error ? statError.message : String(statError);
+    console.error("[Audio Disk] statfs 失败，跳过水位判定:", error);
+  }
+
+  const freeGb = freeBytes === null ? null : freeBytes / BYTES_PER_GB;
+  return {
+    path: rootDir,
+    freeBytes,
+    totalBytes,
+    freeGb,
+    thresholdGb,
+    thresholdBytes,
+    // 低于阈值 → 告警（free < threshold）；读不到空间时不告警，只留 error
+    active: freeBytes !== null && freeBytes < thresholdBytes,
+    error,
+  };
+}
+
+/**
+ * 水位检查：命中阈值时打一条 console.warn（含实际剩余与阈值）。
+ * 启动与每轮清理都调它。
+ */
+export async function checkAudioDiskWatermark(options = {}) {
+  const status = await getAudioDiskStatus(options);
+  if (status.active) {
+    console.warn(
+      `[Audio Disk] 磁盘可用空间告警: 剩余 ${status.freeGb.toFixed(2)} GB < 阈值 ${status.thresholdGb} GB ` +
+        `（${status.path}）。录音落盘/转码可能失败，请清理磁盘或调整 audio.disk_warn_gb。`
+    );
+  }
+  return status;
+}
+
+/**
+ * 录音维护总入口（app-server 启动 + 每小时定时器调它）。
+ *
+ * 节拍复用 #43 的孤儿清理定时器，**不新起独立进程、不用系统 cron**：
+ *   1. 磁盘水位检查（命中就 warn）；
+ *   2. 孤儿录音清理（72h TTL 语义不变）；
+ *   3. 绑定录音到期清理（本单新增）。
+ */
+export async function runAudioMaintenance() {
+  const disk = await checkAudioDiskWatermark();
+  const orphan = await cleanupExpiredAudioRecordings();
+  const retention = await purgeExpiredBoundAudioRecordings();
+  return { disk, orphan, retention };
 }

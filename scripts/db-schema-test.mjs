@@ -519,11 +519,13 @@ async function main() {
     "id", "capture_session_id", "meeting_id", "file_path", "raw_file_path",
     "format", "status", "bytes", "duration_seconds", "sample_rate",
     "bitrate_kbps", "error_message", "created_at", "updated_at", "expires_at",
+    // feat-261103-01（issue #57）：v5 迁移补的到期清理留痕列
+    "purged_at",
   ]) {
     assert(audioCols.includes(column), `meeting_audio_recordings 缺少列 ${column}: ${audioCols}`);
   }
   console.log(
-    `✅ 场景3 旧库迁移: 数据搬迁 + legacy 清理 + 单行 v${KNEX_SCHEMA_VERSION} + meeting_audio_recordings 15 列齐全`
+    `✅ 场景3 旧库迁移: 数据搬迁 + legacy 清理 + 单行 v${KNEX_SCHEMA_VERSION} + meeting_audio_recordings 16 列齐全`
   );
   await db2.knex.destroy();
 
