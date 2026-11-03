@@ -86,7 +86,7 @@ EOF
 - **驱动变更（#54）**：SQLite 从 Node 内置的 `node:sqlite`（`DatabaseSync`，同步）换成 `better-sqlite3@13`（经 knex，Promise 化）。业务代码形态不变（仍是 `prepare(sql).all/get/run`），只是全部变成 `await`。
 - **`DB_TYPE` 真实支持面**：`sqlite`（默认，生产已验证）／`mysql`、`mssql`（**建表 + 迁移 + 版本记账 + 生产入口初始化**已三库跑绿；业务 SQL 的 `ON CONFLICT` / `INSERT OR IGNORE` / `PRAGMA table_info` 等方言语法仍待 #55 清零，配上去会在具体业务路径上出错）。
 - **连接级 PRAGMA 是条件化的**：`journal_mode=WAL` / `busy_timeout=5000` / `foreign_keys=ON` **只在 `DB_TYPE=sqlite` 时下发**（mysql/mssql 没有 `PRAGMA` 语法，实测 mssql 报 `Incorrect syntax near '='`）。WAL 在 Docker bind mount 上不可用时仍会打印原文告警，不静默降级。
-- **SQLite 是单文件数据库**（`data/meeting-asr-app.db`），备份/迁移/换机都只需拷文件（见 §6）。
+- **SQLite 是单文件数据库**（`data/meeting-asr-app.db`），备份/迁移/换机见 §5（**不是拷文件**：WAL 库要用 `VACUUM INTO`）。
 - ⚠ **同一库文件禁止混用两种 SQLite 驱动**：`node:sqlite` 与 `better-sqlite3` 交替写同一个文件会让 WAL 对彼此不可读（实测 `SQLITE_IOERR_SHORT_READ`）。生产只用 `better-sqlite3`；脚本/备份工具要读这个库时也必须用 `better-sqlite3`（`node:sqlite` 只在历史脚本里出现过）。
 
 | 阶段 | 内容 | 状态 |
@@ -186,18 +186,219 @@ docker compose restart app     # 重启，启动时自动检测并重建 .next
 
 ## 5. 数据备份与恢复
 
-数据库为单文件 `meeting-asr-app.db`，备份即拷贝文件：
+### 5.0 为什么不能 `cp`（#56 修正）
+
+旧版本节写的是 `cp -a .docker/data/meeting-asr-app.db backup-$(date +%F).db` —— **对 WAL 库是错的**。
+
+生产库是 **WAL 模式**（同目录有 `meeting-asr-app.db-wal` / `meeting-asr-app.db-shm`），最近提交的事务可能还只在 `-wal` 里、没 checkpoint 回主文件：只拷主文件 ⇒ 丢掉最近写入；连 `-wal` 一起拷又容易拿到不一致的中间态。正确做法是**让 SQLite 自己导出一份事务一致的副本**：`VACUUM INTO`（SQLite 3.27+，本机 3.53.4）。
+
+所以备份动作统一交给 `scripts/db-backup.mjs`；`cp` 只出现在「恢复」那一步（且**必须先删 `-wal`/`-shm`**，见 §5.7）。
+
+### 5.1 一键备份（`npm run db:backup`）
 
 ```bash
-# 备份（建议先停止写入或直接用 sqlite 在线备份）
-cp -a .docker/data/meeting-asr-app.db backup-$(date +%F).db
+# 容器内（生产形态；默认输出到 /app/data/backups = 宿主 .docker/data/backups）
+docker exec meeting_asr_app-app-1 node /app/scripts/db-backup.mjs
 
-# 恢复
-cp backup-xxx.db .docker/data/meeting-asr-app.db
-docker compose restart app
+# 或宿主机走 npm（注意 SQLITE_PATH 要指宿主路径）
+SQLITE_PATH=.docker/data/meeting-asr-app.db DB_BACKUP_DIR=/tmp/bk npm run db:backup
 ```
 
-## 5.1 会议录音（MP3）存储
+脚本做的事（顺序即安全边界，别调换）：
+
+1. `DB_TYPE != sqlite` ⇒ **明确拒绝**：`RESULT: FAIL code=unsupported_db_type`，退出码 1（分叉见 §5.9）。不静默跳过——跳过会被 cron 当成「今天备份成功」。
+2. 目标目录 `DB_BACKUP_DIR`（默认 `/app/data/backups`）不存在则创建。
+3. `better-sqlite3` 打开生产库，**先 `PRAGMA busy_timeout = 5000`**（独立进程、独立连接，不继承应用侧的设置）。
+4. `VACUUM INTO '<dir>/.<name>.tmp'` —— **先写临时名**。
+5. `PRAGMA integrity_check` 打开临时文件（只读、同样是 `better-sqlite3`）必须返回 `ok`。
+6. **才** rename 成 `<prefix>-YYYYMMDD-HHMMSS.db`（时间戳固定 UTC+8，与容器 `TZ` 无关）。同一秒内重复运行不覆盖已有备份，加序号 `-2` / `-3`。
+7. 按 `DB_BACKUP_KEEP`（默认 14）保留最新 N 份，删旧的并逐个记日志。
+8. 只读统计 `data/audio` 的字节数与文件数（不拷贝、不删除），打一行 `[backup] 音频用量…`。
+9. 收尾打**机器可读一行**。
+
+真实输出（2026-11-04 06:49 对生产库）：
+
+```text
+[backup] 音频用量（只统计不拷贝）: files=2 bytes=520128 dir=/app/data/audio
+RESULT: OK file=/tmp/backup56/meeting-asr-app-20261104-064923.db bytes=245760 integrity=ok kept=1 removed=0 elapsed_ms=23
+```
+
+| 环境变量 | 默认 | 说明 |
+|:---|:---|:---|
+| `DB_TYPE` | `sqlite` | 非 sqlite 直接拒绝（退出码 1） |
+| `SQLITE_PATH` | `<cwd>/data/meeting-asr-app.db` | 生产库路径 |
+| `DB_BACKUP_DIR` | `/app/data/backups` | 备份目录（宿主等价 `.docker/data/backups`，compose 已挂载，零改动） |
+| `DB_BACKUP_KEEP` | `14` | 保留份数；**`0` = 不做清理，只增不删** |
+| `DB_BACKUP_PREFIX` | 库文件名去掉 `.db` | 备份文件名前缀 |
+| `DB_AUDIO_DIR` | `<cwd>/data/audio` | 只用于统计 |
+
+失败码（`RESULT: FAIL code=<码>`，退出码一律 1）：`unsupported_db_type` / `invalid_keep` / `db_missing` / `db_open_failed` / `backup_dir_create_failed` / `vacuum_failed` / `vacuum_empty` / `integrity_failed` / `rename_failed` / `unexpected_error`。
+
+**失败不留半成品**：临时文件与 0 字节产物在校验失败时一律删除 ⇒ 目录里出现 `meeting-asr-app-*.db` 本身就意味着那是一份 `integrity_check=ok` 的备份。
+
+### 5.2 每日自动备份（cron）
+
+```bash
+bash scripts/install-backup-cron.sh            # 默认只打印将要追加的行，不写 crontab
+bash scripts/install-backup-cron.sh --install  # 真的写入（幂等：已存在同一行则跳过）
+bash scripts/install-backup-cron.sh --check    # 已装退出码 0 / 未装 1（给监控用）
+```
+
+追加的行（本机 crontab 是**本地时区 UTC+8**，所以是每天 03:20）：
+
+```cron
+20 3 * * * docker exec meeting_asr_app-app-1 node /app/scripts/db-backup.mjs >> /home/eric/logs/meeting-asr-backup.log 2>&1
+```
+
+前提：`/home/eric/logs` 存在（不存在时安装脚本会告警——cron 不会替你建目录，失败是静默的）。
+装之前先手动跑一次 §5.1 的命令，确认能出 `RESULT: OK`。
+
+### 5.3 失败告警口径（三种判据，任一命中即告警）
+
+| # | 判据 | 检查 |
+|:---|:---|:---|
+| 1 | 当天日志出现 `RESULT: FAIL` | `grep -q 'RESULT: FAIL' /home/eric/logs/meeting-asr-backup.log` |
+| 2 | 当天没有新备份文件 | `ls .docker/data/backups/meeting-asr-app-$(date +%Y%m%d)-*.db` 为空 |
+| 3 | 最近一次不是 `integrity=ok`（含进程被杀、没打出 RESULT 行） | `grep 'RESULT: OK' … \| tail -1 \| grep -qv 'integrity=ok'` |
+
+一条能直接挂进监控的：
+
+```bash
+LOG=/home/eric/logs/meeting-asr-backup.log
+BK=/home/eric/projects/meeting_asr_app/.docker/data/backups
+fail=0
+grep -q 'RESULT: FAIL' "$LOG" && fail=1
+grep 'RESULT: OK' "$LOG" | tail -1 | grep -q 'integrity=ok' || fail=1
+ls "$BK"/meeting-asr-app-"$(date +%Y%m%d)"-*.db >/dev/null 2>&1 || fail=1
+[ "$fail" -eq 0 ] || echo "备份异常：$(date -Is)" | tee -a "$LOG"
+```
+
+### 5.4 保留份数与容量
+
+- 默认保留 **14** 份（约两周），按文件名里的时间戳排序，删最旧。
+- `DB_BACKUP_KEEP=0` = **只增不删**（显式语义，单测钉住）。只在「外部快照负责清理」时这么配。
+- 容量：库年增约 0.2–2 GB，14 份 ≈ 当前库体积 × 14，仍是 MB 级；**音频不在这条链里**（见 §5.5 与 §6）。
+
+### 5.5 音频（MP3）不进每日备份——边界与两选一
+
+音频年增 26–155 GB，比库大**两个数量级**。混进每日备份的后果：① 备份窗口从秒级变小时级；② 14 份保留策略直接吃掉数 TB。所以**默认边界：每日备份只管数据库**。音频二选一：
+
+1. **宿主机快照 / 外部备份负责（默认边界）**：`data/audio` 跟着整机/整卷快照走，库里只存路径与元数据。
+2. **单独一条增量 cron（需要时才装，默认不装）**：
+
+```cron
+30 3 * * * rsync -a --delete /home/eric/projects/meeting_asr_app/.docker/data/audio/ /mnt/backup/meeting_asr/audio/ >> /home/eric/logs/meeting-asr-audio-backup.log 2>&1
+```
+
+⚠ 用 `--delete` 前先确认目标盘够大、且目标确实是「镜像」而非「历史归档」。**恢复一致性**要求库与音频来自同一时间点，否则详情页播放器会 404（DB 行还在、文件没了）。
+
+### 5.6 恢复演练记录（2026-11-04 真跑，issue #56 判据 2）
+
+用**当天真跑出来的那份备份**（不是手工造的）走完整链路：
+
+```text
+# 1) 对生产库真跑一次备份（备份目录指到容器 /tmp，避免污染 .docker/data）
+$ docker exec meeting_asr_app-app-1 sh -c 'DB_BACKUP_DIR=/tmp/backup56 node /app/scripts/db-backup.mjs'
+RESULT: OK file=/tmp/backup56/meeting-asr-app-20261104-064923.db bytes=245760 integrity=ok kept=1 removed=0 elapsed_ms=23
+
+# 2) 拷到临时目录并改名成正式库名
+$ docker cp meeting_asr_app-app-1:/tmp/backup56/meeting-asr-app-20261104-064923.db /tmp/restore56/meeting-asr-app.db
+$ ls -la /tmp/restore56/meeting-asr-app.db     →  245760 字节
+
+# 3) integrity_check 原文（宿主侧 better-sqlite3 只读）
+integrity_check = [{"integrity_check":"ok"}]
+tables = 16   (app_settings … users)
+meetings = 0  users = 1
+
+# 4) 临时实例：端口 3125、数据目录指向临时目录（独立容器，不碰生产容器与生产 data）
+$ docker run -d --name meeting_asr_restore56 --rm -v $PWD:/app:ro … -v /tmp/restore56:/app/data \
+    -e PORT=3125 -e SQLITE_PATH=/app/data/meeting-asr-app.db -p 3125:3125 node:24-slim node server/app-server.mjs
+[DB] SQLite ready: /app/data/meeting-asr-app.db (journal_mode=wal)
+[App Server] Production server running on http://0.0.0.0:3125
+
+$ curl -X POST :3125/api/auth/login -d '{"accountName":"admin","password":"admin123"}'
+login http=200  {"user":{"id":"user-admin","accountName":"admin","roles":["system_admin"]}}
+$ curl -b cookie :3125/api/meetings
+{"meetings":[]}      ← 0 条，与生产库一致（生产库 meetings 本来就是 0）
+
+# 5) 证明恢复库**可读写**（不只是能打开）：建一条会议再读回
+post http=200  {"meeting":{"id":"meeting-1f75e8c8-…","title":"恢复演练-261104-01","status":"transcribed"}}
+{"meetings":[{"title":"恢复演练-261104-01", …}]}    ← 1 条
+（演练后再跑 integrity_check 仍为 ok，meetings = 1）
+
+# 6) 拆除 + 清理（ls 证明）
+$ docker rm -f meeting_asr_restore56                 → meeting_asr_restore56
+$ docker exec meeting_asr_app-app-1 rm -rf /tmp/backup56
+$ rm -rf /tmp/restore56
+$ ls -la /tmp/restore56                              → No such file or directory
+$ docker ps | grep -c restore56                      → 0
+```
+
+结论：**今日真备份 → `integrity_check=ok` → 临时实例能登录、能读、能写 → 已清理干净**。
+一处偏差（如实记录）：生产 `admin` 密码早已不是 `admin123`，为了验证登录，只在**恢复副本**上把 admin 的 `password_hash` 重置成 `admin123`（`scrypt-v1` 格式，与 `src/lib/admin-store.ts` 一致）；**生产库未改动**（`.docker/data` 下各文件 mtime 与本单开始时一致）。
+
+### 5.7 从备份恢复（正式流程）
+
+```bash
+# 1. 停应用（避免恢复过程中有写入）
+docker compose stop app
+
+# 2. 先把当前库留个底（这一步仍是 cp，但只是「保命」，不是正式备份）
+cp -a .docker/data/meeting-asr-app.db .docker/data/meeting-asr-app.db.before-restore-$(date +%Y%m%d-%H%M%S)
+
+# 3. ⚠ 必须删掉旧 WAL/SHM：恢复进来的库与旧 -wal 不是一套，留着会被 SQLite 当成本库日志
+rm -f .docker/data/meeting-asr-app.db-wal .docker/data/meeting-asr-app.db-shm
+
+# 4. 把备份放成正式库名
+cp .docker/data/backups/meeting-asr-app-20261104-064923.db .docker/data/meeting-asr-app.db
+
+# 5. 起回来并确认
+docker compose start app
+docker compose logs --tail 30 app | grep -E "SQLite ready|migration|schema_version"
+```
+
+验收：能登录、`GET /api/meetings` 的条数与备份时点一致；`npm run db:smoke` 通过。
+回滚：把第 2 步的 `.before-restore-*` 放回去（同样先删 `-wal`/`-shm`）。
+
+### 5.8 安全告警与驱动告警
+
+- ⚠ **备份文件含明文密钥**：`app_settings` 里有 `llm.api_key`（以及 ASR / TTS / SMTP 密钥）。备份目录必须按密钥对待——不要进 git、不要丢共享盘/网盘、目录 `chmod 700`、异地传输前加密（`age` / `gpg`）。
+- ⚠ **同一库文件禁止混用两种 SQLite 驱动**：`node:sqlite` 与 `better-sqlite3` 交替写同一文件会 `SQLITE_IOERR_SHORT_READ`（实测）。备份/校验脚本只用 `better-sqlite3`；手工排查也请走 `docker exec … node -e "require('better-sqlite3')…"`，不要用系统 `sqlite3` CLI 对着生产文件做写操作。
+
+### 5.9 换 MSSQL / MySQL 后：备份方式分叉（#55）
+
+`scripts/db-backup.mjs` 是 **SQLite 专用**的。`DB_TYPE=mssql|mysql` 时它**明确拒绝**：
+
+```text
+RESULT: FAIL code=unsupported_db_type      （退出码 1）
+```
+
+（不许静默跳过：跳过会被 cron 当成「今天备份成功」。）外置库的备份方式与 SQLite 完全不同：
+
+- **MSSQL**：`BACKUP DATABASE meeting_asr TO DISK = '/var/opt/mssql/backup/meeting_asr-YYYYMMDD.bak' WITH CHECKSUM, COMPRESSION;`，再用 `RESTORE VERIFYONLY FROM DISK = '…'` 校验（等价于 `integrity_check`）。
+- **MySQL / MariaDB**：`mysqldump --single-transaction --routines --triggers --set-gtid-purged=OFF … | gzip`，恢复用 `mysql < dump.sql`。
+- 库外还有 `data/audio`（本地文件，永远跟着宿主机走，见 §5.5）。
+
+cron 行如何按 `DB_TYPE` 分叉、告警口径如何复用：见 **issue #55**。
+
+### 5.10 可选加固：把备份目录挪到 `/docker/meeting_asr_app_backup`
+
+默认备份目录 `.docker/data/backups` 与库同盘——盘坏了库和备份一起没。要分开就：
+
+```bash
+# 1. 宿主建目录（/docker 是 root:root 755，eric 不可写，必须 sudo）
+sudo mkdir -p /docker/meeting_asr_app_backup
+sudo chown 1000:1000 /docker/meeting_asr_app_backup   # 容器内以 root 跑，宿主侧映射成 eric
+
+# 2. compose 的 app.volumes 里加一行（放在 ./.docker/data:/app/data 之后）
+#      - /docker/meeting_asr_app_backup:/app/data/backups
+docker compose up -d app     # 新增 volume 要 up -d 才生效（restart 不够）
+```
+
+生效后脚本默认的 `DB_BACKUP_DIR=/app/data/backups` 就落到 `/docker/meeting_asr_app_backup`，脚本本身不用改。
+（可选加固，本单**没有**安装——见 report 的「诚实边界」。）
+
+## 6. 会议录音（MP3）存储
 
 feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，会议结束后转成 MP3 保存在本地磁盘。设计细节见 `docs/design/meeting-audio-recording.md`。
 
@@ -228,10 +429,11 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 
 ### 备份与迁移
 
-- 备份数据库的同时**必须一并备份 `data/audio/`**，否则恢复后会议详情里的播放器会 404（DB 行还在、文件没了）。最小可用备份：
+- 数据库走 §5.1 的备份脚本（**不要 `cp`**：WAL 库会拿到不一致快照）；音频走 §5.5 的二选一（宿主机快照，或单独一条 `rsync -a --delete` cron）。两者必须来自**同一时间点**，否则恢复后会议详情里的播放器会 404（DB 行还在、文件没了）。
+- 只想要一次性打包（迁移场景，非日常备份）：
   ```bash
-  cp -a .docker/data/meeting-asr-app.db backup-$(date +%F).db
-  tar czf backup-audio-$(date +%F).tar.gz -C .docker/data audio
+  docker exec meeting_asr_app-app-1 node /app/scripts/db-backup.mjs   # 库
+  tar czf backup-audio-$(date +%F).tar.gz -C .docker/data audio        # 音频
   ```
 - 换部署机迁移时，源码 + `.env` + `.docker/data`（**含 `audio/`**）三者一并迁移。
 - `.docker/data/audio` 以 root 写入（容器以 root 运行），宿主机侧清理时注意权限。
@@ -241,7 +443,7 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 - 后台「录音配置」→ 关闭「服务端旁路录制会议音频」后，**新会议**不再落盘；已录好的音频不受影响。开关值存 `app_settings.audio:record_enabled`。
 - 若需彻底停止录音能力，关闭开关即可；`data/audio` 中的既有文件可手工删除（DB 行残留会在详情页表现为 404，删除会议可连带清行）。
 
-## 6. 安全注意事项
+## 7. 安全注意事项
 
 - **必须**设置 `BOOTSTRAP_ADMIN_PASSWORD`，默认 `admin123` 仅限开发。
 - ASR WebSocket 的 Origin 判定：**同源（Origin 的 hostname+端口 == 请求 Host）自动放行**，
@@ -253,7 +455,7 @@ feat-261101-01 起，服务端在转写的同时**旁路录制原始音频**，�
 - 当前容器以 root 运行；如需加固，可在 compose 增加 `user: "node"` 并对 `.docker/` 目录 `chown -R node:node`。
 - 敏感配置（ASR/LLM/SMTP 密钥）存于 SQLite，注意 `.docker/data` 的访问权限。
 
-## 7. 常见问题
+## 8. 常见问题
 
 | 现象 | 原因与处理 |
 |:---|:---|
