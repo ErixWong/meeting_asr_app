@@ -807,6 +807,14 @@ export default function MeetingPage() {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
+      // 离开页面时把仍在连的 ASR 客户端收掉（issue #70 验收 K5）：beforeunload 管不到
+      // Next 的客户端路由（如顶栏「⚙ 管理」），不收拾就会留下「看不见的录音」——
+      // 麦克风还在采、音频还在写，但页面已经不在。转写仍会丢（保存需要用户确认），
+      // 这条只保证不留后台录音。
+      for (const activeClient of asrClientsRef.current.values()) {
+        void activeClient.stopRecording().catch(() => {});
+      }
+      asrClientsRef.current = new Map();
     };
   }, [loadRuntimeConfig, requestJson, showNotice]);
 
@@ -1122,19 +1130,6 @@ export default function MeetingPage() {
     // 用户主动停止：先置意图标志（stop 时的 onclose 不应报「连接断开」），并收掉链路告警
     asrStopIntentRef.current = true;
     setAsrLinkError(null);
-
-    // 先要名字再停录音（issue #70）。原顺序是「停完 ASR 才弹 prompt」：用户在原生对话框里
-    // 按 Esc / 点取消会直接 return，而此时麦克风已关、音频已录完、转写只在内存里 ——
-    // 整场会议静默丢失，没有任何恢复入口。现在取消 = 「不停止」，录音原样继续。
-    const now = new Date();
-    const dateStr = `${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
-    const defaultName = `录音 ${dateStr}`;
-    const name = window.prompt("请输入录音名称：", defaultName);
-    if (name === null) {
-      asrStopIntentRef.current = false;
-      return;
-    }
-
     flushTranslateRef.current();
     if (checkpointPromiseRef.current) {
       await checkpointPromiseRef.current.catch((error) => {
@@ -1163,10 +1158,10 @@ export default function MeetingPage() {
       asrClientsRef.current = new Map();
     }
 
-    // 先把未渲染的 pending partial 刷进 segments（等价于 150ms 定时器那次刷新），
-    // 否则 resetTranscriptScheduler() 里的 clearPendingPartial() 会把它直接丢掉 ——
-    // 停止那一刻的尾段就这样消失（issue #70）。
-    flushPendingPartial();
+    // 先把未渲染的 pending partial 落进 segments，并**补标 final**（issue #70）。
+    // 注意用 materializeCheckpointTranscript 而不是 flushPendingPartial：后者只
+    // commitTranscriptResult，提交出来的段仍是 isFinal:false，会被下面 filter(isFinal) 丢掉。
+    materializeCheckpointTranscript();
     resetTranscriptScheduler();
     const finalSegments = segmentsRef.current.filter((segment) => segment.isFinal);
     if (finalSegments.length === 0) {
@@ -1175,12 +1170,24 @@ export default function MeetingPage() {
       return;
     }
 
-    const title = name.trim() || defaultName;
+    const now = new Date();
+    const dateStr = `${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
+    const defaultName = `录音 ${dateStr}`;
+
+    // 取消命名不再丢数据（issue #70）：取消 = 用默认名称保存，用户可随时重命名。
+    // ⚠ 不能把 prompt 前移到停止录音之前：window.prompt 同步阻塞主线程，而音频处理跑在
+    // ScriptProcessorNode.onaudioprocess（funasr.ts:399-409），阻塞期间 PCM 帧会被丢弃，
+    // 等于把「丢转写」换成「丢音频」。
+    const name = window.prompt("请输入录音名称：", defaultName);
+    if (name === null) {
+      showNotice("info", "已按默认名称保存，可随时在历史记录里重命名");
+    }
+    const title = (name ?? "").trim() || defaultName;
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
-      const data = existingMeetingId
-        ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
+      const sendSave = () => existingMeetingId
+        ? requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1193,7 +1200,7 @@ export default function MeetingPage() {
               finalize: true,
             }),
           })
-        : await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
+        : requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1206,6 +1213,22 @@ export default function MeetingPage() {
               transcriptSegments: finalSegments,
             }),
           });
+
+      // 保存失败自动重试（issue #70）：转写只在内存里，一次网络抖动就全丢太脆。
+      // 3 次、800/1600ms 退避；仍失败则抛给外层 catch（那里不清 liveSegments）。
+      let data: { meeting?: MeetingRecord } | undefined;
+      let lastSaveError: unknown;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          data = await sendSave();
+          break;
+        } catch (error) {
+          lastSaveError = error;
+          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
+        }
+      }
+      if (!data) throw lastSaveError;
+
       const meeting = data.meeting;
       if (meeting) {
         setMeetings((prev) => {
@@ -1235,20 +1258,26 @@ export default function MeetingPage() {
     } catch (error) {
       console.error("Failed to save meeting:", error);
       // 不清 liveSegments（issue #70）：转写只在这里的内存里，清掉就再也拿不回来。
-      showNotice("error", "会议保存失败，转写仍保留在页面上；请重新点「停止录音」再保存一次");
+      showNotice("error", "会议保存失败（已自动重试 3 次）。转写仍保留在页面上，请勿刷新；确认网络/登录状态后重新点「结束录音」再存一次");
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
     }
-  }, [flushPendingPartial, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
+  }, [materializeCheckpointTranscript, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
     // 录音中新建会议会把 liveSegments 清空却不停旧录音（issue #70）：
     // 麦克风还在采、音频还在写，但数据谁也不要。先拦住。
-    if (asrClientsRef.current.size > 0 || status === "recording" || status === "paused") {
+    if (status === "recording" || status === "paused") {
       showNotice("warn", "录音进行中，请先停止录音再新建会议");
       return;
     }
+    // 连接中（connecting）允许切换，但必须把半启动的客户端收掉：上一版用
+    // asrClientsRef.size > 0 做守卫，会在 getUserMedia 挂住时把用户锁死（无处可停）。
+    for (const activeClient of asrClientsRef.current.values()) {
+      void activeClient.stopRecording().catch(() => {});
+    }
+    asrClientsRef.current = new Map();
     resetTranscriptScheduler();
     resetTranslateRef.current();
     asrRecoveryRef.current = false;
@@ -2038,10 +2067,14 @@ export default function MeetingPage() {
                 void handleGenerateAiTitle(id);
               }}
                onSelect={(m) => {
-                 if (asrClientsRef.current.size > 0 || status === "recording" || status === "paused") {
+                 if (status === "recording" || status === "paused") {
                    showNotice("warn", "录音进行中，请先停止录音再切换会议");
                    return;
                  }
+                 for (const activeClient of asrClientsRef.current.values()) {
+                   void activeClient.stopRecording().catch(() => {});
+                 }
+                 asrClientsRef.current = new Map();
                  resetTranscriptScheduler();
                  asrRecoveryRef.current = false;
                  persistedMeetingIdRef.current = null;
@@ -2590,6 +2623,13 @@ export default function MeetingPage() {
                   <div className="flex flex-wrap items-center gap-3">
                     <Link
                       href="/chat"
+                      onClick={(event) => {
+                        // beforeunload 只在整页卸载时触发，Next 的客户端路由不会走它（issue #70 验收 K5）。
+                        if (status === "recording" || status === "paused") {
+                          event.preventDefault();
+                          showNotice("warn", "录音进行中，请先停止录音再切换页面");
+                        }
+                      }}
                       className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-700 shadow-sm transition hover:bg-emerald-100"
                     >
                       🗣 语音对话
