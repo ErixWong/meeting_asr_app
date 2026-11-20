@@ -226,9 +226,11 @@ export default function MeetingPage() {
   const lastCaptureRef = useRef<{ captureSessionId: string; captureSessionIds: string[] } | null>(null);
   // 保存互斥（issue #70 复审 S3/T2）：必须用 ref —— 重试按钮的 onClick 是旧渲染的闭包，
   // 从里面读 status 会读到陈旧值，state 挡不住重入。
-  // 存的是**置锁时刻**（0 = 未锁定），而不是布尔：入口即置锁（堵住双提交窗口），
-  // 同时 60 秒自动过期 —— 万一某条路径抛异常漏掉复位，也不会把后续保存永久卡死。
-  const savingRef = useRef(0);
+  // 置锁在 stopRecording 包装里（入口即置），复位由覆盖全过程的 finally 保证。
+  const savingRef = useRef(false);
+  // 重试按钮的 onClick 建在 stopRecordingInner 内部，拿不到外层包装，
+  // 通过这个 ref 指向「带锁的版本」（issue #70 复审 T2）。
+  const stopRecordingRef = useRef<() => void>(() => {});
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
   const translationEnabledRef = useRef(false);
   const targetLangRef = useRef("en");
@@ -1139,15 +1141,7 @@ export default function MeetingPage() {
     }
   }, [startRecording]);
 
-  const stopRecording = useCallback(async () => {
-    // 保存进行中再次触发（典型：连点「重试保存」）会并发发出第二次 POST/PATCH，
-    // 而这两个接口都不幂等（issue #70 复审 S3）。用 ref 而不是 state：
-    // 重试按钮的 onClick 是旧渲染闭包，读 status 会拿到陈旧值。
-    // 入口**立即**置锁（issue #70 复审 T2）：锁若延后到 prompt 之后才置位，
-    // 期间在 checkpoint 的 await 处让出主线程时，第二次点击仍能挤进来。
-    const lockNow = Date.now();
-    if (savingRef.current && lockNow - savingRef.current < 60_000) return;
-    savingRef.current = lockNow;
+  const stopRecordingInner = useCallback(async () => {
     // 用户主动停止：先置意图标志（stop 时的 onclose 不应报「连接断开」），并收掉链路告警
     asrStopIntentRef.current = true;
     setAsrLinkError(null);
@@ -1202,7 +1196,6 @@ export default function MeetingPage() {
     if (finalSegments.length === 0) {
       showNotice("warn", "本次录音没有可保存的转写");
       setStatus("idle");
-      savingRef.current = 0;
       return;
     }
 
@@ -1289,14 +1282,31 @@ export default function MeetingPage() {
       showNotice(
         "error",
         "会议保存失败。转写已保留在页面上（请勿刷新），可直接重试保存",
-        { label: "重试保存", onClick: () => { void stopRecording(); } }
+        { label: "重试保存", onClick: () => { stopRecordingRef.current(); } }
       );
       setStatus("idle");
     } finally {
-      savingRef.current = 0;
       setSavingMeeting(false);
     }
   }, [materializeCheckpointTranscript, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
+
+  // 保存互斥（issue #70 复审 T2）：入口**立即**置锁，外层 finally 覆盖 checkpoint 的 await、
+  // 命名 prompt、提前返回与保存全过程 —— 不再用 TTL（TTL 会在请求仍在飞时放行第二次提交，
+  // 且旧请求的 finally 会把新请求的锁清掉）。
+  const stopRecording = useCallback(async () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    try {
+      await stopRecordingInner();
+    } finally {
+      savingRef.current = false;
+    }
+  }, [stopRecordingInner]);
+
+  // 让内层函数里的「重试保存」按钮也能走到带锁的版本。
+  useEffect(() => {
+    stopRecordingRef.current = () => { void stopRecording(); };
+  }, [stopRecording]);
 
   const handleCreateNew = useCallback(() => {
     // 录音中新建会议会把 liveSegments 清空却不停旧录音（issue #70）：
