@@ -1183,9 +1183,6 @@ export default function MeetingPage() {
     // ScriptProcessorNode.onaudioprocess（funasr.ts:399-409），阻塞期间 PCM 帧会被丢弃，
     // 等于把「丢转写」换成「丢音频」。
     const name = window.prompt("请输入录音名称：", defaultName);
-    if (name === null) {
-      showNotice("info", "已按默认名称保存，可随时在历史记录里重命名");
-    }
     const title = (name ?? "").trim() || defaultName;
     setSavingMeeting(true);
     try {
@@ -1244,6 +1241,13 @@ export default function MeetingPage() {
       setAsrErrorMessage(null);
       setStatus("idle");
       setElapsed(0);
+      // 保存成功后才说「已保存」；顺便清掉上一条（可能带「重试保存」按钮）的错误提示，
+      // 否则重试成功了旧错误还挂在页面上（issue #70）。
+      if (name === null) {
+        showNotice("info", "已按默认名称保存，可随时在历史记录里重命名");
+      } else {
+        setNotice(null);
+      }
     } catch (error) {
       console.error("Failed to save meeting:", error);
       // 不清 liveSegments（issue #70）：转写只在这里的内存里，清掉就再也拿不回来。
