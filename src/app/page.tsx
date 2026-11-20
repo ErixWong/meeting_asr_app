@@ -236,8 +236,12 @@ export default function MeetingPage() {
   const translationsRef = useRef<TranslationBlock[]>([]);
   translationsRef.current = translations;
 
-  const showNotice = useCallback((type: ActionNotice["type"], message: string) => {
-    setNotice({ type, message });
+  const showNotice = useCallback((
+    type: ActionNotice["type"],
+    message: string,
+    action?: ActionNotice["action"]
+  ) => {
+    setNotice(action ? { type, message, action } : { type, message });
   }, []);
 
   const pickFallbackTargetLang = useCallback((lang: string) => (lang === "en" ? "zh" : "en"), []);
@@ -1186,8 +1190,8 @@ export default function MeetingPage() {
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
-      const sendSave = () => existingMeetingId
-        ? requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
+      const data = existingMeetingId
+        ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1200,7 +1204,7 @@ export default function MeetingPage() {
               finalize: true,
             }),
           })
-        : requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
+        : await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1213,21 +1217,6 @@ export default function MeetingPage() {
               transcriptSegments: finalSegments,
             }),
           });
-
-      // 保存失败自动重试（issue #70）：转写只在内存里，一次网络抖动就全丢太脆。
-      // 3 次、800/1600ms 退避；仍失败则抛给外层 catch（那里不清 liveSegments）。
-      let data: { meeting?: MeetingRecord } | undefined;
-      let lastSaveError: unknown;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-          data = await sendSave();
-          break;
-        } catch (error) {
-          lastSaveError = error;
-          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
-        }
-      }
-      if (!data) throw lastSaveError;
 
       const meeting = data.meeting;
       if (meeting) {
@@ -1258,7 +1247,13 @@ export default function MeetingPage() {
     } catch (error) {
       console.error("Failed to save meeting:", error);
       // 不清 liveSegments（issue #70）：转写只在这里的内存里，清掉就再也拿不回来。
-      showNotice("error", "会议保存失败（已自动重试 3 次）。转写仍保留在页面上，请勿刷新；确认网络/登录状态后重新点「结束录音」再存一次");
+      // 不做自动重试（issue #70）：createMeeting 不去重、capture session 也没有 meeting_id
+      // 可当幂等键，自动重发会造出重复会议/重复转写段。改为用户显式点一次。
+      showNotice(
+        "error",
+        "会议保存失败。转写已保留在页面上（请勿刷新），可直接重试保存",
+        { label: "重试保存", onClick: () => { void stopRecording(); } }
+      );
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
