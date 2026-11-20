@@ -20,7 +20,9 @@
     "test:audio": "node --test scripts/audio-test.mjs",
     "test:retention": "node --test scripts/audio-retention-test.mjs",
     "test:title": "node --test scripts/ai-title-test.mjs",
-    "test:asr-origin": "node --test scripts/asr-origin-test.mjs"
+    "test:asr-origin": "node --test scripts/asr-origin-test.mjs",
+    "test:queue-ctx": "node --test scripts/llm-queue-context-test.mjs",
+    "test:safe-href": "node --test scripts/safe-href-test.mjs"
   },
   "dependencies": {
     "@breezystack/lamejs": "1.2.7",
