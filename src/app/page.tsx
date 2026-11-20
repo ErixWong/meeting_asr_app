@@ -95,7 +95,7 @@ function getTranscriptPlainText(segments: TranscriptSegment[]) {
 }
 
 type ActionNotice = {
-  type: "success" | "error" | "info";
+  type: "success" | "error" | "info" | "warn";
   message: string;
   /** feat-261101-04（#44）：toast 里的一次性动作（AI 标题的「撤销」） */
   action?: { label: string; onClick: () => void };
@@ -695,9 +695,14 @@ export default function MeetingPage() {
     // 那时按原时长（error 7000ms / 其余 3500ms）自动消失 —— 一次性撤销，不给第二次入口。
     if (notice.action) return;
 
+    // warn 是「你需要做一件事」的提示（如「录音进行中，请先停止」），3.5 秒太短会被当成
+    // 「点了没反应」；给 5 秒（issue #70）。error/success 的 7000/3500 原时长不许动
+    //（scripts/ai-title-test.mjs T11 钉住了下面这个表达式）。
+    const baseDismissMs = notice.type === "error" ? 7000 : 3500;
+
     const timer = window.setTimeout(() => {
       setNotice(null);
-    }, notice.type === "error" ? 7000 : 3500);
+    }, notice.type === "warn" ? 5000 : baseDismissMs);
 
     return () => window.clearTimeout(timer);
   }, [notice]);
@@ -804,6 +809,23 @@ export default function MeetingPage() {
       }
     };
   }, [loadRuntimeConfig, requestJson, showNotice]);
+
+  // 录音中/有未保存转写时离开页面要给确认（issue #70）：
+  // 刷新会丢掉全部实时转写，而 ASR 原始事件 2 小时过期、音频是未绑定的孤儿录音。
+  useEffect(() => {
+    const hasUnsavedWork = asrClientsRef.current.size > 0
+      || status === "recording"
+      || status === "paused"
+      || liveSegments.length > 0;
+    if (!hasUnsavedWork) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      // 部分浏览器仍要求设置 returnValue 才会弹确认框
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [liveSegments.length, status]);
 
   const refreshMicDevices = useCallback(async () => {
     setMicRefreshing(true);
@@ -1100,6 +1122,19 @@ export default function MeetingPage() {
     // 用户主动停止：先置意图标志（stop 时的 onclose 不应报「连接断开」），并收掉链路告警
     asrStopIntentRef.current = true;
     setAsrLinkError(null);
+
+    // 先要名字再停录音（issue #70）。原顺序是「停完 ASR 才弹 prompt」：用户在原生对话框里
+    // 按 Esc / 点取消会直接 return，而此时麦克风已关、音频已录完、转写只在内存里 ——
+    // 整场会议静默丢失，没有任何恢复入口。现在取消 = 「不停止」，录音原样继续。
+    const now = new Date();
+    const dateStr = `${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
+    const defaultName = `录音 ${dateStr}`;
+    const name = window.prompt("请输入录音名称：", defaultName);
+    if (name === null) {
+      asrStopIntentRef.current = false;
+      return;
+    }
+
     flushTranslateRef.current();
     if (checkpointPromiseRef.current) {
       await checkpointPromiseRef.current.catch((error) => {
@@ -1128,22 +1163,18 @@ export default function MeetingPage() {
       asrClientsRef.current = new Map();
     }
 
+    // 先把未渲染的 pending partial 刷进 segments（等价于 150ms 定时器那次刷新），
+    // 否则 resetTranscriptScheduler() 里的 clearPendingPartial() 会把它直接丢掉 ——
+    // 停止那一刻的尾段就这样消失（issue #70）。
+    flushPendingPartial();
     resetTranscriptScheduler();
     const finalSegments = segmentsRef.current.filter((segment) => segment.isFinal);
     if (finalSegments.length === 0) {
+      showNotice("warn", "本次录音没有可保存的转写");
       setStatus("idle");
       return;
     }
 
-    const now = new Date();
-    const dateStr = `${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
-    const defaultName = `录音 ${dateStr}`;
-
-    const name = window.prompt("请输入录音名称：", defaultName);
-    if (name === null) {
-      setStatus("idle");
-      return;
-    }
     const title = name.trim() || defaultName;
     setSavingMeeting(true);
     try {
@@ -1203,14 +1234,21 @@ export default function MeetingPage() {
       setElapsed(0);
     } catch (error) {
       console.error("Failed to save meeting:", error);
-      showNotice("error", "会议保存失败");
+      // 不清 liveSegments（issue #70）：转写只在这里的内存里，清掉就再也拿不回来。
+      showNotice("error", "会议保存失败，转写仍保留在页面上；请重新点「停止录音」再保存一次");
       setStatus("idle");
     } finally {
       setSavingMeeting(false);
     }
-  }, [persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
+  }, [flushPendingPartial, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
+    // 录音中新建会议会把 liveSegments 清空却不停旧录音（issue #70）：
+    // 麦克风还在采、音频还在写，但数据谁也不要。先拦住。
+    if (asrClientsRef.current.size > 0 || status === "recording" || status === "paused") {
+      showNotice("warn", "录音进行中，请先停止录音再新建会议");
+      return;
+    }
     resetTranscriptScheduler();
     resetTranslateRef.current();
     asrRecoveryRef.current = false;
@@ -1231,7 +1269,7 @@ export default function MeetingPage() {
     setSendRecords([]);
     setAsrResults([]);
     setSelectedAsrResult(null);
-  }, [resetTranscriptScheduler, updateSummaryGenerating]);
+  }, [resetTranscriptScheduler, showNotice, status, updateSummaryGenerating]);
 
   const loadLlmResults = useCallback(async (meetingId: string) => {
     try {
@@ -1896,9 +1934,11 @@ export default function MeetingPage() {
   const noticeClassName =
     notice?.type === "success"
       ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-      : notice?.type === "error"
-        ? "border-red-200 bg-red-50 text-red-700"
-        : "border-sky-200 bg-sky-50 text-sky-700";
+      : notice?.type === "warn"
+        ? "border-amber-200 bg-amber-50 text-amber-700"
+        : notice?.type === "error"
+          ? "border-red-200 bg-red-50 text-red-700"
+          : "border-sky-200 bg-sky-50 text-sky-700";
 
   return (
     <>
@@ -1998,6 +2038,10 @@ export default function MeetingPage() {
                 void handleGenerateAiTitle(id);
               }}
                onSelect={(m) => {
+                 if (asrClientsRef.current.size > 0 || status === "recording" || status === "paused") {
+                   showNotice("warn", "录音进行中，请先停止录音再切换会议");
+                   return;
+                 }
                  resetTranscriptScheduler();
                  asrRecoveryRef.current = false;
                  persistedMeetingIdRef.current = null;
