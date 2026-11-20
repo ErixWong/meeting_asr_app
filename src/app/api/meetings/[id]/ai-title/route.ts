@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
-import { generateMeetingTitle } from "@/lib/admin-store";
+import { generateMeetingTitle, getMeetingLightById } from "@/lib/admin-store";
 import { AiTitleError } from "@/lib/ai-title";
 
 export const dynamic = "force-dynamic";
@@ -20,6 +20,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   const { id } = await params;
   return withRequiredRoles(req, BUSINESS_ROLES, async () => {
     try {
+      // 属主校验必须发生在请求上下文内：队列任务的 AsyncLocalStorage actor 来自
+      // 启动 pump 的那个请求，不一定是入队者（issue #69）。
+      if (!await getMeetingLightById(id)) {
+        return NextResponse.json({ error: "Meeting not found" }, { status: 404 });
+      }
       const result = await generateMeetingTitle(id);
       return NextResponse.json({
         ok: true,

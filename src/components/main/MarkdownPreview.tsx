@@ -1,6 +1,7 @@
 "use client";
 
 import { ReactNode } from "react";
+import { safeHref } from "@/lib/safe-href";
 
 type Block =
   | { type: "heading"; level: number; text: string }
@@ -153,11 +154,17 @@ function renderInline(text: string) {
     const token = match[0];
     const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
     if (link) {
-      parts.push(
-        <a key={parts.length} href={link[2]} target="_blank" rel="noreferrer" className="text-brand underline underline-offset-2">
-          {link[1]}
-        </a>
-      );
+      const href = safeHref(link[2]);
+      if (href) {
+        parts.push(
+          <a key={parts.length} href={href} target="_blank" rel="noreferrer" className="text-brand underline underline-offset-2">
+            {link[1]}
+          </a>
+        );
+      } else {
+        // 危险协议（如 javascript:）降级为纯文本，不渲染成链接（issue #69）。
+        parts.push(<span key={parts.length}>{link[1]}</span>);
+      }
     } else if (token.startsWith("`")) {
       parts.push(
         <code key={parts.length} className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[0.92em] text-slate-800">

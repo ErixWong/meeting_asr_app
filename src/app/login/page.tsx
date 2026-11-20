@@ -12,7 +12,17 @@ export default function LoginPage() {
 
   const getNextUrl = () => {
     const value = new URLSearchParams(window.location.search).get("next") || "/";
-    return value.startsWith("/") && !value.startsWith("//") ? value : "/";
+    // 只接受站内目标：解析后 origin 必须相同。
+    // 仅判 startsWith("/") && !startsWith("//") 会被反斜杠绕过：
+    // "/\evil.com" 能过校验，而浏览器把 HTTP(S) URL 里的反斜杠当斜杠，
+    // 最终会跳到 https://evil.com/（issue #69）。
+    try {
+      const resolved = new URL(value, window.location.origin);
+      if (resolved.origin !== window.location.origin) return "/";
+      return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+    } catch {
+      return "/";
+    }
   };
 
   useEffect(() => {

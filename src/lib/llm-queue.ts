@@ -32,6 +32,22 @@ const DEFAULT_WAIT_MS: Record<LlmTaskType, number> = {
 
 let configReader: ConfigReader = () => DEFAULT_CONFIG;
 
+export interface LlmQueueContextHooks {
+  capture: () => unknown;
+  run: <R>(context: unknown, task: () => Promise<R>) => Promise<R>;
+}
+
+let contextHooks: LlmQueueContextHooks | null = null;
+
+/**
+ * 让任务在**入队时**的异步上下文里执行（issue #69）。
+ * 不接这个钩子时任务跑在「启动 pump 的那个请求」的上下文里 —— 对用
+ * AsyncLocalStorage 承载身份的宿主来说，等于把别人的身份借给了排队者。
+ */
+export function setLlmQueueContextHooks(hooks: LlmQueueContextHooks | null) {
+  contextHooks = hooks;
+}
+
 export function setLlmQueueConfigReader(reader: ConfigReader) {
   configReader = reader;
 }
@@ -51,12 +67,15 @@ class LlmQueue {
       return Promise.reject(new Error(`LLM queue is full (capacity=${capacity})`));
     }
 
+    // 入队时捕获上下文，执行时恢复（issue #69）
+    const enqueuedContext = contextHooks?.capture();
     return new Promise<T>((resolve, reject) => {
       const wrapped: QueueTask = {
         type,
         run: async () => {
           try {
-            resolve(await task());
+            const hooks = contextHooks;
+            resolve(await (hooks ? hooks.run(enqueuedContext, task) : task()));
           } catch (error) {
             reject(error);
           }
