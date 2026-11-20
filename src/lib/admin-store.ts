@@ -29,7 +29,7 @@ import {
   parseJsonOr,
   requireNonEmpty,
 } from "@/lib/store-utils";
-import { llmQueue, setLlmQueueConfigReader } from "@/lib/llm-queue";
+import { llmQueue, setLlmQueueConfigReader, setLlmQueueContextHooks } from "@/lib/llm-queue";
 import {
   AiTitleError,
   TITLE_FALLBACK_TITLE,
@@ -1334,6 +1334,16 @@ setLlmQueueConfigReader(async () => {
   };
 });
 
+// 队列任务在入队者的 actor 上下文里执行（issue #69）：否则排队期间若别的请求
+// 触发了 pump，任务会继承那个请求的 AsyncLocalStorage 身份，属主校验拿到别人。
+setLlmQueueContextHooks({
+  capture: () => actorContext.getStore() ?? null,
+  run: async (context, task) => {
+    if (context) return await actorContext.run(context as ActorContext, task);
+    return await task();
+  },
+});
+
 function validateSettings(settings: unknown): SettingRow[] {
   if (!Array.isArray(settings)) {
     throw new Error("settings must be an array");
@@ -1710,6 +1720,7 @@ export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">>
     if (!before) return null;
     ensureUserChangeAllowed(id, patch);
 
+    const nextStatus = patch.status === undefined ? before.status : normalizeStatus(patch.status, before.status);
     await tx
       .prepare(`
         UPDATE users
@@ -1721,10 +1732,16 @@ export async function updateUser(id: string, patch: Partial<Omit<UserRow, "id">>
         patch.displayName === undefined ? before.displayName : requireNonEmpty(patch.displayName, "Display name"),
         patch.email ?? before.email,
         patch.department ?? before.department,
-        patch.status === undefined ? before.status : normalizeStatus(patch.status, before.status),
+        nextStatus,
         nowIso(),
         id
       );
+
+    // 停用即撤销该用户全部会话（issue #69）：否则重新启用后未过期的旧 token 会复活
+    // —— getActorBySessionToken 只判 status !== "active"，不删行。
+    if (nextStatus !== "active") {
+      await tx.prepare("DELETE FROM auth_sessions WHERE user_id = ?").run(id);
+    }
 
     if (patch.roleKeys !== undefined) {
       await setUserRoleKeys(id, patch.roleKeys, tx);
@@ -4077,7 +4094,8 @@ export async function deleteMeetingLlmResult(meetingId: string, id: string) {
         beforeSnapshot: {
           meetingId,
           resultTitle: existing.resultTitle,
-          resultMarkdown: existing.resultMarkdown,
+          // 不落整篇正文（issue #69）：审计保留 30 天，删除结果后正文不应继续留存。
+          resultMarkdownLength: String(existing.resultMarkdown ?? "").length,
         },
       }, tx);
     }

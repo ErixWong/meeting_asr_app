@@ -139,6 +139,22 @@ function parseMarkdown(markdown: string): Block[] {
   return blocks;
 }
 
+/** 只放行 http/https/mailto 与站内相对路径；javascript:/data:/vbscript: 等一律返回 null。 */
+function safeHref(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^(\/|#|\?|\.{1,2}\/)/.test(trimmed)) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+      return trimmed;
+    }
+  } catch {
+    // 既不是绝对 URL，也不匹配站内前缀 → 拒绝
+  }
+  return null;
+}
+
 function renderInline(text: string) {
   const parts: ReactNode[] = [];
   const tokenPattern = /(\[[^\]]+\]\([^)]+\)|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g;
@@ -153,11 +169,17 @@ function renderInline(text: string) {
     const token = match[0];
     const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
     if (link) {
-      parts.push(
-        <a key={parts.length} href={link[2]} target="_blank" rel="noreferrer" className="text-brand underline underline-offset-2">
-          {link[1]}
-        </a>
-      );
+      const href = safeHref(link[2]);
+      if (href) {
+        parts.push(
+          <a key={parts.length} href={href} target="_blank" rel="noreferrer" className="text-brand underline underline-offset-2">
+            {link[1]}
+          </a>
+        );
+      } else {
+        // 危险协议（如 javascript:）降级为纯文本，不渲染成链接（issue #69）。
+        parts.push(<span key={parts.length}>{link[1]}</span>);
+      }
     } else if (token.startsWith("`")) {
       parts.push(
         <code key={parts.length} className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[0.92em] text-slate-800">
