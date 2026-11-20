@@ -1,35 +1,44 @@
 /**
  * Markdown 链接协议白名单单测（issue #69，node --test）
  *
- * safeHref 是 MarkdownPreview.tsx 里的非导出函数（TSX 无法直接 import），
- * 因此这里：① 断言源码里存在白名单实现且 <a href> 已改为使用它；
- *          ② 用与源码等价的实现跑协议用例（若源码逻辑变了，① 会红）。
+ * 直接跑**真实实现** `src/lib/safe-href.ts`（Node 22.18+ 原生类型擦除），
+ * 不再测一份副本 —— 副本测试有假绿风险：实现放开了危险协议，只要签名和调用点没变，
+ * 测试仍然通过。
+ *
+ * 另外断言「渲染层确实用了它」：`MarkdownPreview.tsx` 必须 import `safeHref` 且
+ * 不得再直接把 `link[2]` 塞进 `href`。否则白名单写了也没接上。
+ *
+ * 运行：npm run test:safe-href
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
-const source = readFileSync(join(repoRoot, "src", "components", "main", "MarkdownPreview.tsx"), "utf8");
 
-function safeHref(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (/^(\/|#|\?|\.{1,2}\/)/.test(trimmed)) return trimmed;
-  try {
-    const url = new URL(trimmed);
-    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
-      return trimmed;
-    }
-  } catch {}
-  return null;
-}
+const { safeHref } = await import(pathToFileURL(join(repoRoot, "src/lib/safe-href.ts")).href);
+const previewSource = readFileSync(
+  join(repoRoot, "src", "components", "main", "MarkdownPreview.tsx"),
+  "utf8"
+);
 
-test("源码：safeHref 存在，且 <a> 用的是白名单结果而不是原始 link[2]", () => {
-  assert.match(source, /function safeHref\(raw: string\): string \| null/);
-  assert.match(source, /const href = safeHref\(link\[2\]\)/);
-  assert.ok(!/href=\{link\[2\]\}/.test(source), "不得再直接使用 link[2] 作为 href");
+test("接线：MarkdownPreview 必须 import 真实实现，且不再直接使用 link[2] 作为 href", () => {
+  assert.match(
+    previewSource,
+    /import \{ safeHref \} from "@\/lib\/safe-href"/,
+    "必须从 @/lib/safe-href 引入白名单函数"
+  );
+  assert.match(
+    previewSource,
+    /const href = safeHref\(link\[2\]\)/,
+    "必须用白名单结果替换原始链接"
+  );
+  assert.ok(
+    !/href=\{link\[2\]\}/.test(previewSource),
+    "不得再直接把 link[2] 当 href"
+  );
 });
 
 test("放行：http / https / mailto / 站内相对 / 锚点 / 查询串", () => {
@@ -47,7 +56,7 @@ test("放行：http / https / mailto / 站内相对 / 锚点 / 查询串", () =>
   }
 });
 
-test("拒绝：javascript / data / vbscript / file / 空串 / 协议相对 //", () => {
+test("拒绝：javascript / data / vbscript / file / 空串 / 纯空白", () => {
   for (const bad of [
     "javascript:alert(1)",
     "JavaScript:alert(1)",
@@ -60,12 +69,15 @@ test("拒绝：javascript / data / vbscript / file / 空串 / 协议相对 //", 
   ]) {
     assert.equal(safeHref(bad), null, `应拒绝: ${JSON.stringify(bad)}`);
   }
-  // 协议相对 URL 会被解析成 http(s) 外站，白名单放行是正确行为（不是漏洞）
+});
+
+test("协议相对 URL（//host/path）放行：它只是外链，不执行脚本", () => {
+  // 这条**故意**是放行：`//evil.com/x` 解析成 https://evil.com/x，是一个普通外链，
+  // 不会执行脚本、也不会自动跳转（`<a>` 需要用户点击，且带 rel="noreferrer"）。
+  // 真正的 XSS 面是 javascript:/data:，已在上一条断言里拒掉。
   assert.equal(safeHref("//evil.com/x"), "//evil.com/x");
 });
 
-test("反斜杠绕过回归：/\\evil.com 解析为外站，但作为相对路径放行时不得被当作站内", () => {
-  // safeHref 只判协议，不判 origin —— 这条用例固化「href 里不会出现 javascript:」这一目标，
-  // 同时记录 /\\evil.com 在浏览器里等价于 //evil.com（站内相对路径策略由登录跳转单独处理）。
+test("反斜杠回归：/\\evil.com 在浏览器里等价于 //evil.com（登录跳转由 URL origin 校验单独处理）", () => {
   assert.equal(new URL("/\\evil.com", "https://meeting.example.com").origin, "https://evil.com");
 });

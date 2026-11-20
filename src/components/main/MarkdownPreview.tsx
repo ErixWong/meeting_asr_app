@@ -1,6 +1,7 @@
 "use client";
 
 import { ReactNode } from "react";
+import { safeHref } from "@/lib/safe-href";
 
 type Block =
   | { type: "heading"; level: number; text: string }
@@ -137,22 +138,6 @@ function parseMarkdown(markdown: string): Block[] {
   }
 
   return blocks;
-}
-
-/** 只放行 http/https/mailto 与站内相对路径；javascript:/data:/vbscript: 等一律返回 null。 */
-function safeHref(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (/^(\/|#|\?|\.{1,2}\/)/.test(trimmed)) return trimmed;
-  try {
-    const url = new URL(trimmed);
-    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
-      return trimmed;
-    }
-  } catch {
-    // 既不是绝对 URL，也不匹配站内前缀 → 拒绝
-  }
-  return null;
 }
 
 function renderInline(text: string) {

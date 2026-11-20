@@ -1340,7 +1340,11 @@ setLlmQueueContextHooks({
   capture: () => actorContext.getStore() ?? null,
   run: async (context, task) => {
     if (context) return await actorContext.run(context as ActorContext, task);
-    return await task();
+    // 无 actor 的后台入队（capture 为 null）：必须用 exit 在**无上下文**里执行。
+    // 直接 `await task()` 会继承启动 pump 的那个请求的 actor —— 后台任务就以别人身份
+    // 访问数据了（issue #69 验收 J2）。exit 让 getCurrentActor() 抛错（fail closed），
+    // 而不是默默借用别人的身份。
+    return await actorContext.exit(task);
   },
 });
 

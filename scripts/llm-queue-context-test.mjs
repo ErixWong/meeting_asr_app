@@ -20,6 +20,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { registerHooks } from "node:module";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
 
@@ -90,5 +91,47 @@ test("C2 变异验证：钩子置空（= 修复前）时，排队任务会继承
     seen.B,
     { who: "A" },
     "修复前 B 的任务应继承 A 的上下文；若不成立说明本测试已失去判据"
+  );
+});
+
+test("C3 无 actor 的后台入队（capture 为 null）不得继承启动 pump 的请求身份", async () => {
+  // 镜像 admin-store 注册的真实钩子语义：null 分支必须 exit，而不是裸跑。
+  setLlmQueueConfigReader(async () => ({ maxConcurrency: 1, capacity: 10 }));
+  setLlmQueueContextHooks({
+    capture: () => als.getStore() ?? null,
+    run: async (context, task) => (context ? await als.run(context, task) : await als.exit(task)),
+  });
+
+  let sawInBackgroundTask = "unset";
+  // A 占满唯一并发槽
+  const aPromise = als.run({ who: "A" }, () => llmQueue.enqueue("chat", async () => {
+    await sleep(120);
+    return "A";
+  }));
+  await sleep(20);
+  // 后台任务在**没有任何上下文**的地方入队 → capture 返回 null
+  const bgPromise = llmQueue.enqueue("title", async () => {
+    sawInBackgroundTask = als.getStore() ?? null;
+    return "BG";
+  });
+
+  const [a, bg] = await Promise.all([aPromise, bgPromise]);
+  assert.equal(a, "A");
+  assert.equal(bg, "BG");
+  assert.equal(
+    sawInBackgroundTask,
+    null,
+    "无 actor 的任务由 A 的 pump 启动时，必须看不到 A 的身份（fail closed），而不是借用它"
+  );
+});
+
+test("C4 接线断言：admin-store 的 null 分支必须用 actorContext.exit（fail closed）", () => {
+  // 这条是「接线守卫」而不是行为测试：C3 验的是队列契约，真正决定 fail-closed 的
+  // 是 admin-store 里注册的那段钩子实现。用源码断言钉住它，避免有人把 exit 改回裸跑。
+  const adminStoreSource = readFileSync(join(repoRoot, "src", "lib", "admin-store.ts"), "utf8");
+  assert.match(
+    adminStoreSource,
+    /return await actorContext\.exit\(task\);/,
+    "admin-store 的队列上下文钩子必须在无 actor 时走 actorContext.exit(task)"
   );
 });
