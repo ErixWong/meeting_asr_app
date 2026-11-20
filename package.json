@@ -22,6 +22,7 @@
     "test:title": "node --test scripts/ai-title-test.mjs",
     "test:asr-origin": "node --test scripts/asr-origin-test.mjs",
     "test:queue-ctx": "node --test scripts/llm-queue-context-test.mjs",
+    "test:queue-actor": "node --test scripts/llm-queue-actor-test.mjs",
     "test:safe-href": "node --test scripts/safe-href-test.mjs"
   },
   "dependencies": {
