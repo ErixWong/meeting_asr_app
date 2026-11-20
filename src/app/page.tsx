@@ -224,6 +224,9 @@ export default function MeetingPage() {
   // 上一次停止录音时的 capture session 绑定信息（issue #70 复审 R3）：
   // 保存失败后点「重试保存」时 asrClientsRef 已空，靠它把原始录音绑回会议。
   const lastCaptureRef = useRef<{ captureSessionId: string; captureSessionIds: string[] } | null>(null);
+  // 保存互斥（issue #70 复审 S3）：必须用 ref —— 重试按钮的 onClick 是旧渲染的闭包，
+  // 从里面读 status 会读到陈旧值，state 挡不住重入。
+  const savingRef = useRef(false);
   const checkpointPromiseRef = useRef<Promise<void> | null>(null);
   const translationEnabledRef = useRef(false);
   const targetLangRef = useRef("en");
@@ -905,6 +908,7 @@ export default function MeetingPage() {
     if (!preserveTranscript) {
       persistedMeetingIdRef.current = null;
       persistedSegmentCountRef.current = 0;
+      lastCaptureRef.current = null;
       setLiveSegments([]);
       setMicMuted(false);
       selectedMeetingIdRef.current = null;
@@ -1135,8 +1139,9 @@ export default function MeetingPage() {
 
   const stopRecording = useCallback(async () => {
     // 保存进行中再次触发（典型：连点「重试保存」）会并发发出第二次 POST/PATCH，
-    // 而这两个接口都不幂等（issue #70 复审 R3）。保存期间 status 恒为 "generating"。
-    if (status === "generating") return;
+    // 而这两个接口都不幂等（issue #70 复审 S3）。用 ref 而不是 state：
+    // 重试按钮的 onClick 是旧渲染闭包，读 status 会拿到陈旧值。
+    if (savingRef.current) return;
     // 用户主动停止：先置意图标志（stop 时的 onclose 不应报「连接断开」），并收掉链路告警
     asrStopIntentRef.current = true;
     setAsrLinkError(null);
@@ -1184,9 +1189,10 @@ export default function MeetingPage() {
     // 把剩下的一律补标 final。
     // ⚠ 不能去改 finalizeTranscriptSegments 本身：它在录音过程中也会被 flushPendingPartial
     // 调用，那样会把还在变的 partial 误标终稿。
-    const finalSegments = segmentsRef.current.map((segment) =>
-      segment.isFinal ? segment : { ...segment, isFinal: true }
-    );
+    const finalSegments = segmentsRef.current
+      // 空白段不算转写（issue #70 复审 S1）：checkpoint 保存那边也是按 text.trim() 判的。
+      .filter((segment) => segment.text.trim())
+      .map((segment) => (segment.isFinal ? segment : { ...segment, isFinal: true }));
     if (finalSegments.length === 0) {
       showNotice("warn", "本次录音没有可保存的转写");
       setStatus("idle");
@@ -1203,6 +1209,7 @@ export default function MeetingPage() {
     // 等于把「丢转写」换成「丢音频」。
     const name = window.prompt("请输入录音名称：", defaultName);
     const title = (name ?? "").trim() || defaultName;
+    savingRef.current = true;
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
@@ -1280,9 +1287,10 @@ export default function MeetingPage() {
       );
       setStatus("idle");
     } finally {
+      savingRef.current = false;
       setSavingMeeting(false);
     }
-  }, [materializeCheckpointTranscript, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice, status]);
+  }, [materializeCheckpointTranscript, persistLiveTranslations, primeMeetingAsyncState, requestJson, resetTranscriptScheduler, showNotice]);
 
   const handleCreateNew = useCallback(() => {
     // 录音中新建会议会把 liveSegments 清空却不停旧录音（issue #70）：
@@ -1308,6 +1316,7 @@ export default function MeetingPage() {
     asrRecoveryRef.current = false;
     persistedMeetingIdRef.current = null;
     persistedSegmentCountRef.current = 0;
+    lastCaptureRef.current = null;
     setAsrErrorMessage(null);
     selectedMeetingIdRef.current = null;
     fullDetailLoadedRef.current = false;
@@ -2108,6 +2117,7 @@ export default function MeetingPage() {
                  asrRecoveryRef.current = false;
                  persistedMeetingIdRef.current = null;
                  persistedSegmentCountRef.current = 0;
+                 lastCaptureRef.current = null;
                  setAsrErrorMessage(null);
                  selectedMeetingIdRef.current = m.id;
                 fullDetailLoadedRef.current = false;
