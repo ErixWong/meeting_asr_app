@@ -7,7 +7,7 @@
  *   3. 到期清理：365 天到期 → 删 MP3 + status='purged' + purged_at + file_path 保留，
  *      转写/会议不动；0 = 永久一行不清；未到期不动；删除失败保行 + error_message 落库
  *   4. 节拍复用：runAudioMaintenance() 串起「水位检查 + 孤儿清理 + 到期清理」
- *   5. UI 投影：清理后 hasAudio=false（断言的是 admin-store.ts 真实投影源码切片）
+ *   5. UI 投影：清理后 hasAudio=false（断言的是 meeting-audio-projection.ts 真实投影源码切片）
  *   6. 磁盘水位：阈值命中/不命中，命中时 console.warn 含实际剩余与阈值
  *   7. dry-run：只记日志，不删文件、不改状态
  *   8. 跨库红线：本脚本与实现里不出现裸写 ON CONFLICT / LIMIT / PRAGMA（源码级断言）
@@ -359,22 +359,24 @@ test("retention: dry_run=1 → 只记「将清理 X 行 / 释放 Y 字节」，�
 // 5. UI 投影：清理后 hasAudio=false
 // ---------------------------------------------------------------------------
 
-const ADMIN_STORE_PATH = join(repoRoot, "src", "lib", "admin-store.ts");
+// 音频投影纯函数所在模块（chore-261121-06 从 admin-store.ts 拆出；本测试只切它）。
+const PROJECTION_PATH = join(repoRoot, "src", "lib", "meeting-audio-projection.ts");
 
-function sliceBetween(source, startNeedle, endNeedle) {
+function sliceBetween(source, startNeedle, endNeedle, fileLabel = "admin-store.ts") {
   const start = source.indexOf(startNeedle);
-  assert.ok(start >= 0, `admin-store.ts 里找不到起点标记: ${startNeedle}`);
+  assert.ok(start >= 0, `${fileLabel} 里找不到起点标记: ${startNeedle}`);
   const end = source.indexOf(endNeedle, start + startNeedle.length);
-  assert.ok(end > start, `admin-store.ts 里找不到终点标记: ${endNeedle}`);
+  assert.ok(end > start, `${fileLabel} 里找不到终点标记: ${endNeedle}`);
   return source.slice(start, end);
 }
 
 async function loadMeetingAudioProjection() {
-  const source = readFileSync(ADMIN_STORE_PATH, "utf-8");
+  const source = readFileSync(PROJECTION_PATH, "utf-8");
   const snippet = sliceBetween(
     source,
     "// #region meeting-audio-projection",
-    "// #endregion meeting-audio-projection"
+    "// #endregion meeting-audio-projection",
+    "meeting-audio-projection.ts"
   );
   const tsModule = await import(join(repoRoot, "node_modules", "typescript", "lib", "typescript.js"));
   const ts = tsModule.default ?? tsModule;
