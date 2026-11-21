@@ -73,16 +73,33 @@ jobs:
       - name: 生产构建
         run: npm run build
 
-      # 漂移守卫：package.json 里新增的 test:* 必须同步加进本 workflow，
-      # 否则「新测试不进 CI」这件事不会有人发现（2026-11-21 就发生过一次）。
+      # 漂移守卫：package.json 里新增的 test:* 必须同步加进本 workflow。
+      #
+      # 用 node 做**集合比对**，不用 grep：grep 有两个坑 —— 脚本名里的正则元字符没转义
+      # （test:a.b 会匹配 test:axb），以及它扫整个文件、注释里提到也会命中（假绿）。
+      # 这里只认 `run: npm run test:<name>` 这种行（允许尾随参数），再做集合差。
       - name: 门禁自检 · 每个 test:* 都被跑到
         run: |
           set -euo pipefail
-          missing=0
-          for name in $(node -p "Object.keys(require('./package.json').scripts).filter((k) => k.startsWith('test:')).join('\n')"); do
-            if ! grep -q "npm run ${name}\$" .github/workflows/app-gates.yml; then
-              echo "::error::package.json 里有 ${name}，但 app-gates.yml 没有跑它"
-              missing=1
-            fi
-          done
-          exit $missing
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const pkg = require("./package.json");
+          const workflow = fs.readFileSync(".github/workflows/app-gates.yml", "utf8");
+
+          // 只认 run: 行；`npm run test:x -- --foo` 也算（允许尾随参数）
+          const ran = new Set();
+          for (const line of workflow.split("\n")) {
+            const m = line.match(/^\s*run:\s*npm run (test:[A-Za-z0-9:_-]+)(?:\s.*)?$/);
+            if (m) ran.add(m[1]);
+          }
+
+          const wanted = Object.keys(pkg.scripts).filter((k) => k.startsWith("test:"));
+          const missing = wanted.filter((k) => !ran.has(k));
+          if (missing.length > 0) {
+            for (const name of missing) {
+              console.error(`::error::package.json 里有 ${name}，但 app-gates.yml 没有跑它`);
+            }
+            process.exit(1);
+          }
+          console.log(`门禁自检 OK：${wanted.length} 个 test:* 全部覆盖`);
+          NODE
