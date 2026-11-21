@@ -4,7 +4,7 @@
 # 类型、lint、单测、build 全都不在 PR 门禁里 —— 改坏了照样能合（审计 2026-11-20）。
 #
 # 每一条都在干净树 + 干净 node_modules 下实测过：
-#   tsc --noEmit 0 / next lint 0（3 warning）/ build 0 / 9 个测试套件全绿。
+#   tsc --noEmit 0 / next lint 0（3 warning）/ build 0 / 10 个测试套件全绿。
 #
 # 注意：本机（开发机）跑不了 `npm run build`（宿主机 .next 属主是 root），
 # 但 GitHub runner 是全新 checkout，没有这个问题。
@@ -25,9 +25,14 @@ jobs:
     name: typecheck + lint + tests + build
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
 
     steps:
+      # 不留凭据：默认会把 GITHUB_TOKEN 写进 .git/config，后续步骤（PR 里的代码）可读。
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -62,6 +67,22 @@ jobs:
         run: npm run test:queue-actor
       - name: 单测 · Markdown 链接白名单
         run: npm run test:safe-href
+      - name: 单测 · 初始口令策略
+        run: npm run test:bootstrap-admin
 
       - name: 生产构建
         run: npm run build
+
+      # 漂移守卫：package.json 里新增的 test:* 必须同步加进本 workflow，
+      # 否则「新测试不进 CI」这件事不会有人发现（2026-11-21 就发生过一次）。
+      - name: 门禁自检 · 每个 test:* 都被跑到
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in $(node -p "Object.keys(require('./package.json').scripts).filter((k) => k.startsWith('test:')).join('\n')"); do
+            if ! grep -q "npm run ${name}\$" .github/workflows/app-gates.yml; then
+              echo "::error::package.json 里有 ${name}，但 app-gates.yml 没有跑它"
+              missing=1
+            fi
+          done
+          exit $missing
