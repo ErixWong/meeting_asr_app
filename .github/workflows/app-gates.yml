@@ -1,0 +1,67 @@
+# PR 门禁：类型 / lint / 单测 / 生产构建
+#
+# 为什么单独一个 workflow：`.github/workflows/db-parity.yml` 只跑三库方言矩阵，
+# 类型、lint、单测、build 全都不在 PR 门禁里 —— 改坏了照样能合（审计 2026-11-20）。
+#
+# 每一条都在干净树 + 干净 node_modules 下实测过：
+#   tsc --noEmit 0 / next lint 0（3 warning）/ build 0 / 9 个测试套件全绿。
+#
+# 注意：本机（开发机）跑不了 `npm run build`（宿主机 .next 属主是 root），
+# 但 GitHub runner 是全新 checkout，没有这个问题。
+name: app-gates（类型 / lint / 单测 / 构建）
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: app-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: typecheck + lint + tests + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npx next lint
+
+      # 单测：逐条列出（而不是 npm test 通配），这样哪一条红了在 CI 界面上一眼可见。
+      - name: 单测 · AI 标题
+        run: npm run test:title
+      - name: 单测 · 聊天语音
+        run: npm run test:chat
+      - name: 单测 · 音频
+        run: npm run test:audio
+      - name: 单测 · 音频保留
+        run: npm run test:retention
+      - name: 单测 · TTS
+        run: npm run test:tts
+      - name: 单测 · ASR Origin
+        run: npm run test:asr-origin
+      - name: 单测 · 队列上下文隔离
+        run: npm run test:queue-ctx
+      - name: 单测 · 队列真实接线
+        run: npm run test:queue-actor
+      - name: 单测 · Markdown 链接白名单
+        run: npm run test:safe-href
+
+      - name: 生产构建
+        run: npm run build
