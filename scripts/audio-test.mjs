@@ -8,7 +8,7 @@
  *   L2 server/audio-transcode.mjs       —— PCM→MP3 头/码率/删 pcm/失败保留/幂等
  *   L3 meeting_audio_recordings 表       —— 建表 + 迁移到 v3（旧库路径）
  *   L4 绑定 / 孤儿清理                   —— meeting_id 写入、expires_at 置空、过期删除
- *   R2 列表行音频摘要（F1）/ hasAudio 口径 —— admin-store.ts 音频投影纯函数（源码切片 + tsc 转译）
+ *   R2 列表行音频摘要（F1）/ hasAudio 口径 —— meeting-audio-projection.ts 音频投影纯函数（源码切片 + tsc 转译）
  *
  * 运行：npm run test:audio（= node --test scripts/audio-test.mjs，需 Node 24）
  * 说明：全部临时文件落在 os.tmpdir() 的沙箱里（测试开始 chdir 进去，data/ 也在
@@ -574,29 +574,33 @@ test("range: bytes=a-b / a- / -N 与越界 416 语义", async () => {
 // ---------------------------------------------------------------------------
 // R2 返工防回归：列表行必须带出音频摘要（F1）+ hasAudio 口径统一
 //
-// 断言的是**哪一层**：`src/lib/admin-store.ts` 里 `#region meeting-audio-projection`
-// 区间的**真实源码**（不是测试里的副本）。admin-store.ts 依赖 `@/` 别名与 next 运行时，
-// 在 node --test 里不能直接 import，所以按标记切出纯函数区间，用项目自带 tsc
+// 断言的是**哪一层**：`src/lib/meeting-audio-projection.ts` 里 `#region meeting-audio-projection`
+// 区间的**真实源码**（不是测试里的副本）。该区间自 chore-261121-06 起从 admin-store.ts 抽出成独立模块；
+// admin-store.ts 依赖 `@/` 别名与 next 运行时，在 node --test 里不能直接 import，
+// 所以按标记切出纯函数区间，用项目自带 tsc
 // 转译后在 vm 里执行，断言 listMeetings / getMeetingById 共用的那个投影函数的输出。
 // 若有人把 `audioRecordings: []` 写回列表、或往输出里塞磁盘路径，这些用例会挂。
 // ---------------------------------------------------------------------------
 
 const ADMIN_STORE_PATH = join(repoRoot, "src", "lib", "admin-store.ts");
+// 音频投影纯函数所在模块（chore-261121-06 从 admin-store.ts 拆出）。
+const PROJECTION_PATH = join(repoRoot, "src", "lib", "meeting-audio-projection.ts");
 
-function sliceBetween(source, startNeedle, endNeedle) {
+function sliceBetween(source, startNeedle, endNeedle, fileLabel = "admin-store.ts") {
   const start = source.indexOf(startNeedle);
-  assert.ok(start >= 0, `admin-store.ts 里找不到起点标记: ${startNeedle}`);
+  assert.ok(start >= 0, `${fileLabel} 里找不到起点标记: ${startNeedle}`);
   const end = source.indexOf(endNeedle, start + startNeedle.length);
-  assert.ok(end > start, `admin-store.ts 里找不到终点标记: ${endNeedle}`);
+  assert.ok(end > start, `${fileLabel} 里找不到终点标记: ${endNeedle}`);
   return source.slice(start, end);
 }
 
 async function loadMeetingAudioProjection() {
-  const source = readFileSync(ADMIN_STORE_PATH, "utf-8");
+  const source = readFileSync(PROJECTION_PATH, "utf-8");
   const snippet = sliceBetween(
     source,
     "// #region meeting-audio-projection",
-    "// #endregion meeting-audio-projection"
+    "// #endregion meeting-audio-projection",
+    "meeting-audio-projection.ts"
   );
   const tsModule = await import(join(repoRoot, "node_modules", "typescript", "lib", "typescript.js"));
   const ts = tsModule.default ?? tsModule;
@@ -743,16 +747,19 @@ test("R2/F1: listMeetings 走同一投影 + 批量 SQL 不查路径列（防退�
   assert.match(batchSource, /NULL as filePath/);
 
   // hasAudio 只允许由投影结果赋值（口径一致），不许各处自算
+  // 投影区间自 chore-261121-06 起住在 meeting-audio-projection.ts，不再于 admin-store.ts 里
   const projectionRegion = sliceBetween(
-    source,
+    readFileSync(PROJECTION_PATH, "utf-8"),
     "// #region meeting-audio-projection",
-    "// #endregion meeting-audio-projection"
+    "// #endregion meeting-audio-projection",
+    "meeting-audio-projection.ts"
   );
   assert.equal(
     (projectionRegion.match(/hasAudio: audioRecordings\.some/g) ?? []).length,
     1,
     "hasAudio 口径只应在投影函数里算一次"
   );
+  // 投影已抽出，不在 admin-store 源码里；此处 replace 为幂等（充任防回退的占位剥离）
   const outsideProjection = source.replace(projectionRegion, "");
   assert.doesNotMatch(outsideProjection, /hasAudio: audioRecordings\.some/, "投影之外不许再自算 hasAudio 口径");
   assert.doesNotMatch(outsideProjection, /hasAudio:\s*\(audioSummaries/, "旧的 count>0 口径已废弃");
