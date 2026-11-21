@@ -33,9 +33,10 @@ after(async () => {
   // 若这里直接 closeDb() 把连接池销毁，而那次刷新还没落定，它就会重新 openDatabase()
   // 并向已销毁的池 acquire，白等 tarn 的 acquireTimeoutMillis（默认 60000ms）——
   // 本测试曾因此耗时 61 秒（issue #80）。
-  // 先把 reader 换成常量切断对 DB 的依赖，再给在飞的刷新一点时间落定，最后才关库。
+  // 先把 reader 换成常量（之后新发的刷新不再碰 DB），
+  // 再用 whenQuiescent() 等**已经发出的那次**刷新真正落定 —— 屏障，不是猜时长。
   setLlmQueueConfigReader(() => ({ maxConcurrency: 2, capacity: 100 }));
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await llmQueue.whenQuiescent();
 
   const { closeDb } = await import("../server/db-shared.mjs");
   await closeDb();

@@ -56,6 +56,14 @@ class LlmQueue {
   private inflight = 0;
   private pending: QueueTask[] = [];
   private droppedCount = 0;
+  /**
+   * 最后一次「收尾刷新」的 promise（pump 的 .finally 里那次 configReader 读）。
+   *
+   * 为什么需要：那次刷新是 fire-and-forget 的，调用方无从得知它何时落定。
+   * 关库前若它还在飞，就会重新 openDatabase() 并向已销毁的连接池 acquire，
+   * 白等 tarn 的 acquireTimeoutMillis（默认 60000ms）——issue #80 就是这个。
+   */
+  private settleTail: Promise<void> = Promise.resolve();
 
   async enqueue<T>(type: LlmTaskType, task: () => Promise<T>, waitMs = DEFAULT_WAIT_MS[type]): Promise<T> {
     // 配置读取是异步的（#54：app_settings 走 AsyncDb）；读到之前不占位、不排队，
@@ -103,6 +111,23 @@ class LlmQueue {
     };
   }
 
+  /**
+   * 等到「没有在跑的任务」且「最后一次收尾刷新已落定」。
+   *
+   * 用途：**关库前 drain**。队列在任务结束后会 fire-and-forget 读一次配置，
+   * 若此时直接 closeDb()，那次读会重新打开库、向已销毁的池 acquire，
+   * 白等 acquireTimeoutMillis（issue #80）。
+   *
+   * 刷新本身可能 pump 出新任务（新任务的结束又触发新刷新），所以循环到两者同时为空。
+   * 调用方若担心永不收敛，自己加超时。
+   */
+  async whenQuiescent(): Promise<void> {
+    for (;;) {
+      await this.settleTail;
+      if (this.inflight === 0 && this.pending.length === 0) return;
+    }
+  }
+
   private pump(maxConcurrency: number) {
     while (this.inflight < maxConcurrency && this.pending.length > 0) {
       const next = this.pending.shift()!;
@@ -115,7 +140,8 @@ class LlmQueue {
         })
         .finally(() => {
           this.inflight -= 1;
-          void Promise.resolve(configReader())
+          // 记成可 await 的 tail，供 whenQuiescent() / 优雅关闭等待（issue #80）。
+          this.settleTail = Promise.resolve(configReader())
             .then((config) => this.pump(config.maxConcurrency))
             .catch(() => this.pump(DEFAULT_CONFIG.maxConcurrency));
         });
