@@ -218,6 +218,8 @@ The ASR Gateway (`server/asr-gateway.mjs`) is the unified proxy layer between br
 | `BOOTSTRAP_ADMIN_PASSWORD` | Bootstrap admin password | `admin123` (dev only) |
 | `DEV_ACTOR_ACCOUNT` | Dev mode auto-login account | — |
 
+初始口令（含内置默认值）**首次登录必须修改**；自动化流程可设 `BOOTSTRAP_ADMIN_SKIP_PASSWORD_CHANGE=true` 豁免。
+
 ## Scripts
 
 | Command | Description |
