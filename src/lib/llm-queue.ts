@@ -64,6 +64,17 @@ class LlmQueue {
    * 白等 tarn 的 acquireTimeoutMillis（默认 60000ms）——issue #80 就是这个。
    */
   private settleTail: Promise<void> = Promise.resolve();
+  /** 在飞的「收尾刷新」个数（刷新期间队列不算静默）。 */
+  private refreshing = 0;
+  /**
+   * 等待「队列静默」的唤醒者。
+   *
+   * 为什么不用轮询：`whenQuiescent()` 的用途是**优雅关闭前 drain**，那时任务正在飞。
+   * 若循环 `await` 一个已 resolved 的 promise 去看状态，就变成**微任务空转** ——
+   * 微任务队列永不为空会让 `setTimeout` 永不触发，正在飞的任务永远跑不完，
+   * `inflight` 永远不归零，形成真死锁（issue #80 修复过程中实测复现）。
+   */
+  private idleWaiters: Array<() => void> = [];
 
   async enqueue<T>(type: LlmTaskType, task: () => Promise<T>, waitMs = DEFAULT_WAIT_MS[type]): Promise<T> {
     // 配置读取是异步的（#54：app_settings 走 AsyncDb）；读到之前不占位、不排队，
@@ -111,6 +122,19 @@ class LlmQueue {
     };
   }
 
+  /** 队列是否完全静默：没有在跑的任务、没有排队项、没有在飞的收尾刷新。 */
+  private isQuiescent(): boolean {
+    return this.inflight === 0 && this.pending.length === 0 && this.refreshing === 0;
+  }
+
+  /** 静默时唤醒所有等待者（幂等，没人等就什么都不做）。 */
+  private notifyIfQuiescent(): void {
+    if (!this.isQuiescent()) return;
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const wake of waiters) wake();
+  }
+
   /**
    * 等到「没有在跑的任务」且「最后一次收尾刷新已落定」。
    *
@@ -118,13 +142,14 @@ class LlmQueue {
    * 若此时直接 closeDb()，那次读会重新打开库、向已销毁的池 acquire，
    * 白等 acquireTimeoutMillis（issue #80）。
    *
-   * 刷新本身可能 pump 出新任务（新任务的结束又触发新刷新），所以循环到两者同时为空。
+   * 实现是**等待者模式**，不是轮询：静默时被 `notifyIfQuiescent()` 唤醒。
    * 调用方若担心永不收敛，自己加超时。
    */
   async whenQuiescent(): Promise<void> {
-    for (;;) {
-      await this.settleTail;
-      if (this.inflight === 0 && this.pending.length === 0) return;
+    while (!this.isQuiescent()) {
+      await new Promise<void>((resolve) => {
+        this.idleWaiters.push(resolve);
+      });
     }
   }
 
@@ -141,11 +166,20 @@ class LlmQueue {
         .finally(() => {
           this.inflight -= 1;
           // 记成可 await 的 tail，供 whenQuiescent() / 优雅关闭等待（issue #80）。
+          this.refreshing += 1;
           this.settleTail = Promise.resolve(configReader())
             .then((config) => this.pump(config.maxConcurrency))
-            .catch(() => this.pump(DEFAULT_CONFIG.maxConcurrency));
+            .catch(() => this.pump(DEFAULT_CONFIG.maxConcurrency))
+            .finally(() => {
+              this.refreshing -= 1;
+              // 刷新结束后队列可能才真正静默（它可能又 pump 出了新任务）。
+              this.notifyIfQuiescent();
+            });
         });
     }
+    // 循环可能因为 pending 空而退出（此时 inflight 仍可能 > 0），也可能刚把队列清空；
+    // 两种情况都重新看一眼静默条件。
+    this.notifyIfQuiescent();
   }
 }
 
