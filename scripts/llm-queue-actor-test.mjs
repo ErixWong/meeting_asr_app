@@ -158,11 +158,16 @@ test("A1 真实接线：有 actor 入队的任务，执行时拿到的是入队�
     return "ok";
   }));
 
-  // 关键断言：探针必须真的进了排队（否则它可能被立刻执行、根本不经过 pump → 假绿）。
-  const queuedStatus = await waitForQueued(1);
-  assert.ok(queuedStatus.inFlight >= 2, `探针排队时槽应仍被 holder 占满，实际 ${JSON.stringify(queuedStatus)}`);
+  try {
+    // 关键断言：探针必须真的进了排队（否则它可能被立刻执行、根本不经过 pump → 假绿）。
+    const queuedStatus = await waitForQueued(1);
+    assert.ok(queuedStatus.inFlight >= 2, `探针排队时槽应仍被 holder 占满，实际 ${JSON.stringify(queuedStatus)}`);
+  } finally {
+    // 失败路径上也必须放行：否则 holder 永远卡在 await gate、队列停在 inFlight=2，
+    // 会污染后续测试与 teardown（验收 W4）。
+    releaseHolders();
+  }
 
-  releaseHolders();
   await Promise.all([holders, queued]);
   assert.equal(seenInTask, "user-A", "任务必须看到入队者 A 的身份，而不是启动 pump 的 B");
 });
@@ -185,8 +190,15 @@ test("A2 真实接线：无 actor 入队的后台任务，由**另一个 actor �
     return "ok";
   });
 
-  await waitForQueued(1);
-  releaseHolders();
+  try {
+    // 关键断言：探针必须真的进了排队（否则它可能被立刻执行、根本不经过 pump → 假绿）。
+    await waitForQueued(1);
+  } finally {
+    // 失败路径上也必须放行：否则 holder 永远卡在 await gate、队列停在 inFlight=2，
+    // 会污染后续测试与 teardown（验收 W4）。
+    releaseHolders();
+  }
+
   await Promise.all([holders, queued]);
   assert.match(
     outcome,
