@@ -57,13 +57,13 @@ class LlmQueue {
   private pending: QueueTask[] = [];
   private droppedCount = 0;
   /**
-   * 最后一次「收尾刷新」的 promise（pump 的 .finally 里那次 configReader 读）。
+   * 「已开始但还没落定的入队」个数：`enqueue()` 里 `await configReader()` 那一段。
    *
-   * 为什么需要：那次刷新是 fire-and-forget 的，调用方无从得知它何时落定。
-   * 关库前若它还在飞，就会重新 openDatabase() 并向已销毁的连接池 acquire，
-   * 白等 tarn 的 acquireTimeoutMillis（默认 60000ms）——issue #80 就是这个。
+   * 为什么必须计入静默：那段时间任务还没进 `pending`，`inflight`/`pending` 都看不到它，
+   * 于是 `whenQuiescent()` 会**提前返回** —— 之后这个入队才把任务推进来，
+   * 「关库前 drain」就漏掉了它（验收 U5）。
    */
-  private settleTail: Promise<void> = Promise.resolve();
+  private pendingEnqueues = 0;
   /** 在飞的「收尾刷新」个数（刷新期间队列不算静默）。 */
   private refreshing = 0;
   /**
@@ -79,39 +79,62 @@ class LlmQueue {
   async enqueue<T>(type: LlmTaskType, task: () => Promise<T>, waitMs = DEFAULT_WAIT_MS[type]): Promise<T> {
     // 配置读取是异步的（#54：app_settings 走 AsyncDb）；读到之前不占位、不排队，
     // 与改动前「同步读配置再判定」的顺序一致。
-    const { maxConcurrency, capacity } = await configReader();
+    //
+    // 但「读到之前」这段必须计入静默判定（验收 U5）：否则 whenQuiescent() 会在
+    // 这里还没进 pending 时误判队列已空。释放点严格放在「状态已经更新完」之后。
+    this.pendingEnqueues += 1;
+    let released = false;
+    const releaseEnqueue = () => {
+      if (released) return;
+      released = true;
+      this.pendingEnqueues -= 1;
+      this.notifyIfQuiescent();
+    };
 
-    if (this.inflight >= maxConcurrency && this.pending.length >= capacity) {
-      this.droppedCount += 1;
-      return Promise.reject(new Error(`LLM queue is full (capacity=${capacity})`));
+    try {
+      const { maxConcurrency, capacity } = await configReader();
+
+      if (this.inflight >= maxConcurrency && this.pending.length >= capacity) {
+        this.droppedCount += 1;
+        releaseEnqueue();
+        return Promise.reject(new Error(`LLM queue is full (capacity=${capacity})`));
+      }
+
+      // 入队时捕获上下文，执行时恢复（issue #69）
+      const enqueuedContext = contextHooks?.capture();
+      return new Promise<T>((resolve, reject) => {
+        const wrapped: QueueTask = {
+          type,
+          run: async () => {
+            try {
+              const hooks = contextHooks;
+              resolve(await (hooks ? hooks.run(enqueuedContext, task) : task()));
+            } catch (error) {
+              reject(error);
+            }
+          },
+          timer: setTimeout(() => {
+            const index = this.pending.indexOf(wrapped);
+            if (index >= 0) {
+              this.pending.splice(index, 1);
+              this.droppedCount += 1;
+              // 从 pending 里摘掉可能让队列变静默（验收 U1：maxConcurrency<=0 时 pump 永不启动）。
+              this.notifyIfQuiescent();
+            }
+            reject(new Error(`LLM queue wait timeout after ${waitMs}ms`));
+          }, waitMs),
+        };
+
+        this.pending.push(wrapped);
+        // 状态（pending 里已有这一项）更新完之后才释放计数：反过来会留出一个「看不见」的窗口。
+        releaseEnqueue();
+        this.pump(maxConcurrency);
+      });
+    } finally {
+      // 覆盖「configReader() 抛错」与任何未预期分支：不能让计数泄漏。
+      // 正常路径上 releaseEnqueue 已幂等自锁，这里是 no-op。
+      releaseEnqueue();
     }
-
-    // 入队时捕获上下文，执行时恢复（issue #69）
-    const enqueuedContext = contextHooks?.capture();
-    return new Promise<T>((resolve, reject) => {
-      const wrapped: QueueTask = {
-        type,
-        run: async () => {
-          try {
-            const hooks = contextHooks;
-            resolve(await (hooks ? hooks.run(enqueuedContext, task) : task()));
-          } catch (error) {
-            reject(error);
-          }
-        },
-        timer: setTimeout(() => {
-          const index = this.pending.indexOf(wrapped);
-          if (index >= 0) {
-            this.pending.splice(index, 1);
-            this.droppedCount += 1;
-          }
-          reject(new Error(`LLM queue wait timeout after ${waitMs}ms`));
-        }, waitMs),
-      };
-
-      this.pending.push(wrapped);
-      this.pump(maxConcurrency);
-    });
   }
 
   getStatus(): LlmQueueStatus {
@@ -122,9 +145,14 @@ class LlmQueue {
     };
   }
 
-  /** 队列是否完全静默：没有在跑的任务、没有排队项、没有在飞的收尾刷新。 */
+  /** 队列是否完全静默：没有在跑的任务、没有排队项、没有在飞的收尾刷新、没有未落定的入队。 */
   private isQuiescent(): boolean {
-    return this.inflight === 0 && this.pending.length === 0 && this.refreshing === 0;
+    return (
+      this.inflight === 0 &&
+      this.pending.length === 0 &&
+      this.refreshing === 0 &&
+      this.pendingEnqueues === 0
+    );
   }
 
   /** 静默时唤醒所有等待者（幂等，没人等就什么都不做）。 */
@@ -165,16 +193,21 @@ class LlmQueue {
         })
         .finally(() => {
           this.inflight -= 1;
-          // 记成可 await 的 tail，供 whenQuiescent() / 优雅关闭等待（issue #80）。
+          // 刷新包在 async IIFE 里：`configReader()` 若**同步**抛错，也会变成一次 rejection
+          // 被 catch 接住，`refreshing` 因此在任何路径上都会归零（验收 U1/U3）。
           this.refreshing += 1;
-          this.settleTail = Promise.resolve(configReader())
-            .then((config) => this.pump(config.maxConcurrency))
-            .catch(() => this.pump(DEFAULT_CONFIG.maxConcurrency))
-            .finally(() => {
+          void (async () => {
+            try {
+              const config = await configReader();
+              this.pump(config.maxConcurrency);
+            } catch {
+              this.pump(DEFAULT_CONFIG.maxConcurrency);
+            } finally {
               this.refreshing -= 1;
               // 刷新结束后队列可能才真正静默（它可能又 pump 出了新任务）。
               this.notifyIfQuiescent();
-            });
+            }
+          })();
         });
     }
     // 循环可能因为 pending 空而退出（此时 inflight 仍可能 > 0），也可能刚把队列清空；
