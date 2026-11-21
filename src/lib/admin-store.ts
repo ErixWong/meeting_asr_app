@@ -41,6 +41,7 @@ import {
   ensureTitleTemplate,
   sanitizeMeetingTitle,
 } from "@/lib/ai-title";
+import { resolveBootstrapAdminPassword } from "@/lib/bootstrap-admin";
 
 type SettingRow = {
   itemSection: string;
@@ -1943,18 +1944,18 @@ function getBootstrapAdminAccount() {
 }
 
 function getBootstrapAdminPassword() {
-  const configuredPassword = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || "");
-  if (configuredPassword) {
-    return { password: configuredPassword, mustChangePassword: false, source: "env" as const };
-  }
-
-  const fallbackPassword = "admin123";
-  if (process.env.NODE_ENV === "production") {
+  const resolved = resolveBootstrapAdminPassword(process.env);
+  if (resolved.source === "default" && process.env.NODE_ENV === "production") {
     console.warn(
-      "[auth] BOOTSTRAP_ADMIN_PASSWORD is not set. Created bootstrap admin with default password admin123; change it immediately."
+      "[auth] BOOTSTRAP_ADMIN_PASSWORD is not set. Created bootstrap admin with the built-in default password; it must be changed at first login."
     );
   }
-  return { password: fallbackPassword, mustChangePassword: true, source: "default" as const };
+  if (resolved.source === "env" && !resolved.mustChangePassword) {
+    console.warn(
+      "[auth] BOOTSTRAP_ADMIN_SKIP_PASSWORD_CHANGE=true —— 初始管理员口令不会强制首次改密。仅用于自动化流程。"
+    );
+  }
+  return resolved;
 }
 
 function scryptAsync(password: string, salt: string, keylen: number, options: { N: number; r: number; p: number }): Promise<Buffer> {
