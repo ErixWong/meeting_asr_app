@@ -1945,14 +1945,15 @@ function getBootstrapAdminAccount() {
 
 function getBootstrapAdminPassword() {
   const resolved = resolveBootstrapAdminPassword(process.env);
-  if (resolved.source === "default" && process.env.NODE_ENV === "production") {
-    console.warn(
-      "[auth] BOOTSTRAP_ADMIN_PASSWORD is not set. Created bootstrap admin with the built-in default password; it must be changed at first login."
-    );
-  }
-  if (resolved.source === "env" && !resolved.mustChangePassword) {
+  if (!resolved.mustChangePassword) {
+    // 豁免优先：这条必须在「内置默认口令」告警之前，否则 source=default + 豁免 时会打出
+    // 「必须首次改密」的假话，而且看不到豁免生效（issue #68 验收 X6）。
     console.warn(
       "[auth] BOOTSTRAP_ADMIN_SKIP_PASSWORD_CHANGE=true —— 初始管理员口令不会强制首次改密。仅用于自动化流程。"
+    );
+  } else if (resolved.source === "default" && process.env.NODE_ENV === "production") {
+    console.warn(
+      "[auth] BOOTSTRAP_ADMIN_PASSWORD is not set. Created bootstrap admin with the built-in default password; it must be changed at first login."
     );
   }
   return resolved;
