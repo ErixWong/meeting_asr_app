@@ -29,6 +29,15 @@ const sandbox = mkdtempSync(join(tmpdir(), "queue-actor-test-"));
 process.chdir(sandbox);
 
 after(async () => {
+  // 队列在**每个任务结束**时都会做一次 fire-and-forget 的配置刷新（llm-queue.ts 的 pump.finally）。
+  // 若这里直接 closeDb() 把连接池销毁，而那次刷新还没落定，它就会重新 openDatabase()
+  // 并向已销毁的池 acquire，白等 tarn 的 acquireTimeoutMillis（默认 60000ms）——
+  // 本测试曾因此耗时 61 秒（issue #80）。
+  // 先把 reader 换成常量（之后新发的刷新不再碰 DB），
+  // 再用 whenQuiescent() 等**已经发出的那次**刷新真正落定 —— 屏障，不是猜时长。
+  setLlmQueueConfigReader(() => ({ maxConcurrency: 2, capacity: 100 }));
+  await llmQueue.whenQuiescent();
+
   const { closeDb } = await import("../server/db-shared.mjs");
   await closeDb();
   rmSync(sandbox, { recursive: true, force: true });
@@ -62,7 +71,7 @@ const { initializeSchema } = await import("../server/db/schema.mjs");
 
 // 真实模块：admin-store 在 import 时就注册了队列上下文钩子
 const store = await import(pathToFileURL(join(repoRoot, "src", "lib", "admin-store.ts")).href);
-const { llmQueue } = await import(pathToFileURL(join(repoRoot, "src", "lib", "llm-queue.ts")).href);
+const { llmQueue, setLlmQueueConfigReader } = await import(pathToFileURL(join(repoRoot, "src", "lib", "llm-queue.ts")).href);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
