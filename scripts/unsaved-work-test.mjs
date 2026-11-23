@@ -28,9 +28,13 @@ const headerSource = readFileSync(
   "utf8"
 );
 
-/** 去掉 `//` 行注释，避免「注释里提到」被当成真实调用（验收 V4 同一口径）。 */
-function stripLineComments(source) {
+/**
+ * 去掉行注释与块注释，避免「注释里提到」被当成真实调用
+ * （验收 W5：只剥行注释时，块注释可以伪造结构匹配）。
+ */
+function stripComments(source) {
   return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
     .split("\n")
     .map((line) => {
       const slash = line.indexOf("//");
@@ -103,7 +107,7 @@ test("默认 message 含「未保存」：防止以后被改成空提示", () =>
 });
 
 test("源码结构守卫：AppHeader 的顶栏 Link 真的调用了 confirmLeaveIfUnsaved()", () => {
-  const code = stripLineComments(headerSource);
+  const code = stripComments(headerSource);
   assert.match(
     code,
     /if \(!confirmLeaveIfUnsaved\(\)\) event\.preventDefault\(\);/,
@@ -112,12 +116,30 @@ test("源码结构守卫：AppHeader 的顶栏 Link 真的调用了 confirmLeave
 });
 
 test("源码结构守卫：page.tsx 把 status/liveSegments 同步进 setHasUnsavedWork(", () => {
-  const code = stripLineComments(pageSource);
+  const code = stripComments(pageSource);
   assert.match(
     code,
     /\n\s*setHasUnsavedWork\(\n?\s*status === "recording"/,
     "首页必须有一个把 status / liveSegments 写进标志的调用"
   );
+  // 四个条件缺一不可：删掉任何一个都会让对应状态下的离页不再被拦（验收 W5）。
+  // ⚠ 必须限定在 `setHasUnsavedWork(` 那一段里查，不能用全文件 includes ——
+  // `status === "paused"` 在 beforeunload 和 /chat 的 onClick 里也出现，
+  // 全文件查会让「从同步 effect 里删掉这个条件」测不出来（实测过）。
+  const syncAt = code.indexOf("setHasUnsavedWork(");
+  assert.notEqual(syncAt, -1, "找不到 setHasUnsavedWork( 调用");
+  const syncBlock = code.slice(syncAt, syncAt + 400);
+  for (const condition of [
+    'status === "recording"',
+    'status === "paused"',
+    'status === "connecting"',
+    "liveSegments.length > 0",
+  ]) {
+    assert.ok(
+      syncBlock.includes(condition),
+      `同步标志的判定里缺少条件 ${condition} —— 缺了它，该状态下的离页就不再被拦`
+    );
+  }
   assert.match(code, /setHasUnsavedWork\(false\)/, "卸载时必须清标志，避免其他页面残留 true");
 });
 
@@ -127,7 +149,7 @@ test("源码结构守卫：/chat 链接的 onClick 内有 confirmLeaveIfUnsaved(
   // 不能用 indexOf(">") 截属性区：`onClick={(event) =>` 里的 => 也是 >，会截太短。
   const linkEnd = pageSource.indexOf("</Link>", linkAt);
   assert.notEqual(linkEnd, -1, "找不到 /chat 链接的 </Link>");
-  const link = stripLineComments(pageSource.slice(linkAt, linkEnd));
+  const link = stripComments(pageSource.slice(linkAt, linkEnd));
   assert.match(
     link,
     /if \(!confirmLeaveIfUnsaved\(\)\) \{/,

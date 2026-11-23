@@ -24,7 +24,7 @@ export function getHasUnsavedWork(): boolean {
  * 返回 true = 允许导航；false = 应 preventDefault。
  */
 export function confirmLeaveIfUnsaved(
-  message = "有未保存的转写，离开后会丢失。确定离开吗？",
+  message = "当前有未完成的工作（录音中或转写未保存），离开后会丢失。确定离开吗？",
   confirm: (message: string) => boolean = (text) => window.confirm(text),
 ): boolean {
   if (!hasUnsavedWork) return true;
