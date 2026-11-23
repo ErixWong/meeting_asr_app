@@ -946,6 +946,9 @@ export default function MeetingPage() {
       persistedMeetingIdRef.current = null;
       // 新一轮录音：作废上一轮的幂等键（issue #74-3）。
       saveIdempotencyKeyRef.current = null;
+      // 新一轮录音：上一轮的 checkpoint 幂等键也必须作废（issue #74-3）。
+      // 否则「POST 其实已提交但响应丢了」时，新录音的 checkpoint 会用旧键取回上一次的旧会议。
+      checkpointIdempotencyKeyRef.current = null;
       saveTitleRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
@@ -1740,13 +1743,14 @@ export default function MeetingPage() {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
           const uploadCaptureSessionId = client.getCaptureSessionId();
-          // fix-261123-04（issue #74-3）：上传没有重试按钮，但响应丢失后用户会重新选同一个文件。
-          // 用文件身份派生确定性键：同一次选择的同一文件重传会命中幂等，不会多出一条会议。
-          // ⚠ 有意重复上传同一个文件也会被去重 —— 这是刻意的取舍（重复内容本来就不该产生两条会议）。
-          const uploadIdempotencyKey = `upload:${file.name}:${file.size}:${file.lastModified}`;
+          // 上传**故意不带幂等键**（issue #74-3）：
+          //   1) 上传没有「重试」入口，每次上传都是用户的一次独立意图；
+          //   2) 用文件身份派生确定性键会让「有意重复上传同一个文件」被误去重、拿回旧会议；
+          //   3) 直接拼接文件名可能超出 idempotency_keys.key 的 128 字符上限（MySQL/MSSQL 会插入失败）。
+          // 代价：上传的响应丢失后用户重传会产生两条会议 —— 用户可见、可删，接受。
           const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
-            headers: { "Content-Type": "application/json", "Idempotency-Key": uploadIdempotencyKey },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               title,
               sourceType: "file_upload",

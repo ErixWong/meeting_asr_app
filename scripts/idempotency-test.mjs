@@ -23,17 +23,19 @@
  *      不新增会议（验收 X1，变异守卫）。
  *  17. completeIdempotencyKey 返回布尔：令牌对→true、令牌错→false。
  *  19. 源码结构守卫：ASR checkpoint 的 POST /api/meetings 带 "Idempotency-Key": checkpointKey。
- *  20. 源码结构守卫：文件上传的 POST 带 uploadIdempotencyKey，且该键由 file.name/file.size/file.lastModified 派生。
+ *  20'. 源码结构守卫（验收 A1）：startRecording 的「新一轮录音」分支（if (!preserveTranscript)）里必须同时
+ *      作废 saveIdempotencyKeyRef 与 checkpointIdempotencyKeyRef；上传路径不再出现 uploadIdempotencyKey；
+ *      全文件 "Idempotency-Key" 恰好 2 处（主保存 + checkpoint）。
  *
  * **PATCH（追加转写）不做幂等**：追加/标题/状态/LLM 分散在多个事务里，一个幂等键无法原子覆盖。
  * 已知限制：PATCH 的响应丢失后重试会重复追加同一段转写（见 issue #74）。
  *
- * 三条 POST /api/meetings 路径各自的幂等策略（fix-261123-04 验收 Z1）：
+ * 四条路径各自的幂等策略（fix-261123-04 验收 Z1 + A1）：
  *   | 路径 | 幂等 | 键的来源 |
  *   |---|---|---|
- *   | 主保存（停止录音） | ✅ | saveIdempotencyKeyRef，一次保存尝试系列复用 |
- *   | ASR checkpoint | ✅ | checkpointIdempotencyKeyRef，建会成功后清空 |
- *   | 文件上传 | ✅ | `upload:${name}:${size}:${lastModified}` 确定性派生 |
+ *   | 主保存（停止录音） | ✅ | saveIdempotencyKeyRef，一次保存尝试系列复用；新一轮录音作废 |
+ *   | ASR checkpoint | ✅ | checkpointIdempotencyKeyRef，建会成功后清空；新一轮录音也作废（验收 A1：否则「POST 已提交但响应丢了」时，下一次录音的 checkpoint 会用旧键取回上一次的旧会议） |
+ *   | 文件上传 | ❌ | **不做**（验收 A1）：①上传没有重试入口，每次上传都是用户的一次独立意图；②用文件身份派生确定性键会把「有意重复上传同一个文件」误去重、拿回旧会议；③直接拼接文件名可能超出 idempotency_keys.key 的 VARCHAR(128) 上限（MySQL/MSSQL 插入失败）。代价：响应丢失后重传会产生两条会议（用户可见、可删，接受） |
  *   | PATCH 追加转写 | ❌ | **不做**（多事务，见 issue #74） |
  *
  * 运行：npm run test:idempotency
@@ -429,21 +431,38 @@ test("用例19：ASR checkpoint 的 POST 带 Idempotency-Key（源码结构守�
   );
 });
 
-test("用例20：文件上传的 POST 带由文件身份派生的 uploadIdempotencyKey（源码结构守卫）", () => {
+test("用例20'：新一轮录音必须作废 checkpoint 幂等键，且上传路径不再带幂等键（源码结构守卫，验收 A1）", () => {
+  // (a) 定位 startRecording 起点 → 定位其后的 if (!preserveTranscript) { 分支 → 取每个分支其后 1200 字符。
+  const startIdx = pageSourceStripped.indexOf("const startRecording = useCallback(");
+  assert.ok(startIdx !== -1, "必须能在源码里定位 const startRecording = useCallback(");
+  const guardWindows = [];
+  for (let from = startIdx; ; ) {
+    const guardIdx = pageSourceStripped.indexOf("if (!preserveTranscript) {", from);
+    if (guardIdx === -1) break;
+    guardWindows.push(pageSourceStripped.slice(guardIdx, guardIdx + 1200));
+    from = guardIdx + 1;
+  }
   assert.ok(
-    pageSourceStripped.includes("uploadIdempotencyKey"),
-    "剥离注释后源码必须出现 uploadIdempotencyKey"
+    guardWindows.length >= 2,
+    `startRecording 之后应至少有两个 if (!preserveTranscript) { 分支，实际 ${guardWindows.length}`
+  );
+  // 「作废上一轮状态」的那个分支：以既有锚点 saveIdempotencyKeyRef.current = null; 认定（两个分支里只有一个含它）。
+  const resetWindow = guardWindows.find((w) => w.includes("saveIdempotencyKeyRef.current = null;"));
+  assert.ok(
+    resetWindow,
+    "必须存在作废上一轮幂等键的 !preserveTranscript 分支（锚点 saveIdempotencyKeyRef.current = null;）"
   );
   assert.ok(
-    pageSourceStripped.includes('"Idempotency-Key": uploadIdempotencyKey'),
-    '上传的 POST headers 必须带 "Idempotency-Key": uploadIdempotencyKey'
+    resetWindow.includes("checkpointIdempotencyKeyRef.current = null;"),
+    "新一轮录音必须清空 checkpointIdempotencyKeyRef：否则「checkpoint POST 已提交但响应丢了」时，下一次录音的 checkpoint 会用旧键取回上一次的旧会议（验收 A1）"
   );
-  // 键必须由文件身份派生；这三段在模板字符串里，会被 stripComments 保护性替换掉，故对原始源码断言。
-  assert.ok(pageSource.includes("file.name"), "上传幂等键必须由 file.name 派生");
-  assert.ok(pageSource.includes("file.size"), "上传幂等键必须由 file.size 派生");
-  assert.ok(pageSource.includes("file.lastModified"), "上传幂等键必须由 file.lastModified 派生");
+
+  // (b) 上传路径不再带幂等键：剥离注释后整份源码都不应再出现 uploadIdempotencyKey。
   assert.ok(
-    /uploadIdempotencyKey\s*=\s*`upload:\$\{file\.name\}:\$\{file\.size\}:\$\{file\.lastModified\}`/.test(pageSource),
-    "uploadIdempotencyKey 必须形如 `upload:${file.name}:${file.size}:${file.lastModified}`"
+    !pageSourceStripped.includes("uploadIdempotencyKey"),
+    "上传路径必须去掉 uploadIdempotencyKey（确定性派生键语义错且可能超长，验收 A1）"
   );
+  // (c) 只剩两条带键的 POST：主保存 + checkpoint。
+  const headerCount = (pageSourceStripped.match(/"Idempotency-Key"/g) ?? []).length;
+  assert.equal(headerCount, 2, `page.tsx 里 "Idempotency-Key" 必须只剩 2 处（主保存 + checkpoint），实际 ${headerCount}`);
 });
