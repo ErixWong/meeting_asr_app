@@ -2411,12 +2411,10 @@ export class IdempotencyConflictError extends Error {}
  *
  * @param key 幂等键
  * @param scope 作用域（如 "meeting.create" / "meeting.append"）；跨作用域复用同一 key 视为冲突
- * @param expectedMeetingId 目标会议 id（append 场景传入）：key 已绑到别的会议时视为冲突
  */
 export async function claimIdempotencyKey(
   key: string,
   scope: string,
-  expectedMeetingId?: string,
   allowRetry = true
 ): Promise<IdempotencyClaim> {
   const database = await getDb();
@@ -2447,7 +2445,7 @@ export async function claimIdempotencyKey(
 
   if (!row) {
     // 行不见了（并发方刚释放）：允许时重试一次认领，否则保守地当作进行中。
-    if (allowRetry) return claimIdempotencyKey(key, scope, expectedMeetingId, false);
+    if (allowRetry) return claimIdempotencyKey(key, scope, false);
     return { status: "in_progress" };
   }
 
@@ -2456,9 +2454,6 @@ export async function claimIdempotencyKey(
   }
 
   const meetingId = String(row.meeting_id ?? "");
-  if (expectedMeetingId && meetingId && meetingId !== expectedMeetingId) {
-    return { status: "conflict", reason: "meeting mismatch" };
-  }
   if (meetingId) {
     return { status: "replayed", meetingId };
   }
@@ -2470,7 +2465,7 @@ export async function claimIdempotencyKey(
     await database
       .prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ? AND claim_token = ?`)
       .run(key, String(row.claim_token ?? ""));
-    return claimIdempotencyKey(key, scope, expectedMeetingId, false);
+    return claimIdempotencyKey(key, scope, false);
   }
   return { status: "in_progress" };
 }

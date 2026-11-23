@@ -227,6 +227,9 @@ export default function MeetingPage() {
   // fix-261123-04（issue #74-3）：一次「保存尝试系列」共用的幂等键。首次保存生成，
   // 重试（重试保存按钮）时复用同一个值，服务端能认出是同一次保存。
   const saveIdempotencyKeyRef = useRef<string | null>(null);
+  // fix-261123-04（issue #74-3）：ASR 断链时的 checkpoint 建会也要幂等 ——
+  // 双通道会各自触发 onError，`checkpointPromiseRef` 只挡住「同时」，挡不住「串行重入」。
+  const checkpointIdempotencyKeyRef = useRef<string | null>(null);
   // fix-261123-04 验收 V1：同一次保存尝试重试时复用的标题。重试的请求体必须与首次一致，
   // 否则服务端幂等命中会静默忽略新标题，所以重试不能再弹命名框。
   const saveTitleRef = useRef<string | null>(null);
@@ -609,12 +612,17 @@ export default function MeetingPage() {
     let meetingId = persistedMeetingIdRef.current;
 
     if (!meetingId) {
+      // fix-261123-04（issue #74-3）：ASR 断链时的 checkpoint 建会也要幂等 ——
+      // 双通道会各自触发 onError，`checkpointPromiseRef` 只挡住「同时」，挡不住「串行重入」。
+      const checkpointKey =
+        checkpointIdempotencyKeyRef.current ??
+        (checkpointIdempotencyKeyRef.current = newIdempotencyKey());
       const now = new Date();
       const pad = (value: number) => value.toString().padStart(2, "0");
       const title = `录音 ${now.getMonth() + 1}月${now.getDate()}日 ${pad(now.getHours())}:${pad(now.getMinutes())}`;
       const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": checkpointKey },
         body: JSON.stringify({
           title,
           sourceType: "live_recording",
@@ -630,6 +638,8 @@ export default function MeetingPage() {
       meetingId = createdMeeting?.id ?? null;
       if (!meetingId) throw new Error("ASR checkpoint meeting was not created");
       persistedMeetingIdRef.current = meetingId;
+      // checkpoint 建会成功：结束本次 checkpoint 保存系列，下次断链重新生成幂等键（issue #74-3）。
+      checkpointIdempotencyKeyRef.current = null;
       persistedSegmentCountRef.current = segments.length;
       if (createdMeeting) {
         setMeetings((prev) => [createdMeeting, ...prev]);
@@ -1730,9 +1740,13 @@ export default function MeetingPage() {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
           const uploadCaptureSessionId = client.getCaptureSessionId();
+          // fix-261123-04（issue #74-3）：上传没有重试按钮，但响应丢失后用户会重新选同一个文件。
+          // 用文件身份派生确定性键：同一次选择的同一文件重传会命中幂等，不会多出一条会议。
+          // ⚠ 有意重复上传同一个文件也会被去重 —— 这是刻意的取舍（重复内容本来就不该产生两条会议）。
+          const uploadIdempotencyKey = `upload:${file.name}:${file.size}:${file.lastModified}`;
           const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Idempotency-Key": uploadIdempotencyKey },
             body: JSON.stringify({
               title,
               sourceType: "file_upload",

@@ -22,9 +22,19 @@
  *  16. 令牌被他人回收 → 事务内 complete 命中 0 行 → createMeetingWithOutcome 抛 ConflictError 且
  *      不新增会议（验收 X1，变异守卫）。
  *  17. completeIdempotencyKey 返回布尔：令牌对→true、令牌错→false。
+ *  19. 源码结构守卫：ASR checkpoint 的 POST /api/meetings 带 "Idempotency-Key": checkpointKey。
+ *  20. 源码结构守卫：文件上传的 POST 带 uploadIdempotencyKey，且该键由 file.name/file.size/file.lastModified 派生。
  *
  * **PATCH（追加转写）不做幂等**：追加/标题/状态/LLM 分散在多个事务里，一个幂等键无法原子覆盖。
  * 已知限制：PATCH 的响应丢失后重试会重复追加同一段转写（见 issue #74）。
+ *
+ * 三条 POST /api/meetings 路径各自的幂等策略（fix-261123-04 验收 Z1）：
+ *   | 路径 | 幂等 | 键的来源 |
+ *   |---|---|---|
+ *   | 主保存（停止录音） | ✅ | saveIdempotencyKeyRef，一次保存尝试系列复用 |
+ *   | ASR checkpoint | ✅ | checkpointIdempotencyKeyRef，建会成功后清空 |
+ *   | 文件上传 | ✅ | `upload:${name}:${size}:${lastModified}` 确定性派生 |
+ *   | PATCH 追加转写 | ❌ | **不做**（多事务，见 issue #74） |
  *
  * 运行：npm run test:idempotency
  */
@@ -400,4 +410,40 @@ test("用例17：completeIdempotencyKey 返回布尔（令牌对→true 并写 m
   assert.equal(ok, true, "令牌匹配应返回 true");
   const row = await database.prepare(`SELECT meeting_id FROM idempotency_keys WHERE "key" = ?`).get(key);
   assert.equal(row.meeting_id, "meeting-good", "令牌对的 complete 应把 meeting_id 写成目标会议");
+});
+
+// 客户端三条 POST /api/meetings 路径中，checkpoint 与上传两条的幂等键是**源码结构守卫**：
+// saveAsrCheckpoint / 上传流程都是 React 组件内的 useCallback，依赖 ref 与 DOM 音频，
+// 无法在 Node 沙箱里真实渲染运行，所以只能在剥离注释后的源码层面断言「键与请求头同时存在」。
+const pageSource = readFileSync(join(repoRoot, "src", "app", "page.tsx"), "utf8");
+const pageSourceStripped = stripComments(pageSource);
+
+test("用例19：ASR checkpoint 的 POST 带 Idempotency-Key（源码结构守卫）", () => {
+  assert.ok(
+    pageSourceStripped.includes("checkpointIdempotencyKeyRef"),
+    "剥离注释后源码必须出现 checkpointIdempotencyKeyRef（checkpoint 幂等键 ref）"
+  );
+  assert.ok(
+    pageSourceStripped.includes('"Idempotency-Key": checkpointKey'),
+    'checkpoint 的 POST headers 必须带 "Idempotency-Key": checkpointKey（不能只写在注释里）'
+  );
+});
+
+test("用例20：文件上传的 POST 带由文件身份派生的 uploadIdempotencyKey（源码结构守卫）", () => {
+  assert.ok(
+    pageSourceStripped.includes("uploadIdempotencyKey"),
+    "剥离注释后源码必须出现 uploadIdempotencyKey"
+  );
+  assert.ok(
+    pageSourceStripped.includes('"Idempotency-Key": uploadIdempotencyKey'),
+    '上传的 POST headers 必须带 "Idempotency-Key": uploadIdempotencyKey'
+  );
+  // 键必须由文件身份派生；这三段在模板字符串里，会被 stripComments 保护性替换掉，故对原始源码断言。
+  assert.ok(pageSource.includes("file.name"), "上传幂等键必须由 file.name 派生");
+  assert.ok(pageSource.includes("file.size"), "上传幂等键必须由 file.size 派生");
+  assert.ok(pageSource.includes("file.lastModified"), "上传幂等键必须由 file.lastModified 派生");
+  assert.ok(
+    /uploadIdempotencyKey\s*=\s*`upload:\$\{file\.name\}:\$\{file\.size\}:\$\{file\.lastModified\}`/.test(pageSource),
+    "uploadIdempotencyKey 必须形如 `upload:${file.name}:${file.size}:${file.lastModified}`"
+  );
 });
