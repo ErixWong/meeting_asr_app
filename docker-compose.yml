@@ -7,13 +7,21 @@ services:
     #   - @next/swc-linux-x64-gnu 预编译二进制
     image: node:24-slim
     working_dir: /app
+    # 启动流程（三条都必须幂等，否则每次重启都会重装/重建）：
+    #   1) 依赖：node_modules 缺失，或 package-lock.json 比已装的 next 新 → npm ci。
+    #      只判「存在」会让改 lock 之后的 npm ci 永不触发，依赖升级静默失效（issue #82）。
+    #   2) 构建：BUILD_ID 缺失，或源码/配置/依赖锁比它新 → next build。
+    #      必须带上 package-lock.json，否则会出现「换了依赖但产物没重建」（issue #82）。
+    #   3) 启动服务。
+    # ⚠ 不要在本 command 的字符串里写 `#` 注释：`>` 会把换行折成空格，
+    #   `#` 会把**后面整条命令**注释掉，容器直接起不来（2026-11-23 实测）。
     command: >
       sh -c "
-      if ! test -f node_modules/next/package.json; then
+      if ! test -f node_modules/next/package.json || test package-lock.json -nt node_modules/next/package.json; then
         apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*;
         npm ci --no-audit --no-fund;
       fi;
-      if ! test -f .next/BUILD_ID || find src server public tailwind.config.* postcss.config.* tsconfig.json -newer .next/BUILD_ID -print -quit | grep -q .; then npm run build; fi;
+      if ! test -f .next/BUILD_ID || find src server public tailwind.config.* postcss.config.* tsconfig.json package-lock.json -newer .next/BUILD_ID -print -quit 2>/dev/null | grep -q .; then npm run build; fi;
       exec node server/app-server.mjs"
     environment:
       PORT: 3123
