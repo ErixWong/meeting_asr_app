@@ -76,6 +76,8 @@ jobs:
 
       - name: 单测 · 保存重试幂等键
         run: npm run test:idempotency
+      - name: 单测 · 幂等键能力降级生成
+        run: npm run test:idempotency-key
 
       - name: 生产构建
         run: npm run build

@@ -17,6 +17,7 @@ import {
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
 import { isStartCancelled } from "@/lib/recording-start-guard";
 import { confirmLeaveIfUnsaved, setHasUnsavedWork } from "@/lib/unsaved-work";
+import { newIdempotencyKey } from "@/lib/idempotency-key";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import {
@@ -1244,9 +1245,11 @@ export default function MeetingPage() {
     const title = (name ?? "").trim() || defaultName;
     // 同一个「保存尝试系列」复用同一个幂等键：重试时服务端能认出这是同一次保存，
     // 不会因为「上次其实已提交、只是响应丢了」而重复建会议 / 重复追加转写（issue #74-3）。
+    // ⚠ 不直接用 crypto.randomUUID()：它只在安全上下文可用，本应用按 http://<内网IP>:3123 部署，
+    // 那里它是 undefined，每次保存都会抛错；newIdempotencyKey() 已按能力逐级降级。
     const idempotencyKey =
       saveIdempotencyKeyRef.current ??
-      (saveIdempotencyKeyRef.current = crypto.randomUUID());
+      (saveIdempotencyKeyRef.current = newIdempotencyKey());
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
