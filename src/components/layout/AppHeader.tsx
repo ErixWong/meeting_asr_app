@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useMemo } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { performLogout, useAuthSession } from "@/lib/use-auth-session";
+import { confirmLeaveIfUnsaved } from "@/lib/unsaved-work";
 
 type HeaderConfig = {
   title: string;
@@ -87,6 +88,11 @@ export default function AppHeader() {
           {headerConfig.action && (!headerConfig.action.adminOnly || isAdmin) && (
             <Link
               href={headerConfig.action.href}
+              onClick={(event) => {
+                // 顶栏是全站唯一的跨页入口，且它在 root layout 里拿不到首页状态，
+                // 只能靠模块级标志判断（issue #74-1）。
+                if (!confirmLeaveIfUnsaved()) event.preventDefault();
+              }}
               className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
             >
               {headerConfig.action.label}

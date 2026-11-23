@@ -69,6 +69,8 @@ jobs:
         run: npm run test:safe-href
       - name: 单测 · 初始口令策略
         run: npm run test:bootstrap-admin
+      - name: 单测 · 未保存转写拦截
+        run: npm run test:unsaved-work
       - name: 单测 · 录音启动取消判定
         run: npm run test:recording-guard
 

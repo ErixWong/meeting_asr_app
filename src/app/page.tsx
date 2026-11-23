@@ -16,6 +16,7 @@ import {
 } from "@/types";
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
 import { isStartCancelled } from "@/lib/recording-start-guard";
+import { confirmLeaveIfUnsaved, setHasUnsavedWork } from "@/lib/unsaved-work";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import {
@@ -849,6 +850,20 @@ export default function MeetingPage() {
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [liveSegments.length, status]);
+
+  // 把「有未保存的活」同步给页面外的载体（issue #74-1）：AppHeader 在 root layout 里，
+  // 拿不到这里的 status / liveSegments，只能靠这个标志判断该不该拦导航。
+  useEffect(() => {
+    setHasUnsavedWork(
+      status === "recording" ||
+        status === "paused" ||
+        status === "connecting" ||
+        liveSegments.length > 0
+    );
+  }, [status, liveSegments.length]);
+
+  // 离开首页时清掉标志，避免在 /admin、/chat 上残留一个过期的 true。
+  useEffect(() => () => setHasUnsavedWork(false), []);
 
   const refreshMicDevices = useCallback(async () => {
     setMicRefreshing(true);
@@ -2696,6 +2711,12 @@ export default function MeetingPage() {
                         if (status === "recording" || status === "paused") {
                           event.preventDefault();
                           showNotice("warn", "录音进行中，请先停止录音再切换页面");
+                          return;
+                        }
+                        // idle 但内存里还有未保存转写（典型：上一次保存失败）：也要拦（issue #74-1）。
+                        if (!confirmLeaveIfUnsaved()) {
+                          event.preventDefault();
+                          showNotice("warn", "有未保存的转写，已取消跳转");
                         }
                       }}
                       className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-700 shadow-sm transition hover:bg-emerald-100"

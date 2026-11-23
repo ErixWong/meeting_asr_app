@@ -25,6 +25,7 @@
     "test:queue-actor": "node --test scripts/llm-queue-actor-test.mjs",
     "test:safe-href": "node --test scripts/safe-href-test.mjs",
     "test:recording-guard": "node --test scripts/recording-start-guard-test.mjs",
+    "test:unsaved-work": "node --test scripts/unsaved-work-test.mjs",
     "test:bootstrap-admin": "node --test scripts/bootstrap-admin-test.mjs"
   },
   "dependencies": {
