@@ -15,6 +15,7 @@ import {
   AudioDevice,
 } from "@/types";
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
+import { isStartCancelled } from "@/lib/recording-start-guard";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import {
@@ -925,8 +926,19 @@ export default function MeetingPage() {
     asrClientsRef.current = clients;
     const started: FunASRClient[] = [];
 
+    const abortIfCancelled = (): boolean => {
+      if (!isStartCancelled(asrClientsRef.current, clients)) return false;
+      // 本轮启动已作废（离页 / 新建会议 / 重连 / 出错）：把已启动的每一路都收掉，
+      // 否则会留下「看不见的采集」——麦克风还在采、音频还在写，但页面已经不在（issue #74-2）。
+      for (const activeClient of started) {
+        activeClient.stopRecording().catch((e) => console.warn("Failed to stop ASR session after cancel:", e));
+      }
+      return true;
+    };
+
     try {
       for (const deviceId of activeDevices) {
+        if (abortIfCancelled()) return;
         const client = new FunASRClient();
         clients.set(deviceId, client);
         const source: "mic" | "speaker" = deviceId === "speaker" ? "speaker" : "mic";
@@ -1047,6 +1059,7 @@ export default function MeetingPage() {
           deviceId
         );
         started.push(client);
+        if (abortIfCancelled()) return;
       }
     } catch (error) {
       console.error("Failed to start recording:", error);
