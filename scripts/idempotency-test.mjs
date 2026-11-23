@@ -14,6 +14,12 @@
  *   4. 同一个 key 连续 appendMeetingTranscript 两次 → meeting_asr_results 行数不增加
  *      （段不重复追加）。
  *   5. 迁移后 idempotency_keys 表存在，且 SCHEMA_VERSION 变成 6。
+ *   6. 并发同 key createMeetingWithOutcome → meetings 恰好 +1（原子认领防双写）。
+ *   7. key 绑定 scope / 目标会议：跨会议或跨作用域复用 → 抛 IdempotencyConflictError，目标会议转写不变。
+ *   8. 业务写入失败 → 释放认领，同 key 可正常重试建会（不会卡在 in_progress）。
+ *   9. createMeetingWithOutcome 首次 replayed=false，重放 replayed=true。
+ *  10. 占位超 TTL → 回收重认领（变异守卫：删 TTL 重认领段应变红）。
+ *  11. 源码结构守卫：route.ts 的 LLM 触发条件带 !outcome.replayed 前置（变异守卫）。
  *
  * 运行：npm run test:idempotency
  */
@@ -217,4 +223,134 @@ test("用例5：迁移后 idempotency_keys 表存在，且 SCHEMA_VERSION 变成
   const colNames = cols.map((c) => c.name).sort();
   assert.ok(cols.length > 0, "idempotency_keys 表应存在");
   assert.deepEqual(colNames, ["created_at", "key", "meeting_id", "scope"], `列应为 key/scope/meeting_id/created_at，实际 ${colNames}`);
+});
+
+test("用例6：并发同 key createMeetingWithOutcome → meetings 恰好 +1（原子认领防双写）", async () => {
+  const key = "idem-concurrent-same-key";
+  const before = await withActor(() => rowCount("meetings"));
+
+  const runOne = async () => {
+    try {
+      const outcome = await withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key })));
+      return { ok: true, outcome };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  };
+
+  const settled = await Promise.all([runOne(), runOne()]);
+  // 核心不变量：两个并发请求只能造出 1 条会议（旧实现会双写）。
+  const after = await withActor(() => rowCount("meetings"));
+  assert.equal(after, before + 1, `并发同 key 必须只新增 1 条会议，实际 +${after - before}`);
+
+  const successes = settled.filter((s) => s.ok);
+  assert.ok(successes.length >= 1, "至少一方应成功建会/重放");
+  for (const s of successes) {
+    assert.equal(s.outcome.replayed, false, "成功返回会议的一方应是真正建会（replayed=false）");
+    assert.ok(s.outcome.meeting?.id, "成功方应返回会议");
+  }
+  // 未成功的一方只能是因为“被并发方抢先”：抛 in_progress（或同 scope 冲突）。
+  for (const s of settled) {
+    if (!s.ok) {
+      assert.ok(
+        s.error instanceof store.IdempotencyInProgressError || s.error instanceof store.IdempotencyConflictError,
+        `未成功的并发方应抛 IdempotencyInProgressError/ConflictError，实际 ${s.error}`
+      );
+    }
+  }
+});
+
+test("用例7：key 绑定 scope/目标会议 → 跨会议或跨作用域复用抛 IdempotencyConflictError，目标会议转写不变", async () => {
+  const meetingA = await withActor(() => store.createMeeting(meetingInput()));
+  const meetingB = await withActor(() => store.createMeeting(meetingInput()));
+  assert.ok(meetingA?.id && meetingB?.id, "前置：先建 A、B 两个会议");
+
+  const appendInput = (meetingId, key) => ({
+    meetingId,
+    captureSessionId: `append-cap-${Math.random().toString(16).slice(2)}`,
+    captureSessionIds: [],
+    transcriptSegments: [
+      { id: `seg-${Math.random().toString(16).slice(2)}`, speaker: "spk-1", text: "一段转写", time: "00:01", timeSeconds: 1, isFinal: true },
+    ],
+    idempotencyKey: key,
+  });
+
+  // (a) 目标会议绑定：key 先绑到 A 的追加，再用同一 key 追加到 B → meeting mismatch
+  const boundKey = "idem-append-bound-A";
+  const firstAppend = await withActor(() => store.appendMeetingTranscript(appendInput(meetingA.id, boundKey)));
+  assert.equal(firstAppend?.id, meetingA.id, "A 的追加应命中 A 自己");
+
+  const rowsBBefore = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meetingB.id] }));
+  await assert.rejects(
+    () => withActor(() => store.appendMeetingTranscript(appendInput(meetingB.id, boundKey))),
+    (error) => error instanceof store.IdempotencyConflictError,
+    "用 A 的 append key 追加 B 应抛 IdempotencyConflictError（meeting mismatch）"
+  );
+  const rowsBAfter = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meetingB.id] }));
+  assert.equal(rowsBAfter, rowsBBefore, "冲突时 B 的转写不得被改动");
+
+  // (b) 作用域绑定：meeting.create 作用域的 key 拿去 append → scope mismatch
+  const createKey = "idem-scope-cross-key";
+  const created = await withActor(() => store.createMeeting(meetingInput({ idempotencyKey: createKey })));
+  assert.ok(created?.id, "前置：用 create key 建一个会议");
+  await assert.rejects(
+    () => withActor(() => store.appendMeetingTranscript(appendInput(created.id, createKey))),
+    (error) => error instanceof store.IdempotencyConflictError,
+    "用 meeting.create 的 key 去 append 应抛 IdempotencyConflictError（scope mismatch）"
+  );
+});
+
+test("用例8：业务写入失败 → 释放认领，同 key 可正常重试建会", async () => {
+  const key = "idem-release-key";
+  // 空 title 触发 requireNonEmpty 抛错（在任何插入之前，因此不会留下方会议行）
+  await assert.rejects(
+    () => withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key, title: "   " }))),
+    "空 title 首次应抛错"
+  );
+  // claim 被释放（DELETE WHERE meeting_id=''），所以同 key 重试能成功建会，而不是卡在 in_progress
+  const retry = await withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key })));
+  assert.ok(retry.meeting?.id, "释放后同 key 重试必须能建会");
+  assert.equal(retry.replayed, false, "重试是真正新建（replayed=false），不是命中");
+});
+
+test("用例9：createMeetingWithOutcome 首次 replayed=false，重放 replayed=true（同 id）", async () => {
+  const key = "idem-outcome-flag-key";
+  const before = await withActor(() => rowCount("meetings"));
+  const first = await withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key })));
+  assert.equal(first.replayed, false, "首次应为 false");
+  assert.ok(first.meeting?.id, "首次应返回会议");
+  const second = await withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key })));
+  assert.equal(second.replayed, true, "重放应为 true");
+  assert.equal(second.meeting?.id, first.meeting.id, "重放应返回同一会议");
+  const after = await withActor(() => rowCount("meetings"));
+  assert.equal(after, before + 1, "两次调用只应有 1 条会议");
+});
+
+test("用例10：占位超过 TTL → 回收重认领（变异守卫：删掉 TTL 重认领段应变红）", async () => {
+  const key = "idem-ttl-expired-key";
+  // 手工插一条 20 分钟前的「进行中」占位（meeting_id 空串）
+  const database = await getDb();
+  const staleAt = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  await database
+    .prepare(`INSERT INTO idempotency_keys ("key", scope, meeting_id, created_at) VALUES (?, ?, ?, ?)`)
+    .run(key, "meeting.create", "", staleAt);
+
+  const before = await withActor(() => rowCount("meetings"));
+  const outcome = await withActor(() => store.createMeetingWithOutcome(meetingInput({ idempotencyKey: key })));
+  assert.equal(outcome.replayed, false, "过期占位应被回收重认领后正常建会（replayed=false）");
+  assert.ok(outcome.meeting?.id, "应建出新会议");
+  const after = await withActor(() => rowCount("meetings"));
+  assert.equal(after, before + 1, "过期占位回收后应新增 1 条会议");
+});
+
+test("用例11：源码结构守卫 —— route.ts 的 LLM 触发条件必须带 !outcome.replayed 前置（变异守卫）", async () => {
+  const { readFileSync } = await import("node:fs");
+  const routePath = join(repoRoot, "src", "app", "api", "meetings", "route.ts");
+  let src = readFileSync(routePath, "utf8");
+  // 剥块注释与行注释，避免注释里的字面串造成假绿
+  src = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  assert.ok(
+    src.includes("if (!outcome.replayed"),
+    "createMeeting 路由的 LLM 触发条件必须以 `if (!outcome.replayed` 打头（重放不得再触发 LLM）"
+  );
 });

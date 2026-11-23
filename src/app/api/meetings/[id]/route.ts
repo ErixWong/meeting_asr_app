@@ -8,6 +8,8 @@ import {
   getMeetingLightById,
   updateMeeting,
   updateTranscriptMeetingStatus,
+  IdempotencyInProgressError,
+  IdempotencyConflictError,
 } from "@/lib/admin-store";
 
 export const dynamic = "force-dynamic";
@@ -71,6 +73,12 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
       return NextResponse.json({ meeting });
     } catch (error) {
+      if (error instanceof IdempotencyInProgressError || error instanceof IdempotencyConflictError) {
+        return NextResponse.json(
+          { error: error.message },
+          { status: 409 }
+        );
+      }
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Failed to update meeting" },
         { status: 400 }

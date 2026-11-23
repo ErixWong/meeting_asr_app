@@ -227,6 +227,9 @@ export default function MeetingPage() {
   // fix-261123-04（issue #74-3）：一次「保存尝试系列」共用的幂等键。首次保存生成，
   // 重试（重试保存按钮）时复用同一个值，服务端能认出是同一次保存。
   const saveIdempotencyKeyRef = useRef<string | null>(null);
+  // fix-261123-04 验收 V1：同一次保存尝试重试时复用的标题。重试的请求体必须与首次一致，
+  // 否则服务端幂等命中会静默忽略新标题，所以重试不能再弹命名框。
+  const saveTitleRef = useRef<string | null>(null);
   // 上一次停止录音时的 capture session 绑定信息（issue #70 复审 R3）：
   // 保存失败后点「重试保存」时 asrClientsRef 已空，靠它把原始录音绑回会议。
   const lastCaptureRef = useRef<{ captureSessionId: string; captureSessionIds: string[] } | null>(null);
@@ -933,6 +936,7 @@ export default function MeetingPage() {
       persistedMeetingIdRef.current = null;
       // 新一轮录音：作废上一轮的幂等键（issue #74-3）。
       saveIdempotencyKeyRef.current = null;
+      saveTitleRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);
@@ -1241,8 +1245,8 @@ export default function MeetingPage() {
     // ⚠ 不能把 prompt 前移到停止录音之前：window.prompt 同步阻塞主线程，而音频处理跑在
     // ScriptProcessorNode.onaudioprocess（funasr.ts:399-409），阻塞期间 PCM 帧会被丢弃，
     // 等于把「丢转写」换成「丢音频」。
-    const name = window.prompt("请输入录音名称：", defaultName);
-    const title = (name ?? "").trim() || defaultName;
+    // 是否重试：幂等键已存在 = 之前那次保存请求已发出（issue #74-3 验收 V1）。
+    const isRetry = saveIdempotencyKeyRef.current != null;
     // 同一个「保存尝试系列」复用同一个幂等键：重试时服务端能认出这是同一次保存，
     // 不会因为「上次其实已提交、只是响应丢了」而重复建会议 / 重复追加转写（issue #74-3）。
     // ⚠ 不直接用 crypto.randomUUID()：它只在安全上下文可用，本应用按 http://<内网IP>:3123 部署，
@@ -1250,6 +1254,20 @@ export default function MeetingPage() {
     const idempotencyKey =
       saveIdempotencyKeyRef.current ??
       (saveIdempotencyKeyRef.current = newIdempotencyKey());
+
+    // 首次弹框命名；重试（已有幂等键）复用上次的标题，不再弹框：请求体必须与首次一致，
+    // 否则服务端幂等命中会静默忽略新标题（验收 V1）。
+    // ⚠ 首次 prompt 仍留在停止录音之后（阻塞主线程会丢 PCM 帧），这里只调整同一次保存内部的取值顺序。
+    let name: string | null;
+    let title: string;
+    if (isRetry && saveTitleRef.current) {
+      name = saveTitleRef.current;
+      title = saveTitleRef.current;
+    } else {
+      name = window.prompt("请输入录音名称：", defaultName);
+      title = (name ?? "").trim() || defaultName;
+      saveTitleRef.current = title;
+    }
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
@@ -1304,6 +1322,7 @@ export default function MeetingPage() {
       persistedMeetingIdRef.current = null;
       // 保存成功：结束本次「保存尝试系列」，下次保存重新生成幂等键（issue #74-3）。
       saveIdempotencyKeyRef.current = null;
+      saveTitleRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);

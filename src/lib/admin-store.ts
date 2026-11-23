@@ -2382,47 +2382,113 @@ function quoteIdColumn(dbType: string, identifier: string): string {
   return `"${identifier}"`;
 }
 
-/** 按幂等键查已处理过的会议 id（没查到返回 null）。 */
-async function findIdempotentMeetingId(key: string): Promise<string | null> {
-  const database = await getDb();
-  const keyColumn = quoteIdColumn(database.dbType, "key");
-  const row = await database
-    .prepare(`SELECT meeting_id FROM idempotency_keys WHERE ${keyColumn} = ?`)
-    .get(key) as { meeting_id?: string } | undefined;
-  return row?.meeting_id ? String(row.meeting_id) : null;
-}
+/**
+ * fix-261123-04 验收（V1/V8）：幂等键改为「写入前原子认领」。
+ *
+ * 旧实现是「事务外查 key → 业务写入 → 事务内登记 key」，有三个洞：
+ *   1. 并发重放：两个同 key 请求都查不到 key → 都建会议 → insertIgnore 只有一方成功 ⇒ 双写；
+ *   2. key 没绑 scope/目标会议：A 的 key 打到 B 上会静默返回 A、跳过 B 的追加；
+ *   3. 幂等命中后路由又跑一遍 LLM 生成。
+ * 新实现把「占位」提到业务写入之前（claimIdempotencyKey 用 insertIgnore 的返回值判定认领成功），
+ * 只有拿到 `claimed` 才允许执行副作用；占位行用空串 meeting_id 表示「已认领、尚未完成」。
+ */
+
+/** 幂等键的占位记录（`meeting_id` 为空串表示「已认领、尚未完成」）。 */
+const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 10 * 60 * 1000;
+
+type IdempotencyClaim =
+  | { status: "claimed" }
+  | { status: "replayed"; meetingId: string }
+  | { status: "in_progress" }
+  | { status: "conflict"; reason: string };
+
+/** 认领失败 / 冲突的错误：路由据此映射为 409。 */
+export class IdempotencyInProgressError extends Error {}
+export class IdempotencyConflictError extends Error {}
 
 /**
- * 在事务里登记幂等键（已存在时忽略冲突，交给调用方处理）。
- * 并发重复请求的 INSERT 主键冲突走跨库 insertIgnore()（冲突即丢弃），
- * 不写方言特有的 ON CONFLICT / INSERT OR IGNORE。
+ * 认领一个幂等键；返回 `claimed` 才允许执行副作用。
+ *
+ * @param key 幂等键
+ * @param scope 作用域（如 "meeting.create" / "meeting.append"）；跨作用域复用同一 key 视为冲突
+ * @param expectedMeetingId 目标会议 id（append 场景传入）：key 已绑到别的会议时视为冲突
  */
-async function recordIdempotencyKey(
-  tx: AsyncDatabase,
+async function claimIdempotencyKey(
   key: string,
   scope: string,
-  meetingId: string
-): Promise<void> {
-  await insertIgnore(
-    tx,
-    "idempotency_keys",
-    { key, scope, meeting_id: meetingId, created_at: nowIso() },
-    ["key"]
-  );
-}
+  expectedMeetingId?: string,
+  allowRetry = true
+): Promise<IdempotencyClaim> {
+  const database = await getDb();
+  const keyColumn = quoteIdColumn(database.dbType, "key");
 
-export async function createMeeting(input: MeetingInput) {
-  // fix-261123-04（issue #74-3）：幂等命中——上次请求的副作用已写完，直接原样返回那条会议，
-  // 不会因「服务端已提交但响应丢失 → 用户重试」而重复建会议。必须在拿到 settings 之前。
-  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
-  if (idempotencyKey) {
-    const existingId = await findIdempotentMeetingId(idempotencyKey);
-    if (existingId) {
-      const existing = await getMeetingById(existingId);
-      if (existing) return existing;
-    }
+  // 第 1 步：占位。meeting_id 先写空串，业务写入成功后再 complete 指向真会议。
+  let affected = 0;
+  try {
+    affected = await insertIgnore(
+      database,
+      "idempotency_keys",
+      { key, scope, meeting_id: "", created_at: nowIso() },
+      ["key"]
+    );
+  } catch {
+    // MSSQL 走 INSERT ... SELECT WHERE NOT EXISTS，并发时可能抛唯一键冲突：按「冲突（返回 0）」处理。
+    affected = 0;
+  }
+  if (affected === 1) return { status: "claimed" };
+
+  // 第 2 步：冲突，读回那一行再判定。
+  const row = await database
+    .prepare(`SELECT scope, meeting_id, created_at FROM idempotency_keys WHERE ${keyColumn} = ?`)
+    .get(key) as { scope?: string; meeting_id?: string; created_at?: string } | undefined;
+
+  if (!row) {
+    // 行不见了（并发方刚释放）：允许时重试一次认领，否则保守地当作进行中。
+    if (allowRetry) return claimIdempotencyKey(key, scope, expectedMeetingId, false);
+    return { status: "in_progress" };
   }
 
+  if (String(row.scope ?? "") !== scope) {
+    return { status: "conflict", reason: "scope mismatch" };
+  }
+
+  const meetingId = String(row.meeting_id ?? "");
+  if (expectedMeetingId && meetingId && meetingId !== expectedMeetingId) {
+    return { status: "conflict", reason: "meeting mismatch" };
+  }
+  if (meetingId) {
+    return { status: "replayed", meetingId };
+  }
+
+  // meeting_id 为空：仍在「进行中」。只有占位超过 TTL（进程死在半路）才回收重认领一次。
+  const createdMs = Date.parse(String(row.created_at ?? ""));
+  const ageMs = Number.isFinite(createdMs) ? Date.now() - createdMs : Number.POSITIVE_INFINITY;
+  if (ageMs > IDEMPOTENCY_IN_PROGRESS_TTL_MS && allowRetry) {
+    await database.prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ?`).run(key);
+    return claimIdempotencyKey(key, scope, expectedMeetingId, false);
+  }
+  return { status: "in_progress" };
+}
+
+/** 认领成功后，把 key 指向真正的会议 id。 */
+async function completeIdempotencyKey(key: string, meetingId: string): Promise<void> {
+  const database = await getDb();
+  const keyColumn = quoteIdColumn(database.dbType, "key");
+  await database
+    .prepare(`UPDATE idempotency_keys SET meeting_id = ? WHERE ${keyColumn} = ?`)
+    .run(meetingId, key);
+}
+
+/** 业务写入失败时释放认领，避免 key 永久卡在「进行中」。 */
+async function releaseIdempotencyKey(key: string): Promise<void> {
+  const database = await getDb();
+  const keyColumn = quoteIdColumn(database.dbType, "key");
+  await database
+    .prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ? AND meeting_id = ''`)
+    .run(key);
+}
+
+async function createMeetingUncached(input: MeetingInput) {
   const createdAt = nowIso();
   const meetingId = newId("meeting");
   const asrResultId = newId("asr");
@@ -2532,11 +2598,6 @@ export async function createMeeting(input: MeetingInput) {
     // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
     await bindAudioRecordingsToMeeting({ meetingId, captureSessionIds }, tx);
 
-    // fix-261123-04（issue #74-3）：会议插入成功后，在同一个事务里登记幂等键（scope=meeting.create）。
-    if (idempotencyKey) {
-      await recordIdempotencyKey(tx, idempotencyKey, "meeting.create", meetingId);
-    }
-
     const meeting = await getMeetingById(meetingId, tx);
     await writeAuditLog({
       actionType: "meeting.create",
@@ -2563,24 +2624,58 @@ export async function createMeeting(input: MeetingInput) {
   return meetingResult;
 }
 
-export async function appendMeetingTranscript(input: {
+export type CreateMeetingOutcome = {
+  meeting: Awaited<ReturnType<typeof createMeetingUncached>>;
+  /** true = 这次请求命中了幂等键，副作用没有重新执行（路由据此跳过 LLM 触发）。 */
+  replayed: boolean;
+};
+
+/**
+ * 带幂等结果版本的 createMeeting：先原子认领幂等键，只有拿到 `claimed` 才执行业务写入。
+ * 命中重放时返回已存在的会议且 `replayed=true`（调用方据此不再触发 LLM）。
+ */
+export async function createMeetingWithOutcome(input: MeetingInput): Promise<CreateMeetingOutcome> {
+  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
+  if (!idempotencyKey) {
+    return { meeting: await createMeetingUncached(input), replayed: false };
+  }
+  const claim = await claimIdempotencyKey(idempotencyKey, "meeting.create");
+  if (claim.status === "replayed") {
+    return { meeting: await getMeetingById(claim.meetingId), replayed: true };
+  }
+  if (claim.status === "in_progress") {
+    throw new IdempotencyInProgressError("同一保存请求正在处理中，请稍候重试");
+  }
+  if (claim.status === "conflict") {
+    throw new IdempotencyConflictError(`幂等键冲突：${claim.reason}`);
+  }
+  try {
+    const meeting = await createMeetingUncached(input);
+    if (meeting) await completeIdempotencyKey(idempotencyKey, meeting.id);
+    else await releaseIdempotencyKey(idempotencyKey);
+    return { meeting, replayed: false };
+  } catch (error) {
+    await releaseIdempotencyKey(idempotencyKey).catch(() => {});
+    throw error;
+  }
+}
+
+/** 兼容薄包装：保持原有签名（只有路由用新版本，其余调用方不变）。 */
+export async function createMeeting(input: MeetingInput) {
+  return (await createMeetingWithOutcome(input)).meeting;
+}
+
+/** appendMeetingTranscript 的入参形状（供 uncached 实现与带幂等的包装共用）。 */
+type AppendMeetingTranscriptInput = {
   meetingId: string;
   captureSessionId: string;
   captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
   /** fix-261123-04（issue #74-3）：保存重试的幂等键。 */
   idempotencyKey?: string | null;
-}) {
-  // fix-261123-04（issue #74-3）：幂等命中——上次已把这段转写追加过了，直接返回该会议，不重复追加。
-  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
-  if (idempotencyKey) {
-    const existingId = await findIdempotentMeetingId(idempotencyKey);
-    if (existingId) {
-      const existingMeeting = await getMeetingById(existingId);
-      if (existingMeeting) return existingMeeting;
-    }
-  }
+};
 
+async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInput) {
   const existing = await getMeetingById(input.meetingId);
   if (!existing) return null;
 
@@ -2661,14 +2756,38 @@ export async function appendMeetingTranscript(input: {
       captureSessionIds: collectCaptureSessionIds(input),
     }, tx);
 
-    // fix-261123-04（issue #74-3）：转写插入成功后，在同一事务里登记幂等键（scope=meeting.append），
-    // 使重试不会重复追加同一段转写。
-    if (idempotencyKey) {
-      await recordIdempotencyKey(tx, idempotencyKey, "meeting.append", input.meetingId);
-    }
-
     return await getMeetingById(input.meetingId, tx);
   });
+}
+
+/**
+ * 带幂等的 appendMeetingTranscript：写入前先认领，并传 expectedMeetingId 防止“会议 A 的 key 打到会议 B”。
+ * 对外签名不变（仍返回会议或 null）；in_progress / conflict 抛对应错误。
+ */
+export async function appendMeetingTranscript(input: AppendMeetingTranscriptInput) {
+  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
+  if (!idempotencyKey) {
+    return await appendMeetingTranscriptUncached(input);
+  }
+  const claim = await claimIdempotencyKey(idempotencyKey, "meeting.append", input.meetingId);
+  if (claim.status === "replayed") {
+    return await getMeetingById(claim.meetingId);
+  }
+  if (claim.status === "in_progress") {
+    throw new IdempotencyInProgressError("同一追加请求正在处理中，请稍候重试");
+  }
+  if (claim.status === "conflict") {
+    throw new IdempotencyConflictError(`幂等键冲突：${claim.reason}`);
+  }
+  try {
+    const meeting = await appendMeetingTranscriptUncached(input);
+    if (meeting) await completeIdempotencyKey(idempotencyKey, meeting.id);
+    else await releaseIdempotencyKey(idempotencyKey);
+    return meeting;
+  } catch (error) {
+    await releaseIdempotencyKey(idempotencyKey).catch(() => {});
+    throw error;
+  }
 }
 
 export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null, db?: AsyncDatabase) {
