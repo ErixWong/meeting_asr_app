@@ -15,3 +15,5 @@ docs/tasks/
 deploy/voiceprint/__pycache__/
 deploy/voiceprint/data/
 deploy/voiceprint/data-en/
+# 本地 MCP 配置（含本机地址/端口，不进仓库）
+.mcp.json
