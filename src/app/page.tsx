@@ -223,6 +223,9 @@ export default function MeetingPage() {
   const asrStopIntentRef = useRef(false);
   const persistedMeetingIdRef = useRef<string | null>(null);
   const persistedSegmentCountRef = useRef(0);
+  // fix-261123-04（issue #74-3）：一次「保存尝试系列」共用的幂等键。首次保存生成，
+  // 重试（重试保存按钮）时复用同一个值，服务端能认出是同一次保存。
+  const saveIdempotencyKeyRef = useRef<string | null>(null);
   // 上一次停止录音时的 capture session 绑定信息（issue #70 复审 R3）：
   // 保存失败后点「重试保存」时 asrClientsRef 已空，靠它把原始录音绑回会议。
   const lastCaptureRef = useRef<{ captureSessionId: string; captureSessionIds: string[] } | null>(null);
@@ -927,6 +930,8 @@ export default function MeetingPage() {
     asrRecoveryRef.current = false;
     if (!preserveTranscript) {
       persistedMeetingIdRef.current = null;
+      // 新一轮录音：作废上一轮的幂等键（issue #74-3）。
+      saveIdempotencyKeyRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);
@@ -1237,13 +1242,18 @@ export default function MeetingPage() {
     // 等于把「丢转写」换成「丢音频」。
     const name = window.prompt("请输入录音名称：", defaultName);
     const title = (name ?? "").trim() || defaultName;
+    // 同一个「保存尝试系列」复用同一个幂等键：重试时服务端能认出这是同一次保存，
+    // 不会因为「上次其实已提交、只是响应丢了」而重复建会议 / 重复追加转写（issue #74-3）。
+    const idempotencyKey =
+      saveIdempotencyKeyRef.current ??
+      (saveIdempotencyKeyRef.current = crypto.randomUUID());
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
       const data = existingMeetingId
         ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
             method: "PATCH",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
             body: JSON.stringify({
               appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
@@ -1256,7 +1266,7 @@ export default function MeetingPage() {
           })
         : await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
             body: JSON.stringify({
               title,
               sourceType: "live_recording",
@@ -1289,6 +1299,8 @@ export default function MeetingPage() {
         });
       }
       persistedMeetingIdRef.current = null;
+      // 保存成功：结束本次「保存尝试系列」，下次保存重新生成幂等键（issue #74-3）。
+      saveIdempotencyKeyRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);

@@ -538,13 +538,13 @@ test("migration: 生产库 v4（[4] 单行、无 purged_at）→ 起两次进程
   // 第一次启动：必须看到 v5 迁移
   const firstLog = runMigrationChild("open", dbPath);
   assert.match(firstLog, /Migration applied: v5 \(meeting-audio-recordings-purged-at\)/, `第一次启动应跑 v5 迁移，实际 ${firstLog}`);
-  assert.match(firstLog, /"versions":\[5\]/, `迁移后必须是 [5] 单行，实际 ${firstLog}`);
+  assert.match(firstLog, /"versions":\[6\]/, `迁移后必须是 [6] 单行（v5→v6）,实际 ${firstLog}`);
   assert.match(firstLog, /"hasPurgedAt":true/, `迁移后必须有 purged_at 列，实际 ${firstLog}`);
 
   // 第二次启动：不许重跑（单行记账 + 幂等补列）
   const secondLog = runMigrationChild("open", dbPath);
   assert.doesNotMatch(secondLog, /Migration applied/, `第二次启动不许再跑迁移，实际 ${secondLog}`);
-  assert.match(secondLog, /"versions":\[5\]/, `第二次启动后仍是 [5] 单行，实际 ${secondLog}`);
+  assert.match(secondLog, /"versions":\[6\]/, `第二次启动后仍是 [6] 单行，实际 ${secondLog}`);
   assert.match(secondLog, /"hasPurgedAt":true/);
   console.log("[R2] 迁移 v4→v5 两次进程 OK: [4] → [5] 单行，第二次无 Migration applied");
 });
@@ -552,7 +552,7 @@ test("migration: 生产库 v4（[4] 单行、无 purged_at）→ 起两次进程
 test("migration: 全新库直接是 v5 且带 purged_at（新库不靠迁移补列）", async () => {
   const dbPath = join(sandbox, "data", "fresh-v5.db");
   const log = runMigrationChild("open", dbPath);
-  assert.match(log, /"versions":\[5\]/);
+  assert.match(log, /"versions":\[6\]/);
   assert.match(log, /"hasPurgedAt":true/);
   assert.doesNotMatch(log, /Migration applied/, "全新库不应跑任何迁移");
   console.log("[R2] 全新库 v5 + purged_at OK");

@@ -160,6 +160,8 @@ type MeetingInput = {
   captureSessionId: string;
   captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
+  /** fix-261123-04（issue #74-3）：保存重试的幂等键；同一「保存尝试系列」复用同一个值。 */
+  idempotencyKey?: string | null;
 };
 
 type MeetingLlmResultRow = {
@@ -2368,7 +2370,59 @@ async function writeAuditLog(input: {
     );
 }
 
+/**
+ * fix-261123-04（issue #74-3）：`key` 是 MySQL / SQL Server 的保留字，查询里必须按
+ * 方言给标识符加引号。沿用 server/db/insert-ignore.mjs 里 quote() 的同一套方言映射
+ * （sqlite `"x"` / mysql `\`x\`` / mssql `[x]`），不裸写。这不是方言特有的 DML，
+ * 只是标识符转义（schema.mjs / insert-ignore.mjs 建表建索引用的是同一套约定）。
+ */
+function quoteIdColumn(dbType: string, identifier: string): string {
+  if (dbType === "mysql") return `\`${identifier}\``;
+  if (dbType === "mssql") return `[${identifier}]`;
+  return `"${identifier}"`;
+}
+
+/** 按幂等键查已处理过的会议 id（没查到返回 null）。 */
+async function findIdempotentMeetingId(key: string): Promise<string | null> {
+  const database = await getDb();
+  const keyColumn = quoteIdColumn(database.dbType, "key");
+  const row = await database
+    .prepare(`SELECT meeting_id FROM idempotency_keys WHERE ${keyColumn} = ?`)
+    .get(key) as { meeting_id?: string } | undefined;
+  return row?.meeting_id ? String(row.meeting_id) : null;
+}
+
+/**
+ * 在事务里登记幂等键（已存在时忽略冲突，交给调用方处理）。
+ * 并发重复请求的 INSERT 主键冲突走跨库 insertIgnore()（冲突即丢弃），
+ * 不写方言特有的 ON CONFLICT / INSERT OR IGNORE。
+ */
+async function recordIdempotencyKey(
+  tx: AsyncDatabase,
+  key: string,
+  scope: string,
+  meetingId: string
+): Promise<void> {
+  await insertIgnore(
+    tx,
+    "idempotency_keys",
+    { key, scope, meeting_id: meetingId, created_at: nowIso() },
+    ["key"]
+  );
+}
+
 export async function createMeeting(input: MeetingInput) {
+  // fix-261123-04（issue #74-3）：幂等命中——上次请求的副作用已写完，直接原样返回那条会议，
+  // 不会因「服务端已提交但响应丢失 → 用户重试」而重复建会议。必须在拿到 settings 之前。
+  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
+  if (idempotencyKey) {
+    const existingId = await findIdempotentMeetingId(idempotencyKey);
+    if (existingId) {
+      const existing = await getMeetingById(existingId);
+      if (existing) return existing;
+    }
+  }
+
   const createdAt = nowIso();
   const meetingId = newId("meeting");
   const asrResultId = newId("asr");
@@ -2478,6 +2532,11 @@ export async function createMeeting(input: MeetingInput) {
     // feat-261101-01：把本次录音（双通道 = 2 条）绑定到会议，expires_at 置 NULL（永久）
     await bindAudioRecordingsToMeeting({ meetingId, captureSessionIds }, tx);
 
+    // fix-261123-04（issue #74-3）：会议插入成功后，在同一个事务里登记幂等键（scope=meeting.create）。
+    if (idempotencyKey) {
+      await recordIdempotencyKey(tx, idempotencyKey, "meeting.create", meetingId);
+    }
+
     const meeting = await getMeetingById(meetingId, tx);
     await writeAuditLog({
       actionType: "meeting.create",
@@ -2509,7 +2568,19 @@ export async function appendMeetingTranscript(input: {
   captureSessionId: string;
   captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
+  /** fix-261123-04（issue #74-3）：保存重试的幂等键。 */
+  idempotencyKey?: string | null;
 }) {
+  // fix-261123-04（issue #74-3）：幂等命中——上次已把这段转写追加过了，直接返回该会议，不重复追加。
+  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
+  if (idempotencyKey) {
+    const existingId = await findIdempotentMeetingId(idempotencyKey);
+    if (existingId) {
+      const existingMeeting = await getMeetingById(existingId);
+      if (existingMeeting) return existingMeeting;
+    }
+  }
+
   const existing = await getMeetingById(input.meetingId);
   if (!existing) return null;
 
@@ -2589,6 +2660,12 @@ export async function appendMeetingTranscript(input: {
       meetingId: input.meetingId,
       captureSessionIds: collectCaptureSessionIds(input),
     }, tx);
+
+    // fix-261123-04（issue #74-3）：转写插入成功后，在同一事务里登记幂等键（scope=meeting.append），
+    // 使重试不会重复追加同一段转写。
+    if (idempotencyKey) {
+      await recordIdempotencyKey(tx, idempotencyKey, "meeting.append", input.meetingId);
+    }
 
     return await getMeetingById(input.meetingId, tx);
   });

@@ -346,11 +346,11 @@ test("schema: 运行时建表包含 meeting_audio_recordings 全 16 列 + unique
   }
   assert.equal(uniqueIndex, true, `capture_session_id 缺 unique 索引: ${indexes.join(",")}`);
 
-  // fix-261101-02（issue #51）：版本记账改为单行语义，当前版本 = MIGRATIONS.length（v5）
+  // fix-261101-02（issue #51）：版本记账改为单行语义，当前版本 = MIGRATIONS.length（v6，fix-261123-04 加了幂等键迁移）
   const versionRows = await database.prepare("SELECT version FROM schema_version").all();
   assert.equal(versionRows.length, 1, `schema_version 应恰好 1 行，实际 ${versionRows.length} 行`);
-  assert.equal(Number(versionRows[0].version), 5, `schema_version 应为 5，实际 ${versionRows[0].version}`);
-  console.log(`[L3] 运行时 schema OK: 16 列 + unique(capture_session_id) + schema_version=5（单行）`);
+  assert.equal(Number(versionRows[0].version), 6, `schema_version 应为 6，实际 ${versionRows[0].version}`);
+  console.log(`[L3] 运行时 schema OK: 16 列 + unique(capture_session_id) + schema_version=6（单行）`);
 });
 
 test("schema: 重复登记同一 capture_session_id 走 upsert 不抛唯一键冲突", async () => {

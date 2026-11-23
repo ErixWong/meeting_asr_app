@@ -36,11 +36,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       }
 
       if (Array.isArray(body.appendTranscriptSegments)) {
+        // fix-261123-04（issue #74-3）：只透传幂等键，去重逻辑在 appendMeetingTranscript 里。
+        const idempotencyKey = req.headers.get("idempotency-key");
         meeting = await appendMeetingTranscript({
           meetingId: id,
           captureSessionId: String(body.captureSessionId ?? `capture-${Date.now()}`),
           captureSessionIds: Array.isArray(body.captureSessionIds) ? body.captureSessionIds : undefined,
           transcriptSegments: body.appendTranscriptSegments,
+          idempotencyKey,
         });
       }
 
