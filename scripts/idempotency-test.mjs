@@ -20,6 +20,16 @@
  *   9. createMeetingWithOutcome 首次 replayed=false，重放 replayed=true。
  *  10. 占位超 TTL → 回收重认领（变异守卫：删 TTL 重认领段应变红）。
  *  11. 源码结构守卫：route.ts 的 LLM 触发条件带 !outcome.replayed 前置（变异守卫）。
+ *  12. 持有者令牌：旧令牌不得 release/complete 新持有者的行（验收 W2）。
+ *  13. appendMeetingTranscriptWithOutcome 首次返回令牌且不在内部 complete；调用方 complete 后重放
+ *      才为 replayed=true（验收 X2：complete 交给路由，覆盖全部副作用）。
+ *  14. 源码结构守卫：[id]/route.ts 重放时立即 return。
+ *  15. idempotency_keys 表有 claim_token 列。
+ *  16. 令牌被他人回收 → 事务内 complete 命中 0 行 → createMeetingWithOutcome 抛 ConflictError 且
+ *      不新增会议（验收 X1，变异守卫）。
+ *  17. completeIdempotencyKey 返回布尔：令牌对→true、令牌错→false。
+ *  18. 源码结构守卫：[id]/route.ts 的 completeIdempotencyKey 必须在 createMeetingLlmResult 之后
+ *      （验收 X2，变异守卫）。
  *
  * 运行：npm run test:idempotency
  */
@@ -408,7 +418,7 @@ test("用例12：TTL 回收不误删/不误改新认领者（旧持有者令牌�
   assert.ok(!gone, "新持有者用自己的 token release 应能删掉自己那一行");
 });
 
-test("用例13：appendMeetingTranscriptWithOutcome 首次 replayed=false、第二次 replayed=true（同 id、不重复追加）", async () => {
+test("用例13：appendMeetingTranscriptWithOutcome 首次返回令牌不内部 complete、调用方 complete 后第二次 replayed=true（X2）", async () => {
   const meeting = await withActor(() => store.createMeeting(meetingInput()));
   assert.ok(meeting?.id, "前置：先建一个会议");
   const rowsBefore = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meeting.id] }));
@@ -427,10 +437,25 @@ test("用例13：appendMeetingTranscriptWithOutcome 首次 replayed=false、第�
   const first = await withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput()));
   assert.equal(first.replayed, false, "首次追加应为 replayed=false");
   assert.equal(first.meeting?.id, meeting.id, "首次应返回同一会议");
+  // X2：WithOutcome 不再内部 complete，首次必须把认领令牌透出给调用方。
+  assert.equal(typeof first.claimToken, "string", "首次追加必须返回认领令牌（X2：complete 交给调用方）");
+  assert.ok(first.claimToken && first.claimToken.length > 0, "claimToken 应为非空字符串");
 
-  const second = await withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput()));
-  assert.equal(second.replayed, true, "第二次（同 key）应为 replayed=true");
-  assert.equal(second.meeting?.id, meeting.id, "重放应返回同一会议");
+  // 令牌未 complete 前，meeting_id 仍为空 ⇒ 第二次同 key 视为「进行中」（证明 WithOutcome 没内部 complete）。
+  await assert.rejects(
+    () => withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput())),
+    (error) => error instanceof store.IdempotencyInProgressError,
+    "令牌未 complete 时第二次同 key 应抛 IdempotencyInProgressError"
+  );
+
+  // 模拟路由：所有副作用完成后才 complete（事务外、传 token）。
+  const completed = await withActor(() => store.completeIdempotencyKey(key, first.claimToken, meeting.id));
+  assert.equal(completed, true, "用正确令牌 complete 应返回 true");
+
+  const third = await withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput()));
+  assert.equal(third.replayed, true, "complete 之后同 key 应为 replayed=true");
+  assert.equal(third.meeting?.id, meeting.id, "重放应返回同一会议");
+  assert.equal(third.claimToken, null, "重放时 claimToken 必须为 null");
 
   const rowsAfter = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meeting.id] }));
   assert.equal(rowsAfter, rowsBefore + 1, `重放不得重复追加，meeting_asr_results 应只 +1，实际 +${rowsAfter - rowsBefore}`);
@@ -453,4 +478,78 @@ test("用例15：idempotency_keys 表有 claim_token 列（持有者令牌）", 
   const cols = await database.prepare("PRAGMA table_info(idempotency_keys)").all();
   const names = cols.map((c) => c.name);
   assert.ok(names.includes("claim_token"), `idempotency_keys 应含 claim_token 列，实际 ${names.join(",")}`);
+});
+
+test("用例16：令牌被他人回收后 complete 命中 0 行 → createMeetingWithOutcome 抛 ConflictError 且不新增会议（X1，变异守卫）", async () => {
+  // 目标：在「createMeetingWithOutcome 已认领」与「它在事务内 complete」之间，把行里的 claim_token
+  // 改成别的值（模拟 TTL 被他人回收/重认领），使事务内的 completeIdempotencyKey 命中 0 行、返回 false。
+  // 此时 onCommitted 必须抛 IdempotencyConflictError ⇒ 整个事务回滚 ⇒ 不新增会议。
+  // （删掉 `if (!ok) throw new IdempotencyConflictError(...)` 后本用例应变红：会议会被建出来、不报错。）
+  const key = `idem-token-invalidated-${Math.random().toString(16).slice(2)}`;
+  const before = await withActor(() => rowCount("meetings"));
+  const database = await getDb();
+  const input = meetingInput({ idempotencyKey: key });
+
+  // 先启动 createMeetingWithOutcome：它先认领幂等键（插入占位行），随后在事务内 complete。
+  const running = withActor(() => store.createMeetingWithOutcome(input));
+
+  // 等认领写入的占位行出现（claim_token 已写入），立刻把 claim_token 改掉。
+  // 轮询与 createMeetingWithOutcome 共用同一条 `_lockTail` 串行链（sqlite 单连接），故用纯串行
+  // await 细粒度交错（不用 setTimeout：sqlite 同步驱动下 setTimeout(0) 会让整个事务在
+  // 一个 tick 内跑完）。createMeetingUncached 在事务前有 listSettings 等多次串行读，本翻转会排在事务拿锁之前。
+  let flipped = false;
+  for (let i = 0; i < 200000 && !flipped; i++) {
+    const row = await database.prepare(`SELECT claim_token FROM idempotency_keys WHERE "key" = ?`).get(key);
+    if (row && row.claim_token) {
+      await database
+        .prepare(`UPDATE idempotency_keys SET claim_token = ? WHERE "key" = ?`)
+        .run("reclaimed-by-another-worker", key);
+      flipped = true;
+    }
+  }
+  assert.ok(flipped, "前置：必须观测到认领写入的占位行才能模拟令牌失效");
+
+  await assert.rejects(
+    () => running,
+    (error) => error instanceof store.IdempotencyConflictError,
+    "令牌失效后 complete 命中 0 行，应在事务内抛 IdempotencyConflictError（删掉 `if (!ok) throw` 应变红）"
+  );
+
+  const after = await withActor(() => rowCount("meetings"));
+  assert.equal(after, before, `complete 失败必须回滚事务、不新增会议，实际 +${after - before}（删 throw 会 +1）`);
+});
+
+test("用例17：completeIdempotencyKey 返回布尔（令牌对→true 并写 meeting_id，令牌错→false 且不改）", async () => {
+  const key = `idem-complete-bool-${Math.random().toString(16).slice(2)}`;
+  const database = await getDb();
+  const now = new Date().toISOString();
+  await database
+    .prepare(`INSERT INTO idempotency_keys ("key", scope, meeting_id, created_at, claim_token) VALUES (?, ?, ?, ?, ?)`)
+    .run(key, "meeting.create", "", now, "good-token");
+
+  const wrong = await withActor(() => store.completeIdempotencyKey(key, "wrong-token", "meeting-wrong"));
+  assert.equal(wrong, false, "令牌不匹配应返回 false");
+  const midRow = await database.prepare(`SELECT meeting_id FROM idempotency_keys WHERE "key" = ?`).get(key);
+  assert.equal(midRow.meeting_id, "", "令牌错的 complete 不应改 meeting_id（WHERE claim_token 不命中）");
+
+  const ok = await withActor(() => store.completeIdempotencyKey(key, "good-token", "meeting-good"));
+  assert.equal(ok, true, "令牌匹配应返回 true");
+  const row = await database.prepare(`SELECT meeting_id FROM idempotency_keys WHERE "key" = ?`).get(key);
+  assert.equal(row.meeting_id, "meeting-good", "令牌对的 complete 应把 meeting_id 写成目标会议");
+});
+
+test("用例18：源码结构守卫 —— PATCH 路由 [id]/route.ts 的 completeIdempotencyKey 必须在 createMeetingLlmResult 之后（变异守卫）", async () => {
+  // 验收 X2：幂等键完成要覆盖全部副作用，所以 completeIdempotencyKey 必须排在 finalize 的
+  // createMeetingLlmResult 之后。把 complete 那段挑到 finalize 之前，本守卫应变红。
+  const routePath = join(repoRoot, "src", "app", "api", "meetings", "[id]", "route.ts");
+  const src = readRouteStripped(routePath);
+  // 用带开括号的调用形式避开 import 行（import 里是 `completeIdempotencyKey,` / `createMeetingLlmResult,`，无括号）。
+  const llmAt = src.indexOf("createMeetingLlmResult(");
+  const completeAt = src.indexOf("completeIdempotencyKey(");
+  assert.notEqual(llmAt, -1, "PATCH 路由应触发 createMeetingLlmResult(");
+  assert.notEqual(completeAt, -1, "PATCH 路由应在副作用之后调用 completeIdempotencyKey(");
+  assert.ok(
+    completeAt > llmAt,
+    `completeIdempotencyKey( 必须排在 createMeetingLlmResult( 之后（幂等键完成要覆盖全部副作用）；complete=${completeAt}, llm=${llmAt}`
+  );
 });
