@@ -2397,7 +2397,7 @@ function quoteIdColumn(dbType: string, identifier: string): string {
 const IDEMPOTENCY_IN_PROGRESS_TTL_MS = 10 * 60 * 1000;
 
 type IdempotencyClaim =
-  | { status: "claimed" }
+  | { status: "claimed"; token: string }
   | { status: "replayed"; meetingId: string }
   | { status: "in_progress" }
   | { status: "conflict"; reason: string };
@@ -2413,7 +2413,7 @@ export class IdempotencyConflictError extends Error {}
  * @param scope 作用域（如 "meeting.create" / "meeting.append"）；跨作用域复用同一 key 视为冲突
  * @param expectedMeetingId 目标会议 id（append 场景传入）：key 已绑到别的会议时视为冲突
  */
-async function claimIdempotencyKey(
+export async function claimIdempotencyKey(
   key: string,
   scope: string,
   expectedMeetingId?: string,
@@ -2423,24 +2423,27 @@ async function claimIdempotencyKey(
   const keyColumn = quoteIdColumn(database.dbType, "key");
 
   // 第 1 步：占位。meeting_id 先写空串，业务写入成功后再 complete 指向真会议。
+  // claim_token 是本次认领的持有者标识：后续 complete/release/TTL 回收都只针对自己这一行，
+  // 慢请求不会误删/误改新认领者的占位（验收 W2）。
+  const token = newId("idemclaim");
   let affected = 0;
   try {
     affected = await insertIgnore(
       database,
       "idempotency_keys",
-      { key, scope, meeting_id: "", created_at: nowIso() },
+      { key, scope, meeting_id: "", created_at: nowIso(), claim_token: token },
       ["key"]
     );
   } catch {
     // MSSQL 走 INSERT ... SELECT WHERE NOT EXISTS，并发时可能抛唯一键冲突：按「冲突（返回 0）」处理。
     affected = 0;
   }
-  if (affected === 1) return { status: "claimed" };
+  if (affected === 1) return { status: "claimed", token };
 
-  // 第 2 步：冲突，读回那一行再判定。
+  // 第 2 步：冲突，读回那一行再判定（claim_token 也读出来，TTL 回收时只删自己刚读到的那一行）。
   const row = await database
-    .prepare(`SELECT scope, meeting_id, created_at FROM idempotency_keys WHERE ${keyColumn} = ?`)
-    .get(key) as { scope?: string; meeting_id?: string; created_at?: string } | undefined;
+    .prepare(`SELECT scope, meeting_id, created_at, claim_token FROM idempotency_keys WHERE ${keyColumn} = ?`)
+    .get(key) as { scope?: string; meeting_id?: string; created_at?: string; claim_token?: string } | undefined;
 
   if (!row) {
     // 行不见了（并发方刚释放）：允许时重试一次认领，否则保守地当作进行中。
@@ -2464,28 +2467,32 @@ async function claimIdempotencyKey(
   const createdMs = Date.parse(String(row.created_at ?? ""));
   const ageMs = Number.isFinite(createdMs) ? Date.now() - createdMs : Number.POSITIVE_INFINITY;
   if (ageMs > IDEMPOTENCY_IN_PROGRESS_TTL_MS && allowRetry) {
-    await database.prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ?`).run(key);
+    await database
+      .prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ? AND claim_token = ?`)
+      .run(key, String(row.claim_token ?? ""));
     return claimIdempotencyKey(key, scope, expectedMeetingId, false);
   }
   return { status: "in_progress" };
 }
 
-/** 认领成功后，把 key 指向真正的会议 id。 */
-async function completeIdempotencyKey(key: string, meetingId: string): Promise<void> {
+/** 认领成功后，把 key 指向真正的会议 id（带持有者令牌，只改自己那一行）。 */
+export async function completeIdempotencyKey(key: string, token: string, meetingId: string): Promise<void> {
   const database = await getDb();
   const keyColumn = quoteIdColumn(database.dbType, "key");
+  const tokenColumn = quoteIdColumn(database.dbType, "claim_token");
   await database
-    .prepare(`UPDATE idempotency_keys SET meeting_id = ? WHERE ${keyColumn} = ?`)
-    .run(meetingId, key);
+    .prepare(`UPDATE idempotency_keys SET meeting_id = ? WHERE ${keyColumn} = ? AND ${tokenColumn} = ?`)
+    .run(meetingId, key, token);
 }
 
-/** 业务写入失败时释放认领，避免 key 永久卡在「进行中」。 */
-async function releaseIdempotencyKey(key: string): Promise<void> {
+/** 业务写入失败时释放认领（带持有者令牌，只删自己那一行），避免 key 永久卡在「进行中」。 */
+export async function releaseIdempotencyKey(key: string, token: string): Promise<void> {
   const database = await getDb();
   const keyColumn = quoteIdColumn(database.dbType, "key");
+  const tokenColumn = quoteIdColumn(database.dbType, "claim_token");
   await database
-    .prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ? AND meeting_id = ''`)
-    .run(key);
+    .prepare(`DELETE FROM idempotency_keys WHERE ${keyColumn} = ? AND ${tokenColumn} = ?`)
+    .run(key, token);
 }
 
 async function createMeetingUncached(input: MeetingInput) {
@@ -2651,11 +2658,11 @@ export async function createMeetingWithOutcome(input: MeetingInput): Promise<Cre
   }
   try {
     const meeting = await createMeetingUncached(input);
-    if (meeting) await completeIdempotencyKey(idempotencyKey, meeting.id);
-    else await releaseIdempotencyKey(idempotencyKey);
+    if (meeting) await completeIdempotencyKey(idempotencyKey, claim.token, meeting.id);
+    else await releaseIdempotencyKey(idempotencyKey, claim.token);
     return { meeting, replayed: false };
   } catch (error) {
-    await releaseIdempotencyKey(idempotencyKey).catch(() => {});
+    await releaseIdempotencyKey(idempotencyKey, claim.token).catch(() => {});
     throw error;
   }
 }
@@ -2673,6 +2680,15 @@ type AppendMeetingTranscriptInput = {
   transcriptSegments: MeetingTranscriptSegment[];
   /** fix-261123-04（issue #74-3）：保存重试的幂等键。 */
   idempotencyKey?: string | null;
+};
+
+/**
+ * fix-261123-04 验收 W6：追加重放的结果形状。
+ * replayed=true 表示命中幂等键、本次没执行任何副作用（路由据此不再跑 finalize 的 LLM 触发）。
+ */
+export type AppendTranscriptOutcome = {
+  meeting: Awaited<ReturnType<typeof appendMeetingTranscriptUncached>>;
+  replayed: boolean;
 };
 
 async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInput) {
@@ -2761,17 +2777,20 @@ async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInp
 }
 
 /**
- * 带幂等的 appendMeetingTranscript：写入前先认领，并传 expectedMeetingId 防止“会议 A 的 key 打到会议 B”。
- * 对外签名不变（仍返回会议或 null）；in_progress / conflict 抛对应错误。
+ * appendMeetingTranscript 的带结果版本：先认领幂等键，返回 { meeting, replayed }。
+ * 带 expectedMeetingId 防止“会议 A 的 key 打到会议 B”；in_progress / conflict 抛对应错误。
+ * replayed=true 表示本次没执行任何副作用（上一次请求已全部写完），路由据此不再重复触发 LLM。
  */
-export async function appendMeetingTranscript(input: AppendMeetingTranscriptInput) {
+export async function appendMeetingTranscriptWithOutcome(
+  input: AppendMeetingTranscriptInput
+): Promise<AppendTranscriptOutcome> {
   const idempotencyKey = String(input.idempotencyKey ?? "").trim();
   if (!idempotencyKey) {
-    return await appendMeetingTranscriptUncached(input);
+    return { meeting: await appendMeetingTranscriptUncached(input), replayed: false };
   }
   const claim = await claimIdempotencyKey(idempotencyKey, "meeting.append", input.meetingId);
   if (claim.status === "replayed") {
-    return await getMeetingById(claim.meetingId);
+    return { meeting: await getMeetingById(claim.meetingId), replayed: true };
   }
   if (claim.status === "in_progress") {
     throw new IdempotencyInProgressError("同一追加请求正在处理中，请稍候重试");
@@ -2781,13 +2800,20 @@ export async function appendMeetingTranscript(input: AppendMeetingTranscriptInpu
   }
   try {
     const meeting = await appendMeetingTranscriptUncached(input);
-    if (meeting) await completeIdempotencyKey(idempotencyKey, meeting.id);
-    else await releaseIdempotencyKey(idempotencyKey);
-    return meeting;
+    if (meeting) await completeIdempotencyKey(idempotencyKey, claim.token, meeting.id);
+    else await releaseIdempotencyKey(idempotencyKey, claim.token);
+    return { meeting, replayed: false };
   } catch (error) {
-    await releaseIdempotencyKey(idempotencyKey).catch(() => {});
+    await releaseIdempotencyKey(idempotencyKey, claim.token).catch(() => {});
     throw error;
   }
+}
+
+/**
+ * 兼容薄包装：保持原有签名（仍返回会议或 null）；in_progress / conflict 抛对应错误。
+ */
+export async function appendMeetingTranscript(input: AppendMeetingTranscriptInput) {
+  return (await appendMeetingTranscriptWithOutcome(input)).meeting;
 }
 
 export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null, db?: AsyncDatabase) {

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { BUSINESS_ROLES, withRequiredRoles } from "@/lib/api-auth";
 import {
-  appendMeetingTranscript,
+  appendMeetingTranscriptWithOutcome,
   createMeetingLlmResult,
   deleteMeeting,
   getMeetingById,
@@ -38,15 +38,21 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       }
 
       if (Array.isArray(body.appendTranscriptSegments)) {
-        // fix-261123-04（issue #74-3）：只透传幂等键，去重逻辑在 appendMeetingTranscript 里。
+        // fix-261123-04（issue #74-3）：只透传幂等键，去重逻辑在 appendMeetingTranscriptWithOutcome 里。
         const idempotencyKey = req.headers.get("idempotency-key");
-        meeting = await appendMeetingTranscript({
+        const appendOutcome = await appendMeetingTranscriptWithOutcome({
           meetingId: id,
           captureSessionId: String(body.captureSessionId ?? `capture-${Date.now()}`),
           captureSessionIds: Array.isArray(body.captureSessionIds) ? body.captureSessionIds : undefined,
           transcriptSegments: body.appendTranscriptSegments,
           idempotencyKey,
         });
+        meeting = appendOutcome.meeting;
+        if (appendOutcome.replayed) {
+          // 幂等重放：这次请求的副作用上次已经全部写完（追加 + 标题 + 状态 + finalize 的 LLM 触发），
+          // 不能再跑一遍，否则会给同一会议重复生成纪要（验收 W6）。
+          return NextResponse.json({ meeting });
+        }
       }
 
       if (body.title !== undefined) {

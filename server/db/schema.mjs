@@ -106,6 +106,10 @@ function defineIdempotencyKeysTable(t) {
   t.string("scope", 64).notNullable();
   t.string("meeting_id", 64).notNullable();
   t.string("created_at", 32).notNullable();
+  // fix-261123-04 验收 W2：认领持有者令牌。TTL 回收 / complete / release 都带上它，
+  // 保证「只改自己刚认领到的那一行」，慢请求不会误删/误改新认领者的占位。
+  // .defaultTo("") 写法照抄同文件（如 app_settings.item_mark 的 defaultTo("")），跨库通用。
+  t.string("claim_token", 64).notNullable().defaultTo("");
 }
 
 // ---------- 初始化 ----------

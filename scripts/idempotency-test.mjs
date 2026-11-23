@@ -25,7 +25,7 @@
  */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerHooks } from "node:module";
@@ -218,11 +218,15 @@ test("用例5：迁移后 idempotency_keys 表存在，且 SCHEMA_VERSION 变成
   assert.equal(versionRows.length, 1, `schema_version 应恰好 1 行，实际 ${versionRows.length} 行`);
   assert.equal(Number(versionRows[0].version), 6, `schema_version 应为 6，实际 ${versionRows[0].version}`);
 
-  // (c) 表结构：idempotency_keys 表真实存在且有 4 个列
+  // (c) 表结构：idempotency_keys 表真实存在且有 5 个列（fix-261123-04 W2 新增 claim_token）
   const cols = await database.prepare("PRAGMA table_info(idempotency_keys)").all();
   const colNames = cols.map((c) => c.name).sort();
   assert.ok(cols.length > 0, "idempotency_keys 表应存在");
-  assert.deepEqual(colNames, ["created_at", "key", "meeting_id", "scope"], `列应为 key/scope/meeting_id/created_at，实际 ${colNames}`);
+  assert.deepEqual(
+    colNames,
+    ["claim_token", "created_at", "key", "meeting_id", "scope"],
+    `列应为 key/scope/meeting_id/created_at/claim_token，实际 ${colNames}`
+  );
 });
 
 test("用例6：并发同 key createMeetingWithOutcome → meetings 恰好 +1（原子认领防双写）", async () => {
@@ -353,4 +357,100 @@ test("用例11：源码结构守卫 —— route.ts 的 LLM 触发条件必须�
     src.includes("if (!outcome.replayed"),
     "createMeeting 路由的 LLM 触发条件必须以 `if (!outcome.replayed` 打头（重放不得再触发 LLM）"
   );
+});
+
+/** 剥掉块注释与行注释（照抄 scripts/unsaved-work-test.mjs 的 stripComments），避免注释里的字面串造成假绿。 */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .map((line) => {
+      const slash = line.indexOf("//");
+      return slash === -1 ? line : line.slice(0, slash);
+    })
+    .join("\n");
+}
+
+function readRouteStripped(relPath) {
+  return stripComments(readFileSync(relPath, "utf8"));
+}
+
+test("用例12：TTL 回收不误删/不误改新认领者（旧持有者令牌无法影响新行）", async () => {
+  const key = "idem-ttl-not-cross-claim-key";
+  const database = await getDb();
+  const staleAt = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  // 手工插一条 20 分钟前的占位（旧持有者，claim_token='old-token'，meeting_id 空串）
+  await database
+    .prepare(`INSERT INTO idempotency_keys ("key", scope, meeting_id, created_at, claim_token) VALUES (?, ?, ?, ?, ?)`)
+    .run(key, "meeting.create", "", staleAt, "old-token");
+
+  // A 认领：TTL 回收旧行后以**新 token** 重认领成功（返回 claimed + 新 token）。
+  const claim = await withActor(() => store.claimIdempotencyKey(key, "meeting.create"));
+  assert.equal(claim.status, "claimed", "过期占位应被 TTL 回收后重认领成功");
+  const newToken = claim.token;
+  assert.ok(newToken && newToken !== "old-token", "新认领者的 token 必须不同于旧 token");
+
+  // 旧持有者拿自己的旧 token 试图影响：release / complete 都不应该命中新行。
+  await withActor(() => store.releaseIdempotencyKey(key, "old-token"));
+  await withActor(() => store.completeIdempotencyKey(key, "old-token", "meeting-x"));
+
+  const row = await database
+    .prepare(`SELECT claim_token, meeting_id FROM idempotency_keys WHERE "key" = ?`)
+    .get(key);
+  assert.ok(row, "旧持有者的 release/complete 不得删掉新认领者的行（行仍存在）");
+  assert.notEqual(row.meeting_id, "meeting-x", "meeting_id 绝不能被旧 token 改成 meeting-x");
+  assert.equal(row.meeting_id, "", "旧持有者的 complete 不得把 meeting_id 改掉（应仍为空串）");
+  assert.equal(row.claim_token, newToken, "行的 claim_token 应仍是新认领者的 token");
+
+  // 收尾：新持有者用自己的 token release，行应被正确删除（验证令牌确实能命中自己）。
+  await withActor(() => store.releaseIdempotencyKey(key, newToken));
+  const gone = await database.prepare(`SELECT 1 FROM idempotency_keys WHERE "key" = ?`).get(key);
+  assert.ok(!gone, "新持有者用自己的 token release 应能删掉自己那一行");
+});
+
+test("用例13：appendMeetingTranscriptWithOutcome 首次 replayed=false、第二次 replayed=true（同 id、不重复追加）", async () => {
+  const meeting = await withActor(() => store.createMeeting(meetingInput()));
+  assert.ok(meeting?.id, "前置：先建一个会议");
+  const rowsBefore = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meeting.id] }));
+
+  const key = `idem-append-outcome-key-${Math.random().toString(16).slice(2)}`;
+  const appendInput = () => ({
+    meetingId: meeting.id,
+    captureSessionId: `append-cap-${Math.random().toString(16).slice(2)}`,
+    captureSessionIds: [],
+    transcriptSegments: [
+      { id: `seg-${Math.random().toString(16).slice(2)}`, speaker: "spk-1", text: "一段转写", time: "00:01", timeSeconds: 1, isFinal: true },
+    ],
+    idempotencyKey: key,
+  });
+
+  const first = await withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput()));
+  assert.equal(first.replayed, false, "首次追加应为 replayed=false");
+  assert.equal(first.meeting?.id, meeting.id, "首次应返回同一会议");
+
+  const second = await withActor(() => store.appendMeetingTranscriptWithOutcome(appendInput()));
+  assert.equal(second.replayed, true, "第二次（同 key）应为 replayed=true");
+  assert.equal(second.meeting?.id, meeting.id, "重放应返回同一会议");
+
+  const rowsAfter = await withActor(() => rowCount("meeting_asr_results", { sql: "meeting_id = ?", params: [meeting.id] }));
+  assert.equal(rowsAfter, rowsBefore + 1, `重放不得重复追加，meeting_asr_results 应只 +1，实际 +${rowsAfter - rowsBefore}`);
+});
+
+test("用例14：源码结构守卫 —— PATCH 路由 [id]/route.ts 重放时必须立即 return（变异守卫）", async () => {
+  const routePath = join(repoRoot, "src", "app", "api", "meetings", "[id]", "route.ts");
+  const src = readRouteStripped(routePath);
+  const guardAt = src.indexOf("if (appendOutcome.replayed)");
+  assert.notEqual(guardAt, -1, "[id]/route.ts 必须存在 `if (appendOutcome.replayed)` 重放护栏");
+  const window = src.slice(guardAt, guardAt + 400);
+  assert.ok(
+    window.includes("return NextResponse.json({ meeting });"),
+    "重放护栏内必须紧跟 `return NextResponse.json({ meeting });`（重放不得再跑后续副作用）"
+  );
+});
+
+test("用例15：idempotency_keys 表有 claim_token 列（持有者令牌）", async () => {
+  const database = await getDb();
+  const cols = await database.prepare("PRAGMA table_info(idempotency_keys)").all();
+  const names = cols.map((c) => c.name);
+  assert.ok(names.includes("claim_token"), `idempotency_keys 应含 claim_token 列，实际 ${names.join(",")}`);
 });
