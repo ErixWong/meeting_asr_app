@@ -17,6 +17,7 @@ import {
 import { FunASRClient, getAudioDevices } from "@/lib/funasr";
 import { isStartCancelled } from "@/lib/recording-start-guard";
 import { confirmLeaveIfUnsaved, setHasUnsavedWork } from "@/lib/unsaved-work";
+import { newIdempotencyKey } from "@/lib/idempotency-key";
 import { getMeetingStatusMeta } from "@/lib/meeting-status";
 import { extractFeatures, clusterSpeakers, VoiceprintFeature } from "@/lib/voiceprint";
 import {
@@ -223,6 +224,15 @@ export default function MeetingPage() {
   const asrStopIntentRef = useRef(false);
   const persistedMeetingIdRef = useRef<string | null>(null);
   const persistedSegmentCountRef = useRef(0);
+  // fix-261123-04（issue #74-3）：一次「保存尝试系列」共用的幂等键。首次保存生成，
+  // 重试（重试保存按钮）时复用同一个值，服务端能认出是同一次保存。
+  const saveIdempotencyKeyRef = useRef<string | null>(null);
+  // fix-261123-04（issue #74-3）：ASR 断链时的 checkpoint 建会也要幂等 ——
+  // 双通道会各自触发 onError，`checkpointPromiseRef` 只挡住「同时」，挡不住「串行重入」。
+  const checkpointIdempotencyKeyRef = useRef<string | null>(null);
+  // fix-261123-04 验收 V1：同一次保存尝试重试时复用的标题。重试的请求体必须与首次一致，
+  // 否则服务端幂等命中会静默忽略新标题，所以重试不能再弹命名框。
+  const saveTitleRef = useRef<string | null>(null);
   // 上一次停止录音时的 capture session 绑定信息（issue #70 复审 R3）：
   // 保存失败后点「重试保存」时 asrClientsRef 已空，靠它把原始录音绑回会议。
   const lastCaptureRef = useRef<{ captureSessionId: string; captureSessionIds: string[] } | null>(null);
@@ -602,12 +612,17 @@ export default function MeetingPage() {
     let meetingId = persistedMeetingIdRef.current;
 
     if (!meetingId) {
+      // fix-261123-04（issue #74-3）：ASR 断链时的 checkpoint 建会也要幂等 ——
+      // 双通道会各自触发 onError，`checkpointPromiseRef` 只挡住「同时」，挡不住「串行重入」。
+      const checkpointKey =
+        checkpointIdempotencyKeyRef.current ??
+        (checkpointIdempotencyKeyRef.current = newIdempotencyKey());
       const now = new Date();
       const pad = (value: number) => value.toString().padStart(2, "0");
       const title = `录音 ${now.getMonth() + 1}月${now.getDate()}日 ${pad(now.getHours())}:${pad(now.getMinutes())}`;
       const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": checkpointKey },
         body: JSON.stringify({
           title,
           sourceType: "live_recording",
@@ -623,6 +638,8 @@ export default function MeetingPage() {
       meetingId = createdMeeting?.id ?? null;
       if (!meetingId) throw new Error("ASR checkpoint meeting was not created");
       persistedMeetingIdRef.current = meetingId;
+      // checkpoint 建会成功：结束本次 checkpoint 保存系列，下次断链重新生成幂等键（issue #74-3）。
+      checkpointIdempotencyKeyRef.current = null;
       persistedSegmentCountRef.current = segments.length;
       if (createdMeeting) {
         setMeetings((prev) => [createdMeeting, ...prev]);
@@ -927,6 +944,12 @@ export default function MeetingPage() {
     asrRecoveryRef.current = false;
     if (!preserveTranscript) {
       persistedMeetingIdRef.current = null;
+      // 新一轮录音：作废上一轮的幂等键（issue #74-3）。
+      saveIdempotencyKeyRef.current = null;
+      // 新一轮录音：上一轮的 checkpoint 幂等键也必须作废（issue #74-3）。
+      // 否则「POST 其实已提交但响应丢了」时，新录音的 checkpoint 会用旧键取回上一次的旧会议。
+      checkpointIdempotencyKeyRef.current = null;
+      saveTitleRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);
@@ -1235,8 +1258,29 @@ export default function MeetingPage() {
     // ⚠ 不能把 prompt 前移到停止录音之前：window.prompt 同步阻塞主线程，而音频处理跑在
     // ScriptProcessorNode.onaudioprocess（funasr.ts:399-409），阻塞期间 PCM 帧会被丢弃，
     // 等于把「丢转写」换成「丢音频」。
-    const name = window.prompt("请输入录音名称：", defaultName);
-    const title = (name ?? "").trim() || defaultName;
+    // 是否重试：幂等键已存在 = 之前那次保存请求已发出（issue #74-3 验收 V1）。
+    const isRetry = saveIdempotencyKeyRef.current != null;
+    // 同一个「保存尝试系列」复用同一个幂等键：重试时服务端能认出这是同一次保存，
+    // 不会因为「上次其实已提交、只是响应丢了」而重复建会议 / 重复追加转写（issue #74-3）。
+    // ⚠ 不直接用 crypto.randomUUID()：它只在安全上下文可用，本应用按 http://<内网IP>:3123 部署，
+    // 那里它是 undefined，每次保存都会抛错；newIdempotencyKey() 已按能力逐级降级。
+    const idempotencyKey =
+      saveIdempotencyKeyRef.current ??
+      (saveIdempotencyKeyRef.current = newIdempotencyKey());
+
+    // 首次弹框命名；重试（已有幂等键）复用上次的标题，不再弹框：请求体必须与首次一致，
+    // 否则服务端幂等命中会静默忽略新标题（验收 V1）。
+    // ⚠ 首次 prompt 仍留在停止录音之后（阻塞主线程会丢 PCM 帧），这里只调整同一次保存内部的取值顺序。
+    let name: string | null;
+    let title: string;
+    if (isRetry && saveTitleRef.current) {
+      name = saveTitleRef.current;
+      title = saveTitleRef.current;
+    } else {
+      name = window.prompt("请输入录音名称：", defaultName);
+      title = (name ?? "").trim() || defaultName;
+      saveTitleRef.current = title;
+    }
     setSavingMeeting(true);
     try {
       const existingMeetingId = persistedMeetingIdRef.current;
@@ -1256,7 +1300,7 @@ export default function MeetingPage() {
           })
         : await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
             body: JSON.stringify({
               title,
               sourceType: "live_recording",
@@ -1289,6 +1333,9 @@ export default function MeetingPage() {
         });
       }
       persistedMeetingIdRef.current = null;
+      // 保存成功：结束本次「保存尝试系列」，下次保存重新生成幂等键（issue #74-3）。
+      saveIdempotencyKeyRef.current = null;
+      saveTitleRef.current = null;
       persistedSegmentCountRef.current = 0;
       lastCaptureRef.current = null;
       setLiveSegments([]);
@@ -1696,6 +1743,11 @@ export default function MeetingPage() {
           const title = name.trim() || defaultName;
           setSavingMeeting(true);
           const uploadCaptureSessionId = client.getCaptureSessionId();
+          // 上传**故意不带幂等键**（issue #74-3）：
+          //   1) 上传没有「重试」入口，每次上传都是用户的一次独立意图；
+          //   2) 用文件身份派生确定性键会让「有意重复上传同一个文件」被误去重、拿回旧会议；
+          //   3) 直接拼接文件名可能超出 idempotency_keys.key 的 128 字符上限（MySQL/MSSQL 会插入失败）。
+          // 代价：上传的响应丢失后用户重传会产生两条会议 —— 用户可见、可删，接受。
           const data = await requestJson<{ meeting?: MeetingRecord }>("/api/meetings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },

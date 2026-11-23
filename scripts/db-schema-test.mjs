@@ -23,7 +23,7 @@
  *      `CREATE TABLE` 只许出现在 server/db/*.mjs（唯一 schema 实现）——见
  *      assertSingleSchemaImplementation()。本项目三次栽在「两份 schema 实现、
  *      测的和跑的不是同一份」上，这条守卫让第二份 schema 一出现就红。
- *   1. 全新库初始化（knex）→ 16 张表 + schema_version = SCHEMA_VERSION（单行）
+ *   1. 全新库初始化（knex）→ 17 张表 + schema_version = SCHEMA_VERSION（单行）
  *   2. 幂等（knex）：连续两次初始化 → 单行、第二次无 Migration applied、表结构不变
  *   3. 旧库迁移（knex）：构造 v0 旧结构 → 数据搬迁 + legacy 清理 + 录音表
  *   4. 被污染库（knex）：schema_version = [2,3,3] / [2,2] → 收敛成单行 = SCHEMA_VERSION
@@ -414,13 +414,13 @@ async function main() {
   const tableNames = tables.map((r) => r.name).sort();
   const expected = [
     "app_settings", "asr_capture_events", "asr_capture_sessions", "asr_hotwords",
-    "audit_logs", "auth_sessions", "llm_prompt_templates", "meeting_asr_results",
+    "audit_logs", "auth_sessions", "idempotency_keys", "llm_prompt_templates", "meeting_asr_results",
     "meeting_llm_results", "meeting_send_records", "meetings", "roles",
     "schema_version", "user_roles", "users", "meeting_audio_recordings",
   ].sort();
   assert(JSON.stringify(tableNames) === JSON.stringify(expected), `表清单不符: ${tableNames}`);
   assertSingleVersionRow(await knexVersionRows(db), "场景1");
-  console.log(`✅ 场景1 全新库初始化: 16 张表 + schema_version=${KNEX_SCHEMA_VERSION}（单行）`);
+  console.log(`✅ 场景1 全新库初始化: 17 张表 + schema_version=${KNEX_SCHEMA_VERSION}（单行）`);
 
   // --- 场景 2：幂等（连续两次，第二次不得有 Migration applied、结构不变）---
   const structureBefore2 = await knexStructure(db);
@@ -748,7 +748,7 @@ export const CI_DB_PREFIX = "meeting_asr_ci_";
 /** 期望的基线表清单（createTables 产出，含 schema_version） */
 const EXPECTED_TABLES = [
   "app_settings", "asr_capture_events", "asr_capture_sessions", "asr_hotwords",
-  "audit_logs", "auth_sessions", "llm_prompt_templates", "meeting_asr_results",
+  "audit_logs", "auth_sessions", "idempotency_keys", "llm_prompt_templates", "meeting_asr_results",
   "meeting_llm_results", "meeting_send_records", "meetings", "roles",
   "schema_version", "user_roles", "users", "meeting_audio_recordings",
 ].sort();
@@ -889,7 +889,7 @@ async function runDialectSuite(db, dbType) {
   await initializeSchema(db);
   const tables = await listTableNames(db);
   check(
-    "基线建表 16 张表齐全",
+    "基线建表 17 张表齐全",
     JSON.stringify(tables) === JSON.stringify(EXPECTED_TABLES),
     `${tables.length} 张: ${tables.join(", ")}`
   );

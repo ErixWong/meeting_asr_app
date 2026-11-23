@@ -99,6 +99,19 @@ function defineMeetingSendRecordsTable(t) {
   t.foreign("sent_by_user_id").references("users.id").onDelete("NO ACTION");
 }
 
+function defineIdempotencyKeysTable(t) {
+  // fix-261123-04（issue #74-3）：保存重试的幂等键登记表。
+  // 主键写法照抄同文件其它表（单列主键用 t.string(...).primary()，不写 .notNullable()）。
+  t.string("key", 128).primary();
+  t.string("scope", 64).notNullable();
+  t.string("meeting_id", 64).notNullable();
+  t.string("created_at", 32).notNullable();
+  // fix-261123-04 验收 W2：认领持有者令牌。TTL 回收 / complete / release 都带上它，
+  // 保证「只改自己刚认领到的那一行」，慢请求不会误删/误改新认领者的占位。
+  // .defaultTo("") 写法照抄同文件（如 app_settings.item_mark 的 defaultTo("")），跨库通用。
+  t.string("claim_token", 64).notNullable().defaultTo("");
+}
+
 // ---------- 初始化 ----------
 
 /**
@@ -219,6 +232,9 @@ export async function createTables(db) {
 
   await createTableIfAbsent(db, "meeting_send_records", defineMeetingSendRecordsTable);
 
+  // fix-261123-04（issue #74-3）：新库走基线建表（与下面迁移 v6 共用同一个 defineIdempotencyKeysTable）。
+  await createTableIfAbsent(db, "idempotency_keys", defineIdempotencyKeysTable);
+
   await createTableIfAbsent(db, "asr_capture_sessions", (t) => {
     t.string("capture_session_id", 64).primary();
     t.string("task_id", 64).notNullable();
@@ -314,6 +330,17 @@ export async function createIndexes(db) {
 // ---------- 迁移 ----------
 
 export const MIGRATIONS = [
+  {
+    version: 6,
+    name: "idempotency-keys",
+    async up(db) {
+      // fix-261123-04（issue #74-3）：保存重试的幂等键。
+      // 客户端在一次「保存尝试系列」里复用同一个 key；服务端按 key 去重，
+      // 使「服务端已提交但响应丢失 → 用户点重试」不会重复建会议 / 重复追加转写。
+      // 新库由 createTables 的基线直接带上；老库在此补建（两处共用同一个 defineIdempotencyKeysTable）。
+      await createTableIfAbsent(db, "idempotency_keys", defineIdempotencyKeysTable);
+    },
+  },
   {
     version: 5,
     name: "meeting-audio-recordings-purged-at",
