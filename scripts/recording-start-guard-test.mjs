@@ -59,7 +59,13 @@ test("源码结构守卫：循环开头到 new FunASRClient() 之间有 abortIfC
   const newClientAt = pageSource.indexOf("const client = new FunASRClient();", loopAt);
   assert.notEqual(newClientAt, -1, "找不到循环内 new FunASRClient()");
   const between = pageSource.slice(loopAt, newClientAt);
-  assert.match(between, /abortIfCancelled\(\)/, "每轮开头必须检查取消（abortIfCancelled()）");
+  // 必须匹配**真实语句**而不是「文本里出现过 abortIfCancelled()」：
+  // 否则 `// if (abortIfCancelled()) return;` 这种注释掉的行也会被当成命中（验收 V4）。
+  assert.match(
+    between,
+    /\n\s*if \(abortIfCancelled\(\)\) return;/,
+    "每轮开头必须有真实的 if (abortIfCancelled()) return; 语句（注释掉不算）"
+  );
 });
 
 test("源码结构守卫：started.push(client) 之后紧接 if (abortIfCancelled()) return;", () => {
