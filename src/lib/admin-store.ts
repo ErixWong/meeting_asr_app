@@ -2672,8 +2672,9 @@ export type CreateMeetingOutcome = {
  * fix-261123-04 验收 X1：幂等键完成已搬进业务事务内部（见 createMeetingUncached 的 onCommitted），
  * 会议插入与 key 完成要么一起提交、要么一起回滚；令牌失效时抛 IdempotencyConflictError 且不新增会议。
  *
- * 幂等边界：覆盖**本函数内**的写入。调用方在函数返回后追加的副作用（如路由层的 LLM 触发）
- * 若中途失败，重放会跳过它们 —— 这是已知限制，二次副作用必须自身幂等或可重试。
+ * 幂等边界：覆盖**本函数内**的写入（会议 + 幂等键在同一事务里提交）。
+ * 路由层在函数返回后触发的 LLM 生成不在边界内 —— 若首次请求在触发前中断，
+ * 重放会跳过它（会议已建好，可在界面手动重新生成）。
  */
 export async function createMeetingWithOutcome(input: MeetingInput): Promise<CreateMeetingOutcome> {
   const idempotencyKey = String(input.idempotencyKey ?? "").trim();
@@ -2711,31 +2712,15 @@ export async function createMeeting(input: MeetingInput) {
   return (await createMeetingWithOutcome(input)).meeting;
 }
 
-/** appendMeetingTranscript 的入参形状（供 uncached 实现与带幂等的包装共用）。 */
+/** appendMeetingTranscript 的入参形状。 */
 type AppendMeetingTranscriptInput = {
   meetingId: string;
   captureSessionId: string;
   captureSessionIds?: string[];
   transcriptSegments: MeetingTranscriptSegment[];
-  /** fix-261123-04（issue #74-3）：保存重试的幂等键。 */
-  idempotencyKey?: string | null;
 };
 
-/**
- * fix-261123-04 验收 W6：追加重放的结果形状。
- * replayed=true 表示命中幂等键、本次没执行任何副作用（路由据此不再跑 finalize 的 LLM 触发）。
- */
-export type AppendTranscriptOutcome = {
-  meeting: Awaited<ReturnType<typeof appendMeetingTranscriptUncached>>;
-  replayed: boolean;
-  /** 首次追加时返回认领令牌（供路由在所有副作用完成后调 completeIdempotencyKey）；重放/已落地时为 null。 */
-  claimToken: string | null;
-};
-
-async function appendMeetingTranscriptUncached(
-  input: AppendMeetingTranscriptInput,
-  completeInTx?: { key: string; token: string }
-) {
+async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInput) {
   const existing = await getMeetingById(input.meetingId);
   if (!existing) return null;
 
@@ -2816,86 +2801,20 @@ async function appendMeetingTranscriptUncached(
       captureSessionIds: collectCaptureSessionIds(input),
     }, tx);
 
-    // fix-261101-01 / fix-261123-04 验收 A4：直调路径（appendMeetingTranscript）把幂等键完成放在
-    // **追加事务内部**，与转写写入同生共死；令牌失效则抛错回滚，不留下「已追加、key 未指向」的半成品。
-    if (completeInTx) {
-      const ok = await completeIdempotencyKey(completeInTx.key, completeInTx.token, input.meetingId, tx);
-      if (!ok) throw new IdempotencyConflictError("幂等键已被回收，请重试");
-    }
-
     return await getMeetingById(input.meetingId, tx);
   });
 }
 
 /**
- * 追写转写的共享实现：先认领幂等键，再执行追加。
+ * 追加一段转写到已有会议：写入 meeting_asr_results、更新时间、绑定录音。
  *
- * @param completeInTx true = 在**追加事务内部**就把幂等键完成（直调路径 appendMeetingTranscript）；
- *                     false = 只认领+追加，**不在内部 complete**，把 claimToken 透出给调用方（路由），
- *                     由路由在标题/状态/LLM 等全部副作用完成后才调 completeIdempotencyKey（验收 X2）。
- *                     追加失败/无转写时无论何种模式都 release 认领，避免 key 卡在「进行中」。
- */
-async function runAppendWithClaim(
-  input: AppendMeetingTranscriptInput,
-  completeInTx: boolean
-): Promise<AppendTranscriptOutcome> {
-  const idempotencyKey = String(input.idempotencyKey ?? "").trim();
-  if (!idempotencyKey) {
-    return { meeting: await appendMeetingTranscriptUncached(input), replayed: false, claimToken: null };
-  }
-  const claim = await claimIdempotencyKey(idempotencyKey, "meeting.append", input.meetingId);
-  if (claim.status === "replayed") {
-    return { meeting: await getMeetingById(claim.meetingId), replayed: true, claimToken: null };
-  }
-  if (claim.status === "in_progress") {
-    throw new IdempotencyInProgressError("同一追加请求正在处理中，请稍候重试");
-  }
-  if (claim.status === "conflict") {
-    throw new IdempotencyConflictError(`幂等键冲突：${claim.reason}`);
-  }
-  try {
-    const meeting = await appendMeetingTranscriptUncached(
-      input,
-      completeInTx ? { key: idempotencyKey, token: claim.token } : undefined
-    );
-    if (!meeting) {
-      // 会议不存在 / 无转写文本：没做任何实质副作用，释放认领后重试。
-      await releaseIdempotencyKey(idempotencyKey, claim.token);
-      return { meeting, replayed: false, claimToken: null };
-    }
-    // completeInTx=true 时 key 已在事务内落地，claimToken 返回 null（调用方无需再 complete）；
-    // completeInTx=false（路由路径）时把 token 透出，由路由在全部副作用后 complete。
-    return { meeting, replayed: false, claimToken: completeInTx ? null : claim.token };
-  } catch (error) {
-    await releaseIdempotencyKey(idempotencyKey, claim.token).catch(() => {});
-    throw error;
-  }
-}
-
-/**
- * appendMeetingTranscript 的带结果版本：先认领幂等键，返回 { meeting, replayed, claimToken }。
- * 带 expectedMeetingId 防止“会议 A 的 key 打到会议 B”；in_progress / conflict 抛对应错误。
- * replayed=true 表示本次没执行任何副作用（上一次请求已全部写完），路由据此不再重复触发 LLM。
- *
- * fix-261123-04 验收 X2：**不在内部 complete**（只 claim + 追加 + 失败时 release）；首次追加
- * 时把认领令牌 claimToken 透出，由 PATCH 路由在标题/状态/LLM 等全部副作用完成后才调
- * completeIdempotencyKey，让幂等边界覆盖路由的全部副作用。
- *
- * 幂等边界：覆盖**本函数内**的写入。调用方在函数返回后追加的副作用（如路由层的 LLM 触发）
- * 若中途失败，重放会跳过它们 —— 这是已知限制，二次副作用必须自身幂等或可重试。
- */
-export async function appendMeetingTranscriptWithOutcome(
-  input: AppendMeetingTranscriptInput
-): Promise<AppendTranscriptOutcome> {
-  return runAppendWithClaim(input, false);
-}
-
-/**
- * 兼容薄包装：保持原有签名（仍返回会议或 null）；in_progress / conflict 抛对应错误。
- * 直调路径（非路由）在**追加事务内部**就完成幂等键（completeInTx=true），保留原有的同 key 去重语义。
+ * 注意（issue #74-3，五审 Y2/Y5）：**这里不做幂等**。PATCH 路由的追加、标题、状态、LLM 触发
+ * 分散在多个事务里，单个幂等键无法原子覆盖全部副作用，所以故意不加认领/完成逻辑；
+ * 代价是 PATCH 响应丢失后重试会重复追加同一段转写（已知限制，见 issue #74）。
+ * 要真正幂等，必须先把这些副作用收进同一个事务。
  */
 export async function appendMeetingTranscript(input: AppendMeetingTranscriptInput) {
-  return (await runAppendWithClaim(input, true)).meeting;
+  return appendMeetingTranscriptUncached(input);
 }
 
 export async function updateMeetingStatus(id: string, status: string, lastErrorMessage?: string | null, db?: AsyncDatabase) {

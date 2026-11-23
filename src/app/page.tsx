@@ -1274,7 +1274,7 @@ export default function MeetingPage() {
       const data = existingMeetingId
         ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
             method: "PATCH",
-            headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,
