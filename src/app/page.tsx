@@ -1287,7 +1287,9 @@ export default function MeetingPage() {
       const data = existingMeetingId
         ? await requestJson<{ meeting?: MeetingRecord }>(`/api/meetings/${existingMeetingId}`, {
             method: "PATCH",
-            headers: { "Content-Type": "application/json" },
+            // 与 POST 共用同一个幂等键（issue #74）：服务端把「追加 + 标题 + 状态」收进了单事务，
+            // 所以「已提交但响应丢了」的重试不会重复追加同一段转写。
+            headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
             body: JSON.stringify({
               appendTranscriptSegments: finalSegments.slice(persistedSegmentCountRef.current),
               captureSessionId: recordingCaptureSessionId || `capture-${Date.now()}`,

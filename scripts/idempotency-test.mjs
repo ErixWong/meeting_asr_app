@@ -25,10 +25,10 @@
  *  19. 源码结构守卫：ASR checkpoint 的 POST /api/meetings 带 "Idempotency-Key": checkpointKey。
  *  20'. 源码结构守卫（验收 A1）：startRecording 的「新一轮录音」分支（if (!preserveTranscript)）里必须同时
  *      作废 saveIdempotencyKeyRef 与 checkpointIdempotencyKeyRef；上传路径不再出现 uploadIdempotencyKey；
- *      全文件 "Idempotency-Key" 恰好 2 处（主保存 + checkpoint）。
+ *      全文件 "Idempotency-Key" 恰好 3 处（主保存 POST + 主保存 PATCH + checkpoint；PATCH 那处由 fix-261125-01 加回）。
  *
- * **PATCH（追加转写）不做幂等**：追加/标题/状态/LLM 分散在多个事务里，一个幂等键无法原子覆盖。
- * 已知限制：PATCH 的响应丢失后重试会重复追加同一段转写（见 issue #74）。
+ * **PATCH（保存重试）现在也是幂等的**（fix-261125-01）：追加/标题/状态已收进
+ * `finalizeMeetingSave` 的单事务，专用测试见 scripts/meeting-save-test.mjs（npm run test:meeting-save）。
  *
  * 四条路径各自的幂等策略（fix-261123-04 验收 Z1 + A1）：
  *   | 路径 | 幂等 | 键的来源 |
@@ -36,7 +36,7 @@
  *   | 主保存（停止录音） | ✅ | saveIdempotencyKeyRef，一次保存尝试系列复用；新一轮录音作废 |
  *   | ASR checkpoint | ✅ | checkpointIdempotencyKeyRef，建会成功后清空；新一轮录音也作废（验收 A1：否则「POST 已提交但响应丢了」时，下一次录音的 checkpoint 会用旧键取回上一次的旧会议） |
  *   | 文件上传 | ❌ | **不做**（验收 A1）：①上传没有重试入口，每次上传都是用户的一次独立意图；②用文件身份派生确定性键会把「有意重复上传同一个文件」误去重、拿回旧会议；③直接拼接文件名可能超出 idempotency_keys.key 的 VARCHAR(128) 上限（MySQL/MSSQL 插入失败）。代价：响应丢失后重传会产生两条会议（用户可见、可删，接受） |
- *   | PATCH 追加转写 | ❌ | **不做**（多事务，见 issue #74） |
+ *   | PATCH 保存（追加+标题+状态） | ✅ | **与主保存同一个键**（fix-261125-01：单事务 + 事务内完成 key） |
  *
  * 运行：npm run test:idempotency
  */
@@ -462,7 +462,8 @@ test("用例20'：新一轮录音必须作废 checkpoint 幂等键，且上传�
     !pageSourceStripped.includes("uploadIdempotencyKey"),
     "上传路径必须去掉 uploadIdempotencyKey（确定性派生键语义错且可能超长，验收 A1）"
   );
-  // (c) 只剩两条带键的 POST：主保存 + checkpoint。
+  // (c) 带键的请求：主保存 POST + 主保存 PATCH（fix-261125-01，issue #74：「追加+标题+状态」已收进单事务，
+  // 所以 PATCH 重试也可以带同一个键）+ checkpoint，共 3 处。
   const headerCount = (pageSourceStripped.match(/"Idempotency-Key"/g) ?? []).length;
-  assert.equal(headerCount, 2, `page.tsx 里 "Idempotency-Key" 必须只剩 2 处（主保存 + checkpoint），实际 ${headerCount}`);
+  assert.equal(headerCount, 3, `page.tsx 里 "Idempotency-Key" 必须是 3 处（主保存 POST + 主保存 PATCH + checkpoint），实际 ${headerCount}`);
 });

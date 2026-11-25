@@ -27,6 +27,7 @@
     "test:recording-guard": "node --test scripts/recording-start-guard-test.mjs",
     "test:unsaved-work": "node --test scripts/unsaved-work-test.mjs",
     "test:idempotency": "node --test scripts/idempotency-test.mjs",
+    "test:meeting-save": "node --test scripts/meeting-save-test.mjs",
     "test:idempotency-key": "node --test scripts/idempotency-key-test.mjs",
     "test:bootstrap-admin": "node --test scripts/bootstrap-admin-test.mjs"
   },
