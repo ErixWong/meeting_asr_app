@@ -3099,6 +3099,11 @@ export async function finalizeMeetingSave(input: FinalizeMeetingSaveInput): Prom
 
   const claim = key ? await claimIdempotencyKey(key, MEETING_SAVE_IDEMPOTENCY_SCOPE) : null;
   if (claim?.status === "replayed") {
+    // 幂等键必须绑定到同一个会议：同一个 key 被用到别的会议上时，绝不能把 A 的保存结果返回给 B
+    // （否则 B 的 PATCH 会收到 A 的会议，且 B 一行都没改）。返回 409 让调用方重试/换 key。
+    if (claim.meetingId !== input.meetingId) {
+      throw new IdempotencyConflictError("幂等键已绑定到另一个会议");
+    }
     return { meeting: await getMeetingById(claim.meetingId), replayed: true };
   }
   if (claim?.status === "in_progress") {
@@ -3732,8 +3737,10 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
  * 一次生成在飞（此时 `claimMeetingLlmGeneration` 本来也会 409）。
  *
  * ⚠ 取舍（按任务里允许的退路）：不再细分「那一条是不是默认模板生成的」——只要存在任意一条
- * `status <> "failed"` 的结果（包括手动重生成、翻译结果）就跳过。宁可少触发一次（用户可在界面
+ * `status <> "failed"` 的**纪要类**结果（包括手动重生成的纪要）就跳过。宁可少触发一次（用户可在界面
  * 手动重新生成），也不要重复生成（多烧一次 token、还把结果版本往后堆）。
+ * 例外：`result_type = "translation"` 不算「纪要已生成」（验收 V4）——一个只做过翻译的会议，
+ * finalize 之后仍然要触发默认纪要生成，否则行为与改动前不一致。
  *
  * 与 `createMeetingLlmResult` 一样**不等生成完成**（fire-and-forget）；失败由
  * `createMeetingLlmResultInner` 内部把会议置为 `llm_failed`。
@@ -3747,7 +3754,9 @@ export async function ensureMeetingLlmResult(meetingId: string): Promise<{ trigg
   }
 
   const results = await listMeetingLlmResultsByMeetingId(meetingId);
-  if (results.some((item) => String(item.status ?? "") !== "failed")) {
+  // 只把「纪要类」结果当作已生成：translation 是另一种产物，不能替掉默认纪要（验收 V4）。
+  // title 已被 listMeetingLlmResultsByMeetingId 排除，这里再排除 translation。
+  if (results.some((item) => String(item.status ?? "") !== "failed" && item.resultType !== "translation")) {
     return { triggered: false };
   }
 

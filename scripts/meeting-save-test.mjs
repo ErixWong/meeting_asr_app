@@ -20,6 +20,14 @@
  *   8. 同一 key 用在别的 scope → 抛 IdempotencyConflictError。
  *   9. 源码结构守卫：PATCH 路由确实换成 finalizeMeetingSave / ensureMeetingLlmResult / 409 映射，
  *      page.tsx 的 PATCH headers 重新带上 "Idempotency-Key"。
+ *  10. 同一个 key 用到别的会议上 → 抛 IdempotencyConflictError，且 B 一行没被改、A 也不变
+ *      （一审判 V3：不绑会议的幂等重放会把 A 的会议返回给 B）。
+ *      变异守卫：删掉 `claim.meetingId !== input.meetingId` 的抛错 → 本用例转红。
+ *  11. 只有一条 translation 成功结果时 ensureMeetingLlmResult 仍必须 triggered=true
+ *      （一审判 V4：翻译结果不能当成「纪要已生成」而跳过默认纪要）。
+ *      变异守卫：去掉 `item.resultType !== "translation"` → 本用例转红。
+ *  12. 存在性优先：PATCH 里 getMeetingById(id) 的 404 分支必须排在 body.status 参数校验之前
+ *      （一审判 V5：不存在的会议 + 非法参数必须是 404，不是 400；路由层用源码结构守卫）。
  *
  * 运行：npm run test:meeting-save
  */
@@ -561,5 +569,174 @@ test("用例9：PATCH 路由改用 finalizeMeetingSave + ensureMeetingLlmResult 
   assert.ok(
     patchCalls.some((chunk) => chunk.includes('"Idempotency-Key": idempotencyKey')),
     'stopRecordingInner 的 PATCH headers 必须带 "Idempotency-Key": idempotencyKey（与 POST 同一个键）'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 10. 幂等键必须绑定会议（一审判 V3）
+// ---------------------------------------------------------------------------
+
+/** 插一行 meeting_llm_results（字段全按基线表结构给齐；prompt_template_id 有外键，先复用/补建模板）。 */
+async function insertLlmResultRow(meetingId, { resultType, status, versionNo }) {
+  const database = await getDb();
+  const existingTemplate = await database.prepare(`SELECT id FROM llm_prompt_templates LIMIT 1`).get();
+  let promptTemplateId = existingTemplate?.id;
+  if (!promptTemplateId) {
+    promptTemplateId = `tpl-test-${Math.random().toString(16).slice(2)}`;
+    const now = new Date().toISOString();
+    await database
+      .prepare(
+        `INSERT INTO llm_prompt_templates
+         (id, template_key, template_name, template_type, content, description, status, is_system, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(promptTemplateId, promptTemplateId, "测试模板", resultType, "内容", "", "active", 0, now, now);
+  }
+  const now = new Date().toISOString();
+  await database
+    .prepare(
+      `INSERT INTO meeting_llm_results
+       (id, meeting_id, input_transcript_snapshot, llm_setting_mark, prompt_template_id,
+        generation_config_snapshot, generation_mode, status, version_no, result_type,
+        result_title, raw_prompt, raw_response, result_markdown, error_message, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      `llm-test-${Math.random().toString(16).slice(2)}`,
+      meetingId,
+      "测试用的转写快照",
+      "current",
+      promptTemplateId,
+      JSON.stringify({ source: "test" }),
+      "manual_regenerate",
+      status,
+      versionNo,
+      resultType,
+      `测试${resultType}`,
+      "",
+      "",
+      "测试正文",
+      null,
+      now
+    );
+}
+
+test("用例10：同一个 key 用到别的会议上 → 抛 IdempotencyConflictError，且 B 一行没改、A 也不变", async () => {
+  // 变异守卫：删掉 finalizeMeetingSave 里 `claim.meetingId !== input.meetingId` 的抛错 ⇒
+  // 对 B 的调用不抱错而是 replayed=true 并返回 A 的会议，下面 assert.rejects 立即转红。
+  const meetingA = await newMeeting();
+  const meetingB = await newMeeting();
+  const key = `save-cross-meeting-${meetingA.id}`;
+
+  // 第 1 步：key 先用在会议 A 上（带标题 + 追加），正常落库。
+  const firstOnA = await withActor(() =>
+    store.finalizeMeetingSave({
+      meetingId: meetingA.id,
+      appendTranscriptSegments: [segment("A 的正文")],
+      captureSessionId: "capture-cross-a",
+      title: "A 的标题",
+      idempotencyKey: key,
+    })
+  );
+  assert.equal(firstOnA.replayed, false, "前置：A 首次保存必须真的执行");
+  assert.equal(firstOnA.meeting?.title, "A 的标题");
+
+  // 基线：B 与 A 当前的标题 / 段数 / asr 行数
+  const bBefore = await withActor(() => store.getMeetingById(meetingB.id));
+  const bTitleBefore = bBefore?.title;
+  const bSegmentsBefore = (await transcriptOf(meetingB.id)).length;
+  const bAsrBefore = await asrRowCount(meetingB.id);
+  const aSegmentsBefore = (await transcriptOf(meetingA.id)).length;
+
+  // 第 2 步：同一个 key 打到会议 B 上 → 必须冲突（旧行为：replayed=true 且拿到 A 的会议）。
+  await assert.rejects(
+    () =>
+      withActor(() =>
+        store.finalizeMeetingSave({
+          meetingId: meetingB.id,
+          appendTranscriptSegments: [segment("B 的正文")],
+          captureSessionId: "capture-cross-b",
+          title: "B 的新标题",
+          idempotencyKey: key,
+        })
+      ),
+    (error) => error instanceof store.IdempotencyConflictError,
+    "同 key 跳会议必须抛 IdempotencyConflictError（路由映射 409，而不是静默返回 A）"
+  );
+
+  const bAfter = await withActor(() => store.getMeetingById(meetingB.id));
+  assert.equal(bAfter?.title, bTitleBefore, "B 的标题必须原封不动（旧行为下这里是 B 的旧标题、但断言不会跑列）");
+  assert.notEqual(bAfter?.title, "B 的新标题", "B 的标题不能被这次冲突改写");
+  assert.equal((await transcriptOf(meetingB.id)).length, bSegmentsBefore, "B 的转写段数必须不变");
+  assert.equal(await asrRowCount(meetingB.id), bAsrBefore, "B 不能被写入 meeting_asr_results");
+
+  const aAfter = await withActor(() => store.getMeetingById(meetingA.id));
+  assert.equal(aAfter?.title, "A 的标题", "A 仍保有首次保存的结果");
+  assert.equal((await transcriptOf(meetingA.id)).length, aSegmentsBefore, "A 的段数不能被这次冲突改变");
+});
+
+// ---------------------------------------------------------------------------
+// 11. 翻译结果不阻断默认纪要（一审判 V4）
+// ---------------------------------------------------------------------------
+
+test("用例11：只有一条 translation 成功结果 → ensureMeetingLlmResult 仍必须 triggered=true", async () => {
+  // 变异守卫：把 `&& item.resultType !== "translation"` 去掉 → 这里变成 triggered=false 而转红。
+  const meeting = await newMeeting();
+
+  // 与用例5 一致：把 llm.base_url 指向本地桩，使触发的生成能真跑完。
+  const database = await getDb();
+  await database
+    .prepare(`UPDATE app_settings SET item_value = ? WHERE item_section = ? AND item_mark = ?`)
+    .run(`http://127.0.0.1:${llmStubPort}/v1`, "llm", "base_url");
+
+  await insertLlmResultRow(meeting.id, { resultType: "translation", status: "succeeded", versionNo: 1 });
+  assert.equal(await llmResultCount(meeting.id), 1, "前置：已写入 1 行 translation 成功结果");
+
+  const triggered = await withActor(() => store.ensureMeetingLlmResult(meeting.id));
+  assert.equal(triggered.triggered, true, "只做过翻译的会议仍必须触发默认纪要生成（删掉 translation 排除应变红）");
+
+  // 等火忘生成跑完，再看控制组：现在多了一条非 translation 的成功结果，必须改为跳过。
+  for (let i = 0; i < 200 && (await llmResultCount(meeting.id)) < 2; i += 1) {
+    await llmQueue.whenQuiescent();
+  }
+  const usableMinutes = await database
+    .prepare(
+      `SELECT COUNT(*) AS c FROM meeting_llm_results WHERE meeting_id = ? AND result_type <> 'translation' AND status = 'succeeded'`
+    )
+    .get(meeting.id);
+  assert.ok(
+    Number(usableMinutes?.c ?? 0) >= 1,
+    "前置：触发的生成必须真的写入 1 行非 translation 的成功结果（否则控制组没有意义）"
+  );
+
+  const second = await withActor(() => store.ensureMeetingLlmResult(meeting.id));
+  assert.equal(second.triggered, false, "已经有一份纪要类成功结果时必须跳过（不能变成无脑重试）");
+
+  await llmQueue.whenQuiescent();
+});
+
+// ---------------------------------------------------------------------------
+// 12. 404 优先于 400（一审判 V5，路由层源码结构守卫）
+// ---------------------------------------------------------------------------
+
+test("用例12：PATCH 路由的存在性 404 必须排在 body.status 参数校验之前", () => {
+  // 本仓库测试不拉 Next 服务，拿不到真 HTTP 响应，所以用源码结构守卫：
+  // 断言 PATCH 函数体里 `getMeetingById(id)` → 404 的分支位置早于 `body.status !== undefined` 校验。
+  // 变异方式：删掉新加的 existing 存在性检查 → notFound === -1 而转红；把它改回校验之后 → 顺序断言转红。
+  const route = stripComments(
+    readFileSync(join(repoRoot, "src", "app", "api", "meetings", "[id]", "route.ts"), "utf8")
+  );
+  const patchStart = route.indexOf("export async function PATCH");
+  const deleteStart = route.indexOf("export async function DELETE");
+  assert.ok(patchStart > -1 && deleteStart > patchStart, "前置：必须能定位 PATCH 函数体");
+  const patch = route.slice(patchStart, deleteStart);
+
+  const notFound = patch.search(/getMeetingById\(id\)[\s\S]{0,200}status:\s*404/);
+  const statusCheck = patch.indexOf("body.status !== undefined");
+  assert.ok(statusCheck > -1, "前置：PATCH 里必须还能定位到 body.status !== undefined 校验");
+  assert.ok(notFound > -1, "PATCH 必须有 getMeetingById(id) → 404 的存在性分支");
+  assert.ok(
+    notFound < statusCheck,
+    "存在性检查必须排在参数校验之前：不存在的会议带非法 status 时必须先 404（旧行为）"
   );
 });

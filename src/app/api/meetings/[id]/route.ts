@@ -30,8 +30,15 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     try {
       const body = await req.json();
 
+      // 存在性优先：不存在的会议一律 404，不受参数校验影响（与改动前一致，验收 V5）。
+      const existing = await getMeetingById(id);
+      if (!existing) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+
       // 参数校验必须放在 finalizeMeetingSave **之前**：无效入参一律 400，与改动前一致，
       // 且现在连一行都不会写（以前无效 status 会先把转写追加进去再返回 400）。
+      // 存在性检查已在上方先行（验收 V5：不存在的会议不管参数合法与否都是 404）。
       if (body.status !== undefined && body.status !== "paused" && body.status !== "transcribed") {
         return NextResponse.json({ error: "Unsupported meeting status" }, { status: 400 });
       }
