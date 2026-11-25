@@ -1894,18 +1894,19 @@ export async function getRuntimeConfig() {
   };
 }
 
-export async function listActiveHotwordMap() {
-  const active = (await listHotwords()).filter((item) => item.status === "active");
+export async function listActiveHotwordMap(db?: AsyncDatabase) {
+  const active = (await listHotwords(db)).filter((item) => item.status === "active");
   return active.reduce<Record<string, number>>((acc, item) => {
     acc[item.term] = Number(item.weight);
     return acc;
   }, {});
 }
 
-async function getAsrCaptureSession(captureSessionId: string) {
+async function getAsrCaptureSession(captureSessionId: string, db?: AsyncDatabase) {
   if (!captureSessionId) return null;
 
-  const row = (await (await getDb())
+  const database = db ?? (await getDb());
+  const row = (await database
     .prepare(`
       SELECT
         capture_session_id as captureSessionId,
@@ -2715,24 +2716,60 @@ type AppendMeetingTranscriptInput = {
   transcriptSegments: MeetingTranscriptSegment[];
 };
 
-async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInput) {
-  const existing = await getMeetingById(input.meetingId);
-  if (!existing) return null;
-
-  const createdAt = nowIso();
-  const settings = await listSettings();
-  const activeHotwords = await listActiveHotwordMap();
+/**
+ * 追加转写前把该 capture session 尚未落盘的事件冲下去。
+ *
+ * ⚠ 必须在事务**外**执行：`drainCaptureEvents` 自己会开事务（server/runtime-store.mjs 的
+ * `flushQueueState`），而 AsyncDb 的运行期防线（issue #55 D2）禁止在事务上下文里用非事务句柄
+ * 开事务 —— 那样抛出的错误会被 flush 自己的 catch 吞掉并**丢弃待落盘事件**。
+ * 触发条件与拆分前一致：正文非空且 captureSessionId 非空才冲。
+ */
+async function drainCaptureEventsBeforeAppend(input: AppendMeetingTranscriptInput) {
   const transcriptSegments = Array.isArray(input.transcriptSegments) ? input.transcriptSegments : [];
   const normalizedText = transcriptSegments.map((segment) => String(segment.text ?? "")).join("");
-  if (!normalizedText.trim()) return existing;
+  if (!normalizedText.trim()) return;
 
-  const get = (section: string, mark: string) =>
-    settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
   const captureSessionId = String(input.captureSessionId || "").trim();
   if (captureSessionId) {
     await drainCaptureEvents(captureSessionId);
   }
-  const captureSession = await getAsrCaptureSession(captureSessionId);
+}
+
+/**
+ * 追加转写的**事务内**实现（issue #74）：`meeting_asr_results` 插入、`meetings.updated_at` 更新、
+ * 录音绑定全部落在调用方传入的事务句柄上，这样 `finalizeMeetingSave` 能让它们与标题、状态、
+ * 幂等键完成在同一个事务里提交或回滚。
+ *
+ * 写入部分是拆分前 `appendMeetingTranscriptUncached` 事务内部代码**逐字搬过来**的，语义不变
+ * （包括 meeting_asr_results 的插入、collectCaptureSessionIds 与 bindAudioRecordingsToMeeting 的调用）；
+ * 只有三处必要调整，都不改变写入结果：
+ *   1. 快照所需的读也走 `tx`（`listSettings` / `listActiveHotwordMap` / `getAsrCaptureSession`
+ *      已加可选 db 参数），否则被 D2 运行期防线拒绝；
+ *   2. `drainCaptureEvents` 移到事务外（见 `drainCaptureEventsBeforeAppend` 的原因说明）；
+ *   3. 会议不存在 / 正文为空时直接返回、不写任何行（保持原来的早退语义）。
+ */
+async function appendMeetingTranscriptInTx(
+  tx: AsyncDatabase,
+  input: {
+    meetingId: string;
+    captureSessionId: string;
+    captureSessionIds?: string[];
+    transcriptSegments: MeetingTranscriptSegment[];
+  },
+): Promise<void> {
+  if (!await getMeetingById(input.meetingId, tx)) return;
+
+  const createdAt = nowIso();
+  const settings = await listSettings(tx);
+  const activeHotwords = await listActiveHotwordMap(tx);
+  const transcriptSegments = Array.isArray(input.transcriptSegments) ? input.transcriptSegments : [];
+  const normalizedText = transcriptSegments.map((segment) => String(segment.text ?? "")).join("");
+  if (!normalizedText.trim()) return;
+
+  const get = (section: string, mark: string) =>
+    settings.find((item) => item.itemSection === section && item.itemMark === mark)?.itemValue ?? "";
+  const captureSessionId = String(input.captureSessionId || "").trim();
+  const captureSession = await getAsrCaptureSession(captureSessionId, tx);
   const captureStats = captureSession ? getCaptureSessionStats(captureSessionId) : null;
   const rawAsrConfigSnapshot = captureSession?.asrConfigSnapshot
     ? parseJsonOr(captureSession.asrConfigSnapshot, {})
@@ -2764,49 +2801,62 @@ async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInp
         transcriptSegments,
       }
     : { captureSessionId, segments: transcriptSegments };
+  await tx
+    .prepare(`
+      INSERT INTO meeting_asr_results (
+        id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
+        capture_session_id, result_format, raw_payload, normalized_text, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      newId("asr"),
+      input.meetingId,
+      captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
+      "checkpoint",
+      JSON.stringify(asrConfigSnapshot),
+      input.captureSessionId,
+      captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
+      JSON.stringify(rawPayload),
+      normalizedText,
+      createdAt
+    );
 
-  return await withTransaction(async (tx) => {
-    await tx
-      .prepare(`
-        INSERT INTO meeting_asr_results (
-          id, meeting_id, asr_provider, asr_setting_mark, asr_config_snapshot,
-          capture_session_id, result_format, raw_payload, normalized_text, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .run(
-        newId("asr"),
-        input.meetingId,
-        captureSession?.asrProvider || get("asr", "provider") || "local_funasr",
-        "checkpoint",
-        JSON.stringify(asrConfigSnapshot),
-        input.captureSessionId,
-        captureSession ? "gateway_raw_events_json" : "transcript_segments_json",
-        JSON.stringify(rawPayload),
-        normalizedText,
-        createdAt
-      );
+  await tx
+    .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
+    .run(createdAt, input.meetingId);
 
-    await tx
-      .prepare("UPDATE meetings SET updated_at = ? WHERE id = ?")
-      .run(createdAt, input.meetingId);
-
-    // feat-261101-01：增量落定路径同样把录音绑定到会议（幂等，重复绑不报错）
-    await bindAudioRecordingsToMeeting({
-      meetingId: input.meetingId,
-      captureSessionIds: collectCaptureSessionIds(input),
-    }, tx);
-
-    return await getMeetingById(input.meetingId, tx);
-  });
+  // feat-261101-01：增量落定路径同样把录音绑定到会议（幂等，重复绑不报错）
+  await bindAudioRecordingsToMeeting({
+    meetingId: input.meetingId,
+    captureSessionIds: collectCaptureSessionIds(input),
+  }, tx);
 }
 
 /**
- * 追加一段转写到已有会议：写入 meeting_asr_results、更新时间、绑定录音。
+ * 追加一段转写到已有会议：单事务内写入 meeting_asr_results、更新会议时间、绑定录音。
  *
- * 注意（issue #74-3，五审 Y2/Y5）：**这里不做幂等**。PATCH 路由的追加、标题、状态、LLM 触发
- * 分散在多个事务里，单个幂等键无法原子覆盖全部副作用，所以故意不加认领/完成逻辑；
- * 代价是 PATCH 响应丢失后重试会重复追加同一段转写（已知限制，见 issue #74）。
- * 要真正幂等，必须先把这些副作用收进同一个事务。
+ * 对外行为与拆分前一致：会议不存在 → `null`；正文为空 → 返回会议（重新读取的同一行，
+ * 字段值与拆分前返回的 `existing` 相同）；成功 → 返回更新后的会议。
+ *
+ * 幂等（issue #74）：本函数自身**不做**认领/完成，重复调用会重复追加；
+ * 需要幂等请走 `finalizeMeetingSave`（PATCH 路由已改走它）。
+ */
+async function appendMeetingTranscriptUncached(input: AppendMeetingTranscriptInput) {
+  const existing = await getMeetingById(input.meetingId);
+  if (!existing) return null;
+
+  await drainCaptureEventsBeforeAppend(input);
+  await withTransaction((tx) => appendMeetingTranscriptInTx(tx, input));
+  return await getMeetingById(input.meetingId);
+}
+
+/**
+ * 追加一段转写到已有会议（对外 API，行为与拆分前一致）。
+ *
+ * 幂等状态变迁（issue #74 / #74-3 五审 Y2/Y5）：以前 PATCH 的追加、标题、状态、LLM 触发分散在
+ * 四个独立事务里，单个幂等键无法原子覆盖，所以这里**故意不做**认领/完成；现在「追加 + 标题 +
+ * 状态」已收进单事务，带幂等键的保存走 `finalizeMeetingSave`（PATCH 路由已改走它）。
+ * 本函数自身仍然不做认领/完成（重复调用会重复追加），保留它是为了其他调用方的语义不变。
  */
 export async function appendMeetingTranscript(input: AppendMeetingTranscriptInput) {
   return appendMeetingTranscriptUncached(input);
@@ -2826,6 +2876,70 @@ export async function updateMeetingStatus(id: string, status: string, lastErrorM
   return await getMeetingById(id, db);
 }
 
+/**
+ * `updateTranscriptMeetingStatus` 的**事务内**实现（issue #74）：状态迁移与审计日志落在调用方的
+ * 事务句柄上，供 `finalizeMeetingSave` 与追加/标题/幂等键同事务提交。
+ *
+ * 内容与拆分前的事务体逐字相同（包含两处错误文案）；唯一变化是事务外的预检搬进来时改用 `tx` 读。
+ * 会议不存在 → `null`；非法迁移 / 并发改状态 → 抛错（文案不变）。
+ */
+export async function updateTranscriptMeetingStatusInTx(
+  tx: AsyncDatabase,
+  id: string,
+  status: "paused" | "transcribed",
+  lastErrorMessage?: string | null
+) {
+  const existing = await getMeetingById(id, tx);
+  if (!existing) return null;
+
+  const allowedFrom = status === "paused"
+    ? ["transcribed", "paused"]
+    : ["paused"];
+  if (!allowedFrom.includes(existing.status)) {
+    throw new Error(`Invalid meeting status transition: ${existing.status} -> ${status}`);
+  }
+
+  const updatedAt = nowIso();
+  const result = await tx
+    .prepare(`
+      UPDATE meetings
+      SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
+      WHERE id = ? AND status IN (?, ?)
+    `)
+    .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id, ...allowedFrom);
+
+  if (Number(result.changes ?? 0) === 0) {
+    throw new Error(`Meeting status changed before transition: ${id}`);
+  }
+
+  const updated = await getMeetingById(id, tx);
+  await writeAuditLog({
+    actionType: "meeting.status.update",
+    resourceType: "meeting",
+    resourceId: id,
+    resourceName: updated?.title ?? existing.title,
+    beforeSnapshot: {
+      id: existing.id,
+      title: existing.title,
+      status: existing.status,
+      lastErrorMessage: existing.lastErrorMessage,
+    },
+    afterSnapshot: updated
+      ? {
+          id: updated.id,
+          title: updated.title,
+          status: updated.status,
+          lastErrorMessage: updated.lastErrorMessage,
+        }
+      : null,
+  }, tx);
+  return updated;
+}
+
+/**
+ * 薄包装（对外行为与拆分前一致）：先在事务外读会议并预检迁移合法性（不存在 → `null`、
+ * 非法迁移 → 抛错，都不开事务），再在事务里跑 `updateTranscriptMeetingStatusInTx`。
+ */
 export async function updateTranscriptMeetingStatus(
   id: string,
   status: "paused" | "transcribed",
@@ -2841,81 +2955,191 @@ export async function updateTranscriptMeetingStatus(
     throw new Error(`Invalid meeting status transition: ${existing.status} -> ${status}`);
   }
 
-  return await withTransaction(async (tx) => {
-    const updatedAt = nowIso();
-    const result = await tx
-      .prepare(`
-        UPDATE meetings
-        SET status = ?, status_updated_at = ?, last_error_message = ?, updated_at = ?
-        WHERE id = ? AND status IN (?, ?)
-      `)
-      .run(status, updatedAt, lastErrorMessage ?? null, updatedAt, id, ...allowedFrom);
-
-    if (Number(result.changes ?? 0) === 0) {
-      throw new Error(`Meeting status changed before transition: ${id}`);
-    }
-
-    const updated = await getMeetingById(id, tx);
-    await writeAuditLog({
-      actionType: "meeting.status.update",
-      resourceType: "meeting",
-      resourceId: id,
-      resourceName: updated?.title ?? existing.title,
-      beforeSnapshot: {
-        id: existing.id,
-        title: existing.title,
-        status: existing.status,
-        lastErrorMessage: existing.lastErrorMessage,
-      },
-      afterSnapshot: updated
-        ? {
-            id: updated.id,
-            title: updated.title,
-            status: updated.status,
-            lastErrorMessage: updated.lastErrorMessage,
-          }
-        : null,
-    }, tx);
-    return updated;
-  });
+  return await withTransaction((tx) => updateTranscriptMeetingStatusInTx(tx, id, status, lastErrorMessage));
 }
 
+/**
+ * `updateMeeting` 的**事务内**实现（issue #74）：标题更新与审计日志落在调用方的事务句柄上。
+ * 内容与拆分前的事务体逐字相同；会议不存在 → `null`。
+ */
+export async function updateMeetingInTx(tx: AsyncDatabase, id: string, patch: { title?: string }) {
+  const existing = await getMeetingById(id, tx);
+  if (!existing) return null;
+
+  const updatedAt = nowIso();
+  const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
+  await tx
+    .prepare(`
+      UPDATE meetings
+      SET title = ?, updated_at = ?
+      WHERE id = ?
+    `)
+    .run(nextTitle, updatedAt, id);
+
+  const updated = await getMeetingById(id, tx);
+  await writeAuditLog({
+    actionType: "meeting.update",
+    resourceType: "meeting",
+    resourceId: id,
+    resourceName: updated?.title ?? existing.title,
+    beforeSnapshot: {
+      id: existing.id,
+      title: existing.title,
+      status: existing.status,
+    },
+    afterSnapshot: updated
+      ? {
+          id: updated.id,
+          title: updated.title,
+          status: updated.status,
+        }
+      : null,
+  }, tx);
+  return updated;
+}
+
+/** 薄包装（对外行为与拆分前一致）：单事务里跑 `updateMeetingInTx`。 */
 export async function updateMeeting(id: string, patch: { title?: string }) {
-  return await withTransaction(async (tx) => {
-    const existing = await getMeetingById(id, tx);
-    if (!existing) return null;
+  return await withTransaction((tx) => updateMeetingInTx(tx, id, patch));
+}
 
-    const updatedAt = nowIso();
-    const nextTitle = patch.title === undefined ? existing.title : requireNonEmpty(patch.title, "title");
-    await tx
-      .prepare(`
-        UPDATE meetings
-        SET title = ?, updated_at = ?
-        WHERE id = ?
-      `)
-      .run(nextTitle, updatedAt, id);
+/** 会议记录形状（= `getMeetingById` 的返回元素类型），供 `finalizeMeetingSave` 的出参使用。 */
+export type MeetingRecord = NonNullable<Awaited<ReturnType<typeof getMeetingById>>>;
 
-    const updated = await getMeetingById(id, tx);
-    await writeAuditLog({
-      actionType: "meeting.update",
-      resourceType: "meeting",
-      resourceId: id,
-      resourceName: updated?.title ?? existing.title,
-      beforeSnapshot: {
-        id: existing.id,
-        title: existing.title,
-        status: existing.status,
-      },
-      afterSnapshot: updated
-        ? {
-            id: updated.id,
-            title: updated.title,
-            status: updated.status,
-          }
-        : null,
-    }, tx);
-    return updated;
-  });
+/** `finalizeMeetingSave` 的入参。 */
+export type FinalizeMeetingSaveInput = {
+  meetingId: string;
+  appendTranscriptSegments?: MeetingTranscriptSegment[];
+  captureSessionId?: string;
+  captureSessionIds?: string[];
+  title?: string;
+  status?: "paused" | "transcribed";
+  lastErrorMessage?: string | null;
+  idempotencyKey?: string | null;
+};
+
+/** `finalizeMeetingSave` 的出参。 */
+export type FinalizeMeetingSaveOutcome = {
+  meeting: MeetingRecord | null;
+  /** true = 本次请求命中了幂等键，四个副作用一个都没重新执行。 */
+  replayed: boolean;
+};
+
+/** 本单新引入的幂等作用域（不传 expectedMeetingId：保存目标会议由入参直接给出）。 */
+const MEETING_SAVE_IDEMPOTENCY_SCOPE = "meeting.save";
+
+/**
+ * 保存副作用的单事务体（issue #74）：追加 → 标题 → 状态，全部走同一个 `tx`。
+ *
+ * @param onCommitted 写入完成后、仍在**同一事务内**执行的回调（幂等键完成）；
+ *                    与 `createMeetingUncached` 的 onCommitted 同一模式。
+ * @returns 更新后的会议；会议不存在时返回 null（此时一行也没写，onCommitted 也不会跑）。
+ */
+async function finalizeMeetingSaveTx(
+  tx: AsyncDatabase,
+  input: FinalizeMeetingSaveInput,
+  captureSessionId: string,
+  onCommitted?: (tx: AsyncDatabase, meetingId: string) => Promise<void>
+): Promise<MeetingRecord | null> {
+  if (!await getMeetingById(input.meetingId, tx)) return null;
+
+  if (Array.isArray(input.appendTranscriptSegments)) {
+    await appendMeetingTranscriptInTx(tx, {
+      meetingId: input.meetingId,
+      captureSessionId,
+      captureSessionIds: input.captureSessionIds,
+      transcriptSegments: input.appendTranscriptSegments,
+    });
+  }
+
+  if (input.title !== undefined) {
+    await updateMeetingInTx(tx, input.meetingId, { title: input.title });
+  }
+
+  if (input.status !== undefined) {
+    await updateTranscriptMeetingStatusInTx(tx, input.meetingId, input.status, input.lastErrorMessage ?? null);
+  }
+
+  if (onCommitted) {
+    await onCommitted(tx, input.meetingId);
+  }
+
+  return await getMeetingById(input.meetingId, tx);
+}
+
+/**
+ * 保存会议（追加转写 + 标题 + 状态）的**单事务 + 可幂等**版本（issue #74 最后一项）。
+ *
+ * 为何要这个函数：PATCH /api/meetings/:id 的副作用原先分散在四个独立事务里（追加 / 标题 /
+ * 状态 / fire-and-forget 的 LLM），一个幂等键无法原子覆盖，重试会在「重复追加」与「跳过
+ * 遗漏副作用」之间二选一。现在前三步已收进单事务，LLM 触发则改为可重放的
+ * `ensureMeetingLlmResult`（路由里事务之后跑，重放也跑）。
+ *
+ * 幂等语义（与 `createMeetingWithOutcome` 一致）：
+ *   - 无 key → 直接执行全部步骤，`replayed: false`（幂等是**显式开启**的）；
+ *   - 有 key → 先原子认领：replayed 直接返回已存在的会议；in_progress / conflict 抛错（路由映射 409）；
+ *     claimed 才跑副作用，且 `completeIdempotencyKey` 在**事务内**执行：令牌失效（返回 false）
+ *     就抛 `IdempotencyConflictError` 让整笔写入回滚；任何抛错都 release 后再向外抛。
+ *
+ * 会议不存在 → `{ meeting: null, replayed: false }`（与 `appendMeetingTranscript` 的 null 语义一致）；
+ * 此时一行也没写，若已认领过则把 key 释放（不把它指向一个不存在的会议）。
+ */
+export async function finalizeMeetingSave(input: FinalizeMeetingSaveInput): Promise<FinalizeMeetingSaveOutcome> {
+  const key = String(input.idempotencyKey ?? "").trim();
+  // captureSessionId 只算一次：事务外的 flush 与事务内的追加必须用同一个值。
+  const captureSessionId = String(input.captureSessionId ?? `capture-${Date.now()}`);
+  const appendInput: AppendMeetingTranscriptInput | null = Array.isArray(input.appendTranscriptSegments)
+    ? {
+        meetingId: input.meetingId,
+        captureSessionId,
+        captureSessionIds: input.captureSessionIds,
+        transcriptSegments: input.appendTranscriptSegments,
+      }
+    : null;
+
+  const claim = key ? await claimIdempotencyKey(key, MEETING_SAVE_IDEMPOTENCY_SCOPE) : null;
+  if (claim?.status === "replayed") {
+    return { meeting: await getMeetingById(claim.meetingId), replayed: true };
+  }
+  if (claim?.status === "in_progress") {
+    throw new IdempotencyInProgressError("同一保存请求正在处理中，请稍候重试");
+  }
+  if (claim?.status === "conflict") {
+    throw new IdempotencyConflictError(`幂等键冲突：${claim.reason}`);
+  }
+
+  // flush 必须在事务外（见 drainCaptureEventsBeforeAppend 的原因说明）。
+  if (appendInput) {
+    await drainCaptureEventsBeforeAppend(appendInput);
+  }
+
+  try {
+    const meeting = await withTransaction((tx) =>
+      finalizeMeetingSaveTx(
+        tx,
+        input,
+        captureSessionId,
+        claim && key
+          ? async (innerTx, meetingId) => {
+              const ok = await completeIdempotencyKey(key, claim.token, meetingId, innerTx);
+              if (!ok) throw new IdempotencyConflictError("幂等键已被回收，请重试");
+            }
+          : undefined
+      )
+    );
+
+    if (claim && key && !meeting) {
+      // 会议不存在：没有任何写入，不能把 key 完成到一个不存在的会议 id 上。
+      await releaseIdempotencyKey(key, claim.token).catch(() => {});
+    }
+
+    return { meeting, replayed: false };
+  } catch (error) {
+    if (claim && key) {
+      await releaseIdempotencyKey(key, claim.token).catch(() => {});
+    }
+    throw error;
+  }
 }
 
 export async function deleteMeeting(id: string) {
@@ -3491,6 +3715,46 @@ export async function createMeetingLlmResult(meetingId: string, templateId?: str
     }
     throw error;
   }
+}
+
+/**
+ * 「确保」这个会议有一份默认纪要生成任务（issue #74）。
+ *
+ * 与 `createMeetingLlmResult` 的区别：本函数**可重放** —— 已经有一份可用结果（或有一次生成
+ * 正在进行）时直接跳过，不会因为「上一次请求已提交但响应丢了、用户重试」而重复生成。
+ * 这正是 PATCH 重试路径需要的触发方式：事务后的 LLM 触发在重放时也要跑一次，本函数自己判重。
+ *
+ * 判定用的字段与取值（已核对本仓代码，不是猜的）：`meeting_llm_results.status` 实际只有
+ * `"succeeded"` / `"failed"` 两种（**没有** pending/processing/completed，生成行只在结束时
+ * 一次性写入）；`generation_mode` 是 `"default_auto"`（首次自动生成）/ `"manual_regenerate"`；
+ * `result_type` 取模板类型（minutes / actions / translation …），标题结果（`result_type = 'title'`）
+ * 已被 `listMeetingLlmResultsByMeetingId` 排除。另外会议 `status = "llm_processing"` 表示有
+ * 一次生成在飞（此时 `claimMeetingLlmGeneration` 本来也会 409）。
+ *
+ * ⚠ 取舍（按任务里允许的退路）：不再细分「那一条是不是默认模板生成的」——只要存在任意一条
+ * `status <> "failed"` 的结果（包括手动重生成、翻译结果）就跳过。宁可少触发一次（用户可在界面
+ * 手动重新生成），也不要重复生成（多烧一次 token、还把结果版本往后堆）。
+ *
+ * 与 `createMeetingLlmResult` 一样**不等生成完成**（fire-and-forget）；失败由
+ * `createMeetingLlmResultInner` 内部把会议置为 `llm_failed`。
+ */
+export async function ensureMeetingLlmResult(meetingId: string): Promise<{ triggered: boolean }> {
+  const meeting = await getMeetingById(meetingId);
+  if (!meeting) return { triggered: false };
+
+  if (meeting.status === "llm_processing") {
+    return { triggered: false };
+  }
+
+  const results = await listMeetingLlmResultsByMeetingId(meetingId);
+  if (results.some((item) => String(item.status ?? "") !== "failed")) {
+    return { triggered: false };
+  }
+
+  void createMeetingLlmResult(meetingId).catch((error) => {
+    console.error("Failed to generate meeting LLM result (ensure):", error);
+  });
+  return { triggered: true };
 }
 
 const TRANSLATE_BATCH_MAX_SENTENCES = 5;
